@@ -38,6 +38,12 @@ Define your tasks with `br`. Type `grove run`. Walk away. Come back when it's do
 
 ---
 
+## Standing on Shoulders
+
+Grove didn't appear from nothing. The exit gate and circuit breaker come from [Frank Bria](https://github.com/frankbria)'s [ralph-claude-code](https://github.com/frankbria/ralph-claude-code), which proved that an autonomous Claude loop needs both heuristic detection and an explicit exit signal to avoid premature stops. The entire task graph — dependencies, lifecycle, ready-queue — runs on [Jeff Emanuel](https://github.com/Dicklesworthstone)'s [beads_rust](https://github.com/Dicklesworthstone/beads_rust), and grove uses his [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) for PageRank, critical path, and triage scoring when deciding which bead to dispatch next. Grove's native transcript archive is modeled after his [coding_agent_session_search](https://github.com/Dicklesworthstone/coding_agent_session_search), and the playbook engine — evidence scoring, confidence decay, curation, anti-pattern inversion — is adapted directly from his [cass_memory_system](https://github.com/Dicklesworthstone/cass_memory_system). His [ntm](https://github.com/Dicklesworthstone/ntm) shaped early thinking about session layout and parallel coordination, though grove chose direct process spawning over tmux. Finally, [nwiizo](https://github.com/nwiizo)'s [ccswarm](https://github.com/nwiizo/ccswarm) influenced the Rust workspace structure, type-state patterns, and task scoring design. Thank you all.
+
+---
+
 ## How It Works
 
 Grove runs a continuous autonomous loop over your beads task graph. Each bead is dispatched to a Claude session. When context exhausts, grove checkpoints and spawns a fresh session automatically. Child beads inherit structured handoffs from parents. Parallel beads run concurrently with file reservation safety.
@@ -77,6 +83,7 @@ grove run
 Grove does not exit just because Claude says it's done. It uses a **dual-condition check**:
 
 **Exit requires BOTH:**
+
 1. `completion_indicators >= 2` — heuristic from natural language patterns in output
 2. Claude's explicit `GROVE_EXIT: true` in the protocol block
 
@@ -153,7 +160,8 @@ cargo install --git https://github.com/quangdang46/grove
 ```
 
 **Required tools (install first):**
-- `claude` CLI — https://claude.ai/code
+
+- `claude` CLI — [https://claude.ai/code](https://claude.ai/code)
 - `br` (beads_rust) — `cargo install --git https://github.com/Dicklesworthstone/beads_rust`
 - `bv` (beads_viewer) — `cargo install --git https://github.com/Dicklesworthstone/beads_viewer`
 
@@ -216,6 +224,7 @@ grove retry bd-e9b1d4
 Grove communicates with Claude sessions through stdout markers:
 
 **Task complete:**
+
 ```
 GROVE_RESULT: Implemented JWT auth middleware with refresh token support
 GROVE_ARTIFACTS: ["src/middleware/auth.rs", "tests/auth_test.rs"]
@@ -226,11 +235,13 @@ GROVE_EXIT: true
 ```
 
 **Checkpoint (context filling up):**
+
 ```
 GROVE_CHECKPOINT: {"progress": "routes done, middleware 60%", "next_step": "finish token refresh", "context": {}, "open_questions": [], "claimed_paths": ["src/auth/**"]}
 ```
 
 **Still working (prevent premature exit):**
+
 ```
 GROVE_EXIT: false
 ```
@@ -324,11 +335,13 @@ my-project/
 
 All required. Grove exits with clear install instructions if any are missing.
 
-| Tool | Purpose |
-|------|---------|
-| `claude` CLI | Execute AI coding sessions |
-| `br` (beads_rust) | Task graph — issue definitions, dependencies, lifecycle |
+
+| Tool                | Purpose                                                           |
+| ------------------- | ----------------------------------------------------------------- |
+| `claude` CLI        | Execute AI coding sessions                                        |
+| `br` (beads_rust)   | Task graph — issue definitions, dependencies, lifecycle           |
 | `bv` (beads_viewer) | Graph analytics — PageRank, critical path, triage recommendations |
+
 
 That's it. No external memory, search, or orchestration tools. Grove handles everything else natively.
 
@@ -336,27 +349,13 @@ That's it. No external memory, search, or orchestration tools. Grove handles eve
 
 ## Roadmap
 
-- [ ] Phase 1 — Project skeleton, beads integration kernel, `grove init` + `grove status`
-- [ ] Phase 2 — Claude session runtime, protocol parser, exit policy, circuit breaker
-- [ ] Phase 3 — Sequential orchestrator, checkpoint/resume, handoff persistence, crash recovery
-- [ ] Phase 4 — Native transcript archive, FTS5 search, prompt retrieval
-- [ ] Phase 5 — Playbook memory, lesson ingestion, evidence scoring, prompt injection
-- [ ] Phase 6 — Parallel scheduler, file reservations, conflict-aware dispatch
-- [ ] Phase 7 — Rich curation, diaries, anti-pattern inversion, playbook compaction
-
----
-
-## Acknowledgments
-
-Grove's design draws heavily from patterns pioneered by these projects and their creators. Thank you.
-
-- [ralph-claude-code](https://github.com/frankbria/ralph-claude-code) by **Frank Bria** — Autonomous loop with intelligent exit detection. Grove's dual-condition exit gate, circuit breaker state machine, and response analysis patterns originate here.
-- [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) by **Jeff Emanuel** — Dependency-aware issue tracker and CLI. Grove's entire task graph model is built on top of `br`.
-- [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) (`bv`) by **Jeff Emanuel** — Graph-aware triage engine. Grove uses `bv`'s PageRank, critical path, and betweenness metrics to prioritize dispatch.
-- [coding_agent_session_search](https://github.com/Dicklesworthstone/coding_agent_session_search) (`cass`) by **Jeff Emanuel** — Cross-agent session search. Grove's native transcript archive and FTS retrieval model is adapted from cass's normalized schema and hybrid search design.
-- [cass_memory_system](https://github.com/Dicklesworthstone/cass_memory_system) (`cm`) by **Jeff Emanuel** — Procedural memory for coding agents. Grove's playbook engine — evidence scoring, confidence decay, curation pipeline, and anti-pattern inversion — is directly inspired by cm.
-- [ntm](https://github.com/Dicklesworthstone/ntm) by **Jeff Emanuel** — Named tmux manager for multi-agent sessions. Informed grove's thinking about session layout and parallel coordination, though grove chose direct process spawning over tmux.
-- [ccswarm](https://github.com/nwiizo/ccswarm) by **nwiizo** — Rust multi-agent orchestration with Claude Code. Influenced grove's Rust workspace design, type-state patterns, and task scoring architecture.
+- Phase 1 — Project skeleton, beads integration kernel, `grove init` + `grove status`
+- Phase 2 — Claude session runtime, protocol parser, exit policy, circuit breaker
+- Phase 3 — Sequential orchestrator, checkpoint/resume, handoff persistence, crash recovery
+- Phase 4 — Native transcript archive, FTS5 search, prompt retrieval
+- Phase 5 — Playbook memory, lesson ingestion, evidence scoring, prompt injection
+- Phase 6 — Parallel scheduler, file reservations, conflict-aware dispatch
+- Phase 7 — Rich curation, diaries, anti-pattern inversion, playbook compaction
 
 ---
 
