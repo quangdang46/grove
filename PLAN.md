@@ -968,10 +968,9 @@ Never promote a lesson to a strong rule because it appeared once.
 
 ## 4.7 Phase complexity intentionally
 
-- sequential kernel first
+- single scheduler core, parallel-capable from day one (reservation safety built into dispatch)
 - archive next
 - basic memory next
-- parallel scheduler next
 - richer curation later
 - migration readers later
 
@@ -1476,7 +1475,7 @@ timeout_minutes = 60
 env_passthrough = []
 
 [scheduler]
-max_parallel = 1
+max_parallel = 5
 poll_interval_ms = 1000
 retry_max = 3
 retry_backoff_secs = 30
@@ -2556,14 +2555,18 @@ pub struct QueueEntry {
 - filter by reservation conflicts
 - produce dispatch plan
 
-### Ready criteria
+### Ready criteria (canonical — delegates to `br`)
 
-A task is ready when:
+A bead is dispatchable when:
 
-- status is `Pending`, `Ready`, or `Failed` with retry permitted
-- all parent dependencies are `Succeeded`
-- no active run already owns it
-- no active exclusive reservation conflict blocks it
+1. `br ready --json` reports it as ready (this is the **sole authority** for dependency satisfaction — grove never re-evaluates parent status or dependency graphs itself)
+2. Grove has no local blocker:
+   - no active `TaskRun` already owns it
+   - no retry backoff timer is pending
+   - circuit breaker is not `Open`
+   - no active exclusive reservation conflict blocks it
+
+Grove may only **suppress** readiness (via local blockers). It must never **create** readiness independently of `br`.
 
 ### Critical path estimate
 
@@ -3325,10 +3328,9 @@ They must not scrape parent transcripts by default.
 
 ## 13. Scheduler, Dispatch, and Parallel Safety
 
-## 13.1 Sequential before parallel
+## 13.1 Single scheduler, parallel by default
 
-Phase 1 must work with `max_parallel = 1` and still use the same scheduler core.
-Parallelism is a later configuration change, not a separate architecture.
+The scheduler dispatches up to `max_parallel` beads concurrently from the first release. There is no separate sequential mode — `max_parallel = 1` is just a configuration choice, not a distinct architecture. The default is `max_parallel = 5`. Reservation safety is built into the dispatch path, not bolted on later.
 
 ## 13.2 Ready set computation
 
@@ -3581,11 +3583,13 @@ This section is intentionally near-code.
 
 ---
 
-## Phase 3 — Sequential orchestrator
+## Phase 3 — Parallel orchestrator, reservations, and crash recovery
 
 ### Build
 
 - `grove-orchestrator`
+- bounded concurrency (`max_parallel` slots via semaphore)
+- reservation manager and conflict-aware dispatch
 - run/session/checkpoint persistence
 - node runner
 - handoff persistence
@@ -3594,7 +3598,8 @@ This section is intentionally near-code.
 
 ### Acceptance
 
-- full sequential DAG execution works
+- parallel DAG execution works with `max_parallel >= 2`
+- overlapping path claims block unsafe dispatch
 - checkpoints respawn new sessions
 - parent handoffs unblock children
 - orchestrator survives restart and recovers state
@@ -3636,24 +3641,7 @@ This section is intentionally near-code.
 
 ---
 
-## Phase 6 — Parallel scheduler and reservations
-
-### Build
-
-- bounded concurrency
-- reservation manager
-- conflict-aware scheduler
-- richer `grove status`
-
-### Acceptance
-
-- multiple tasks can run safely in parallel
-- overlapping path claims block unsafe dispatch
-- recovery preserves consistency after crash
-
----
-
-## Phase 7 — Rich curation
+## Phase 6 — Rich curation
 
 ### Build
 
@@ -3680,7 +3668,7 @@ This section is intentionally near-code.
 | Parallel tasks interfere | Reservation model + deterministic blocking + stale expiry |
 | Recovery bugs create duplicated work | Durable run/session/checkpoint records + idempotent recovery scan |
 | README still advertises external CLIs | Reconcile README after kernel direction is accepted |
-| Overbuilding before shipping | Keep phase order strict: kernel -> session -> orchestrator -> archive -> playbook -> parallel |
+| Overbuilding before shipping | Keep phase order strict: kernel -> session -> parallel orchestrator -> archive -> playbook -> curation |
 
 ---
 
@@ -3741,10 +3729,9 @@ If implementation starts immediately, the first exact order should be:
 7. create `grove-br` integration layer — **read-only**: `br ready`, `br show`, `br list`; **mirror-only**: `br update`, `br close`, `br comments add`, `br sync --flush-only`
 8. create `grove-bv` integration layer for `bv --robot-triage`, `--robot-next`, `--robot-plan`, and `--robot-insights`
 9. create `grove-session` backend + protocol parser + transcript writer + exit policy
-10. create `grove-orchestrator` sequential node runner + recovery
+10. create `grove-orchestrator` parallel node runner + reservation manager + bounded concurrency + recovery
 11. create `grove-memory` archive ingest + FTS
 12. create `grove-memory` playbook candidate bullet flow
-13. add parallel reservations and bounded concurrency
 
 That order minimizes wasted effort and keeps the product aligned with the confirmed beads-backed direction.
 
@@ -5958,7 +5945,7 @@ Create `grove-session::analysis`:
 - progress signal detection
 - completion indicator counting
 - exit false override
-n
+
 ### Step 5
 
 Create `grove-session::exit_policy` and `classifier`.
@@ -5993,6 +5980,10 @@ Create orchestrator queue and ready evaluation.
 
 ### Step 2
 
+Create reservation manager and conflict-aware scheduler.
+
+### Step 3
+
 Create node runner with:
 
 - open run
@@ -6003,23 +5994,33 @@ Create node runner with:
 - success finalization
 - failure handling
 
-### Step 3
-
-Create recovery reconciler.
-
 ### Step 4
 
-Create leader lease acquisition and heartbeat.
+Add bounded concurrency to coordinator (`max_parallel` slots via semaphore).
 
 ### Step 5
 
+Create recovery reconciler.
+
+### Step 6
+
+Create leader lease acquisition and heartbeat.
+
+### Step 7
+
 Create `grove run` loop.
+
+### Step 8
+
+Expose dispatch explanations in status/inspect.
 
 ### Phase 3 done means
 
-- sequential DAG execution works end-to-end
+- parallel DAG execution works with `max_parallel >= 2`
+- overlapping paths do not run together unsafely
 - child tasks unblock after parent handoff persists
 - checkpoints can lead to fresh sessions
+- stale reservations recover after crash
 - restart recovery preserves consistency
 
 ## 29.4 Phase 4 micro-steps
@@ -6074,30 +6075,6 @@ Create selector injection into prompt building.
 
 ### Step 1
 
-Create reservation manager.
-
-### Step 2
-
-Create conflict-aware scheduler.
-
-### Step 3
-
-Add bounded concurrency to coordinator.
-
-### Step 4
-
-Expose dispatch explanations in status/inspect.
-
-### Phase 6 done means
-
-- safe parallelism works
-- overlapping paths do not run together unsafely
-- stale reservations recover after crash
-
-## 29.7 Phase 7 micro-steps
-
-### Step 1
-
 Create diary generation from run outcome.
 
 ### Step 2
@@ -6112,7 +6089,7 @@ Create harmful-rule inversion.
 
 Refine selector and pruning.
 
-### Phase 7 done means
+### Phase 6 done means
 
 - playbook stays compact
 - harmful stale rules do not keep poisoning prompts
