@@ -1,0 +1,22 @@
+[package]
+name = "grove-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "grove"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+grove-br = { path = "../grove-br" }
+grove-bv = { path = "../grove-bv" }
+grove-config = { path = "../grove-config" }
+grove-db = { path = "../grove-db" }
+grove-kernel = { path = "../grove-kernel" }
+grove-types = { path = "../grove-types" }

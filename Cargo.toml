@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/grove-types",
+  "crates/grove-config",
+  "crates/grove-db",
+  "crates/grove-kernel",
+  "crates/grove-br",
+  "crates/grove-bv",
+  "crates/grove-cli",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+authors = ["quangdang"]
+
+[workspace.dependencies]
+anyhow = "1"
+camino = { version = "1", features = ["serde1"] }
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+toml = "0.8"
+tracing = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

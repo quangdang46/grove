@@ -1,0 +1,12 @@
+[package]
+name = "grove-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+grove-types = { path = "../grove-types" }

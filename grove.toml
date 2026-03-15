@@ -1,0 +1,47 @@
+[runtime]
+claude_bin = "claude"
+default_model = "sonnet"
+workspace_root = "."
+timeout_minutes = 60
+
+[scheduler]
+max_parallel = 5
+poll_interval_ms = 1000
+retry_max = 3
+retry_backoff_secs = 30
+critical_path_bonus = 20
+reservation_conflict_penalty = 1000
+
+[checkpoint]
+warn_pct = 0.70
+rotate_pct = 0.82
+hard_stop_pct = 0.90
+
+[exit_policy]
+completion_indicator_threshold = 2
+heuristic_window = 8
+require_explicit_exit = true
+
+[circuit_breaker]
+no_progress_threshold = 3
+same_error_threshold = 5
+permission_denial_threshold = 2
+cooldown_minutes = 30
+
+[memory]
+enable_playbook = true
+archive_top_k = 5
+max_prompt_snippets = 3
+max_prompt_bullets = 12
+
+[reservations]
+enabled = true
+default_ttl_minutes = 60
+
+[safety]
+scan_transcripts = true
+inject_safety_preamble = true
+
+[logging]
+level = "info"
+persist_jsonl = true
