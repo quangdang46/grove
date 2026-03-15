@@ -34,130 +34,136 @@ You become the orchestrator. A human one. Manually chaining sessions, one at a t
 
 **Grove closes this loop.**
 
-Assign your beads to the right agents. Type `grove run`. Walk away. Come back when it's done — all tasks completed, all sessions handled, context rotations managed, memory passed between nodes automatically.
-
-Your project is ready for the next plan. Or the bugs are fixed. And you were asleep.
+Define your tasks with `br`. Type `grove run`. Walk away. Come back when it's done — all tasks completed, all sessions handled, context rotations managed, memory passed between nodes automatically.
 
 ---
 
 ## How It Works
 
-Grove runs a continuous autonomous loop over your beads task graph. Each bead is a Claude session. When context exhausts, grove checkpoints and spawns a fresh session automatically. Child nodes inherit memory from parents. Parallel nodes run concurrently.
+Grove runs a continuous autonomous loop over your beads task graph. Each bead is dispatched to a Claude session. When context exhausts, grove checkpoints and spawns a fresh session automatically. Child beads inherit structured handoffs from parents. Parallel beads run concurrently with file reservation safety.
 
 ### The Loop
 
 ```
 grove run
   │
-  ├─ poll br ready --json
-  │     → [node_A, node_B]  (no blockers, both ready)
+  ├─ sync br ready --json
+  │     → [bd-e9b1d4, bd-7f3a2c]  (no blockers, both ready)
   │
-  ├─ spawn parallel sessions
-  │     session A: claude -p "<task A + parent handoffs + cass memory + cm rules>"
-  │     session B: claude -p "<task B + parent handoffs + cass memory + cm rules>"
+  ├─ score candidates (priority + critical path + bv insights)
   │
-  ├─ session A outputs GROVE_RESULT: done
-  │     → write handoff_A.json
-  │     → cass index session A
-  │     → cm store lesson
-  │     → br close node_A
-  │     → node_C (depends on A) becomes ready
-  │     → grove spawns session C
+  ├─ dispatch top-scoring beads (up to max_parallel)
+  │     session A: claude -p "<task + parent handoffs + archive snippets + playbook rules>"
+  │     session B: claude -p "<task + parent handoffs + archive snippets + playbook rules>"
   │
-  ├─ session B hits context limit
+  ├─ session A outputs GROVE_EXIT: true (+ completion indicators met)
+  │     → persist handoff
+  │     → index transcript into grove's native archive
+  │     → extract lessons into playbook
+  │     → mirror to br (close + comment)
+  │     → child bead C (depends on A) becomes ready
+  │     → next tick: grove dispatches C
+  │
+  ├─ session B hits context pressure
   │     → GROVE_CHECKPOINT: {"progress": "60% done", "next": "finish auth"}
-  │     → grove spawns new session B'
-  │     → B' resumes from checkpoint with full memory injected
+  │     → grove persists checkpoint, ends session
+  │     → spawns fresh session B' with checkpoint + full context injected
   │
-  └─ loop until all beads closed
+  └─ loop until all beads done or shutdown
 ```
 
-### Intelligent Exit Detection (from ralph)
+### Intelligent Exit Detection
 
 Grove does not exit just because Claude says it's done. It uses a **dual-condition check**:
 
 **Exit requires BOTH:**
 1. `completion_indicators >= 2` — heuristic from natural language patterns in output
-2. Claude's explicit `GROVE_EXIT: true` in the status block
+2. Claude's explicit `GROVE_EXIT: true` in the protocol block
 
 ```
-Node loop 5: "Phase complete, moving to next feature"
-  → completion_indicators: 3 (high from patterns)
+Loop 5: "Phase complete, moving to next feature"
+  → completion_indicators: 3
   → GROVE_EXIT: false (Claude says more work needed)
   → Result: CONTINUE
 
-Node loop 8: "All tasks complete"
+Loop 8: "All tasks complete"
   → completion_indicators: 4
   → GROVE_EXIT: true
-  → Result: mark done, trigger children
+  → Result: SUCCESS → persist handoff, unblock children
 ```
 
-This prevents premature exits during productive iterations — a real problem ralph solved and grove adopts directly.
+This prevents premature exits during productive iterations.
 
-### Circuit Breaker (from ralph)
+### Circuit Breaker
 
-Grove monitors each node session for stuck loops:
+Grove monitors each session for stuck loops:
 
 ```
-No file changes for 3 loops    → circuit OPEN, checkpoint, retry with new session
-Same error repeated 5 loops    → circuit OPEN, fail node, notify user
-Output declining 70%+          → circuit OPEN, investigate
+No progress for 3 iterations → circuit OPEN
+Same error repeated 5 times  → circuit OPEN
+Permission denied 2 times    → circuit OPEN, fail fast
 ```
 
-Auto-recovery: OPEN → cooldown (30min) → HALF_OPEN → CLOSED.
+Auto-recovery: OPEN → cooldown (30min) → HALF_OPEN → test one iteration → CLOSED.
 
-### Context Exhaustion (grove's core addition)
+### Context Exhaustion
 
-Ralph loops within one session. Grove goes further — when context exhausts, grove spawns a **brand new session** with full memory reconstructed:
+When context fills up, grove spawns a **brand new session** with full memory reconstructed:
 
 ```
 session running...
-  estimated tokens > 80%?
-    → node outputs GROVE_CHECKPOINT: {progress, next_step, context}
-    → grove kills session gracefully
-    → spawns new session with checkpoint + parent handoffs + cass search + cm rules
-    → node resumes mid-task in fresh context window
+  estimated tokens > 82%?
+    → session outputs GROVE_CHECKPOINT: {progress, next_step, context}
+    → grove persists checkpoint to DB + file
+    → session ends gracefully
+    → new session spawned with checkpoint + parent handoffs + archive snippets + playbook rules
+    → work resumes mid-task in fresh context window
 
-stop_reason = max_tokens (exit code indicates context cut)?
-    → emergency checkpoint from last known state
+  estimated tokens > 90% with no checkpoint?
+    → grove synthesizes emergency checkpoint from latest protocol state
+    → kills session
     → new session spawned immediately
 ```
 
-### Memory (cass + cm)
+### Native Memory Engine
+
+Grove owns its memory entirely — no external memory tools required.
 
 ```
-Node A session ends
-  → cass indexes the session (incremental, automatic)
-  → grove writes handoff_A.json
-  → cm stores key lessons from node A's work
+Bead A session ends
+  → grove indexes transcript into native FTS5 archive
+  → grove persists structured handoff (summary, artifacts, lessons, decisions, warnings)
+  → grove extracts GROVE_LESSONS into playbook as candidate bullets
 
-Node B (child of A) spawns
-  → cass search: "auth middleware" → returns relevant snippets from A's session
-  → cm recall: returns rules learned in past sessions
-  → handoff_A.json injected into prompt
-  → Node B starts knowing exactly what A did
+Bead B (child of A) dispatched
+  → archive search: "auth middleware" → returns relevant snippets from past sessions
+  → playbook selector: returns proven rules matching this task's scope/tags
+  → parent handoff injected into prompt
+  → Bead B starts knowing exactly what A did
 ```
+
+Over time, repeated lessons get promoted (Candidate → Established → Proven). Harmful rules get demoted or inverted into anti-patterns. The playbook stays compact and self-curating via exponential decay scoring.
 
 ---
 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/quangdang46/grove/main/install.sh | bash
+cargo install --git https://github.com/quangdang46/grove
 ```
 
-Installs grove + cass + cm + bv automatically.
-
-**Prerequisites (install manually first):**
+**Required tools (install first):**
 - `claude` CLI — https://claude.ai/code
 - `br` (beads_rust) — `cargo install --git https://github.com/Dicklesworthstone/beads_rust`
+- `bv` (beads_viewer) — `cargo install --git https://github.com/Dicklesworthstone/beads_viewer`
+
+No other orchestration, memory, or search tool is required. Grove implements all memory and retrieval natively.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Init beads in your project
 cd my-project
 br init
 
@@ -170,104 +176,63 @@ br create "Implement auth middleware" --type task
 
 br dep add bd-7f3a2c bd-e9b1d4   # auth depends on schema
 
-# Run grove — then go do something else
+# Init grove
+grove init
+
+# Run — then go do something else
 grove run
 ```
 
-Grove handles everything from here. When it's done, all your beads are closed and the project is ready for the next plan.
+Grove handles everything from here. When it's done, all your beads are closed and the project is ready.
 
 ---
 
 ## Usage
 
 ```bash
-# Start orchestrator
+# Init grove workspace
+grove init
+
+# Start orchestrator (the main command)
 grove run
 
-# Limit parallel sessions (default: 5)
-grove run --max-parallel 3
-
-# Use specific model
-grove run --model opus
-
-# Start with web UI
-grove run --web
-
-# Check status
+# Check status — ready queue, running beads, scores, health
 grove status
 
-# Live TUI dashboard
-grove tui
+# Deep inspect a bead — runs, checkpoints, handoffs, prompt breakdown
+grove inspect bd-e9b1d4
 
-# Stream logs for a specific node
-grove log bd-abc123
+# Stream transcript logs for a bead
+grove log bd-e9b1d4
 
-# Visualize the beads DAG
-grove tree
-
-# Retry a failed node
-grove retry bd-abc123
-
-# Web UI only (orchestrator already running)
-grove web --port 3030
+# Retry a failed bead
+grove retry bd-e9b1d4
 ```
 
 ---
 
 ## Node Protocol
 
-Grove communicates with Claude sessions through stdout markers. The session outputs structured signals, grove reads and acts on them.
+Grove communicates with Claude sessions through stdout markers:
 
 **Task complete:**
 ```
 GROVE_RESULT: Implemented JWT auth middleware with refresh token support
-GROVE_ARTIFACTS: src/middleware/auth.rs, tests/auth_test.rs
-GROVE_LESSONS: Always validate token expiry before checking signature
+GROVE_ARTIFACTS: ["src/middleware/auth.rs", "tests/auth_test.rs"]
+GROVE_LESSONS: ["Always validate token expiry before checking signature"]
+GROVE_DECISIONS: ["Used RS256 for token signing"]
+GROVE_WARNINGS: ["Rate limiting not yet implemented"]
 GROVE_EXIT: true
 ```
 
 **Checkpoint (context filling up):**
 ```
-GROVE_CHECKPOINT: {"progress": "routes done, middleware 60%", "next_step": "finish token refresh", "context": {}}
+GROVE_CHECKPOINT: {"progress": "routes done, middleware 60%", "next_step": "finish token refresh", "context": {}, "open_questions": [], "claimed_paths": ["src/auth/**"]}
 ```
 
 **Still working (prevent premature exit):**
 ```
 GROVE_EXIT: false
-```
-
-Grove injects full context into each session's prompt:
-
-```
-[GROVE NODE]
-ID: bd-7f3a2c
-Task: Implement auth middleware
-Priority: P1
-Parents done: bd-e9b1d4
-
-[PARENT OUTPUTS]
-bd-e9b1d4 — Set up database schema
-  Result: Schema done with users, sessions tables
-  Artifacts: migrations/001_init.sql, src/db/schema.rs
-
-[RELEVANT PAST SESSIONS]
-Score 0.92: Previously solved JWT refresh token edge case...
-
-[AGENT MEMORY]
-Rule: Always check token expiry before debugging auth
-Rule: Use connection pooling for DB-heavy middleware
-
-[TASK]
-Implement auth middleware that validates JWT tokens...
-
-[GROVE PROTOCOL]
-GROVE_RESULT: <summary>
-GROVE_ARTIFACTS: <files>
-GROVE_LESSONS: <lesson>
-GROVE_EXIT: true | false
-
-If context filling up:
-GROVE_CHECKPOINT: {"progress": "...", "next_step": "...", "context": {}}
 ```
 
 ---
@@ -277,36 +242,53 @@ GROVE_CHECKPOINT: {"progress": "...", "next_step": "...", "context": {}}
 ```toml
 # grove.toml
 
-[orchestrator]
-max_parallel = 5            # concurrent Claude sessions
-context_threshold = 80      # % estimated tokens → checkpoint warning
-poll_interval_secs = 5      # br ready poll interval
-retry_max = 3               # retries per node
-retry_backoff_secs = 30
-
-# Circuit breaker (from ralph pattern)
-cb_no_progress_threshold = 3    # open circuit after N loops with no file changes
-cb_same_error_threshold = 5     # open circuit after N loops with same error
-cb_cooldown_minutes = 30        # auto-recovery cooldown
-
-[session]
+[runtime]
 claude_bin = "claude"
-default_model = "sonnet"        # sonnet | opus | haiku
-timeout_minutes = 60            # max per session (not per node — node spans multiple sessions)
+default_model = "sonnet"
+workspace_root = "."
+timeout_minutes = 60
+
+[scheduler]
+max_parallel = 1              # start sequential, increase when confident
+poll_interval_ms = 1000
+retry_max = 3
+retry_backoff_secs = 30
+critical_path_bonus = 20
+reservation_conflict_penalty = 1000
+
+[checkpoint]
+warn_pct = 0.70               # context pressure warning
+rotate_pct = 0.82             # trigger checkpoint rotation
+hard_stop_pct = 0.90          # emergency kill threshold
+
+[exit_policy]
+completion_indicator_threshold = 2
+heuristic_window = 8
+require_explicit_exit = true
+
+[circuit_breaker]
+no_progress_threshold = 3
+same_error_threshold = 5
+permission_denial_threshold = 2
+cooldown_minutes = 30
 
 [memory]
-handoff_dir = ".grove/handoffs"
-lock_dir = ".grove/locks"
-cass_search_limit = 5
-cass_days = 30
+enable_playbook = true
+archive_top_k = 5
+max_prompt_snippets = 3
+max_prompt_bullets = 12
 
-[beads]
-br_bin = "br"
-bv_bin = "bv"
+[reservations]
+enabled = true
+default_ttl_minutes = 60
 
-[web]
-port = 3030
-host = "127.0.0.1"
+[safety]
+scan_transcripts = true
+inject_safety_preamble = true
+
+[logging]
+level = "info"
+persist_jsonl = true
 ```
 
 ---
@@ -315,30 +297,26 @@ host = "127.0.0.1"
 
 ```
 my-project/
-├── .beads/
-│   ├── beads.jsonl
-│   └── .br_history/
-├── .grove/
-│   ├── handoffs/           # handoff_<node_id>.json — output of each completed node
-│   ├── locks/              # advisory locks for parallel file writes
-│   ├── events.jsonl        # full audit log of all node events
-│   └── state.json          # orchestrator checkpoint for crash recovery
+├── .beads/                    # br-owned task graph
+│   └── beads.jsonl
+├── .grove/                    # grove-owned runtime state
+│   ├── grove.db               # SQLite — authoritative runtime state
+│   ├── config.snapshot.json
+│   ├── lock/
+│   │   └── leader.lock        # single-coordinator enforcement
+│   ├── transcripts/
+│   │   └── <bead-id>/
+│   │       └── <session-id>.jsonl
+│   ├── checkpoints/
+│   │   └── <bead-id>/
+│   │       └── <checkpoint-id>.json
+│   ├── artifacts/
+│   │   └── <bead-id>/
+│   ├── logs/
+│   │   └── orchestrator.jsonl
+│   └── tmp/
 └── grove.toml
 ```
-
----
-
-## Web UI
-
-```bash
-grove run --web
-# → http://127.0.0.1:3030
-```
-
-- **DAG visualization** — nodes colored by state: gray=pending, blue=running, green=done, red=failed
-- **Node detail** — task description, live log stream, handoff output, config
-- **Live updates** — SSE, no refresh needed
-- **Config editor** — edit grove.toml fields without restarting
 
 ---
 
@@ -348,31 +326,37 @@ All required. Grove exits with clear install instructions if any are missing.
 
 | Tool | Purpose |
 |------|---------|
-| `claude` CLI | Run Claude sessions |
-| `br` (beads_rust) | Task graph — frozen stable API |
-| `bv` (beads_viewer) | DAG analytics, parallel track detection |
-| `cass` | Cross-session memory search |
-| `cm` | Agent memory rules and lessons |
+| `claude` CLI | Execute AI coding sessions |
+| `br` (beads_rust) | Task graph — issue definitions, dependencies, lifecycle |
+| `bv` (beads_viewer) | Graph analytics — PageRank, critical path, triage recommendations |
+
+That's it. No external memory, search, or orchestration tools. Grove handles everything else natively.
 
 ---
 
 ## Roadmap
 
-- [ ] Phase 1 — Sequential DAG, checkpoint/resume, cass/cm memory, circuit breaker
-- [ ] Phase 2 — Parallel nodes, lock coordination, ratatui TUI
-- [ ] Phase 3 — Web UI (DAG viz, live logs, config editor)
+- [ ] Phase 1 — Project skeleton, beads integration kernel, `grove init` + `grove status`
+- [ ] Phase 2 — Claude session runtime, protocol parser, exit policy, circuit breaker
+- [ ] Phase 3 — Sequential orchestrator, checkpoint/resume, handoff persistence, crash recovery
+- [ ] Phase 4 — Native transcript archive, FTS5 search, prompt retrieval
+- [ ] Phase 5 — Playbook memory, lesson ingestion, evidence scoring, prompt injection
+- [ ] Phase 6 — Parallel scheduler, file reservations, conflict-aware dispatch
+- [ ] Phase 7 — Rich curation, diaries, anti-pattern inversion, playbook compaction
 
 ---
 
-## Related
+## Acknowledgments
 
-- [ralph-claude-code](https://github.com/frankbria/ralph-claude-code) — autonomous loop with intelligent exit detection (inspiration for grove's exit gate + circuit breaker)
-- [beads_rust](https://github.com/Dicklesworthstone/beads_rust) — task graph CLI
-- [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) — DAG analytics
-- [coding_agent_session_search](https://github.com/Dicklesworthstone/coding_agent_session_search) — cass
-- [cass_memory_system](https://github.com/Dicklesworthstone/cass_memory_system) — cm
-- [ntm](https://github.com/Dicklesworthstone/ntm) — tmux agent manager
-- [ccswarm](https://github.com/nwiizo/ccswarm) — Rust multi-agent
+Grove's design draws heavily from patterns pioneered by these projects and their creators. Thank you.
+
+- [ralph-claude-code](https://github.com/frankbria/ralph-claude-code) by **Frank Bria** — Autonomous loop with intelligent exit detection. Grove's dual-condition exit gate, circuit breaker state machine, and response analysis patterns originate here.
+- [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) by **Jeff Emanuel** — Dependency-aware issue tracker and CLI. Grove's entire task graph model is built on top of `br`.
+- [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) (`bv`) by **Jeff Emanuel** — Graph-aware triage engine. Grove uses `bv`'s PageRank, critical path, and betweenness metrics to prioritize dispatch.
+- [coding_agent_session_search](https://github.com/Dicklesworthstone/coding_agent_session_search) (`cass`) by **Jeff Emanuel** — Cross-agent session search. Grove's native transcript archive and FTS retrieval model is adapted from cass's normalized schema and hybrid search design.
+- [cass_memory_system](https://github.com/Dicklesworthstone/cass_memory_system) (`cm`) by **Jeff Emanuel** — Procedural memory for coding agents. Grove's playbook engine — evidence scoring, confidence decay, curation pipeline, and anti-pattern inversion — is directly inspired by cm.
+- [ntm](https://github.com/Dicklesworthstone/ntm) by **Jeff Emanuel** — Named tmux manager for multi-agent sessions. Informed grove's thinking about session layout and parallel coordination, though grove chose direct process spawning over tmux.
+- [ccswarm](https://github.com/nwiizo/ccswarm) by **nwiizo** — Rust multi-agent orchestration with Claude Code. Influenced grove's Rust workspace design, type-state patterns, and task scoring architecture.
 
 ---
 
