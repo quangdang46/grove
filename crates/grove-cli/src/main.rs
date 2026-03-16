@@ -22,8 +22,13 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(command) => println!("{:?} is not implemented yet in the workspace skeleton.", command_name(&command)),
-        None => println!("grove workspace skeleton is wired. Command implementations land in later beads."),
+        Some(command) => println!(
+            "{:?} is not implemented yet in the workspace skeleton.",
+            command_name(&command)
+        ),
+        None => println!(
+            "grove workspace skeleton is wired. Command implementations land in later beads."
+        ),
     }
 }
 

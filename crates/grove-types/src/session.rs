@@ -1,4 +1,4 @@
-use crate::{errors::InvalidTransition, ProtocolEvent, SessionId, Timestamp};
+use crate::{ProtocolEvent, SessionId, Timestamp, errors::InvalidTransition};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +85,7 @@ pub struct ClaudeSessionRecord {
     pub estimated_input_tokens: i32,
     pub estimated_output_tokens: i32,
     pub exit_code: Option<i32>,
-    pub stop_reason: Option<String>,
+    pub stop_reason: Option<StopReason>,
     pub transcript_path: String,
 }
 

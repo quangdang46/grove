@@ -9,4 +9,10 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+camino.workspace = true
 grove-types = { path = "../grove-types" }
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

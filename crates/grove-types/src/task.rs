@@ -1,4 +1,4 @@
-use crate::{BeadId, RunId, Timestamp};
+use crate::{BeadId, BeadPriority, RunId, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -18,7 +18,7 @@ pub struct BeadRef {
     pub id: BeadId,
     pub title: String,
     pub description: Option<String>,
-    pub priority: i32,
+    pub priority: BeadPriority,
     pub issue_type: String,
     pub br_status: String,
     pub assignee: Option<String>,
@@ -65,6 +65,7 @@ impl GroveBeadRecord {
                 | (Idle, Running)
                 | (Ready, Running)
                 | (Running, Checkpointed)
+                | (Running, WaitingToRetry)
                 | (Running, Succeeded)
                 | (Running, Failed)
                 | (Checkpointed, Running)

@@ -52,7 +52,8 @@ pub fn load_from_path_with_env(
         message: source.to_string(),
     })?;
 
-    let mut config: GroveConfig = toml::from_str(&raw).map_err(|source| ConfigError::TomlParse { source })?;
+    let mut config: GroveConfig =
+        toml::from_str(&raw).map_err(|source| ConfigError::TomlParse { source })?;
     apply_env_overrides(&mut config, env)?;
 
     let paths = GrovePaths::from_config(&config, path)?;
@@ -73,10 +74,10 @@ pub fn apply_env_overrides(
             "GROVE_RUNTIME__TIMEOUT_MINUTES" => {
                 config.runtime.timeout_minutes = parse_env(key, value)?
             }
-            "GROVE_RUNTIME__ENV_PASSTHROUGH" => {
-                config.runtime.env_passthrough = parse_csv(value)
+            "GROVE_RUNTIME__ENV_PASSTHROUGH" => config.runtime.env_passthrough = parse_csv(value),
+            "GROVE_SCHEDULER__MAX_PARALLEL" => {
+                config.scheduler.max_parallel = parse_env(key, value)?
             }
-            "GROVE_SCHEDULER__MAX_PARALLEL" => config.scheduler.max_parallel = parse_env(key, value)?,
             "GROVE_SCHEDULER__POLL_INTERVAL_MS" => {
                 config.scheduler.poll_interval_ms = parse_env(key, value)?
             }
@@ -134,7 +135,9 @@ pub fn apply_env_overrides(
             "GROVE_MEMORY__MAX_PROMPT_BULLETS" => {
                 config.memory.max_prompt_bullets = parse_env(key, value)?
             }
-            "GROVE_MEMORY__ENABLE_PLAYBOOK" => config.memory.enable_playbook = parse_env(key, value)?,
+            "GROVE_MEMORY__ENABLE_PLAYBOOK" => {
+                config.memory.enable_playbook = parse_env(key, value)?
+            }
             "GROVE_MEMORY__SEMANTIC_ENABLED" => {
                 config.memory.semantic_enabled = parse_env(key, value)?
             }
@@ -142,7 +145,9 @@ pub fn apply_env_overrides(
             "GROVE_RESERVATIONS__DEFAULT_TTL_MINUTES" => {
                 config.reservations.default_ttl_minutes = parse_env(key, value)?
             }
-            "GROVE_SAFETY__SCAN_TRANSCRIPTS" => config.safety.scan_transcripts = parse_env(key, value)?,
+            "GROVE_SAFETY__SCAN_TRANSCRIPTS" => {
+                config.safety.scan_transcripts = parse_env(key, value)?
+            }
             "GROVE_SAFETY__INJECT_SAFETY_PREAMBLE" => {
                 config.safety.inject_safety_preamble = parse_env(key, value)?
             }
@@ -244,10 +249,12 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    value.parse::<T>().map_err(|source| ConfigError::Validation {
-        field: field.to_owned(),
-        message: source.to_string(),
-    })
+    value
+        .parse::<T>()
+        .map_err(|source| ConfigError::Validation {
+            field: field.to_owned(),
+            message: source.to_string(),
+        })
 }
 
 fn parse_csv(value: &str) -> Vec<String> {

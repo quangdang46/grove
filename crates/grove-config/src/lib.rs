@@ -6,13 +6,12 @@ mod validate;
 
 pub use defaults::{
     DEFAULT_ARTIFACTS_DIR_NAME, DEFAULT_CHECKPOINTS_DIR_NAME, DEFAULT_DB_PATH,
-    DEFAULT_GROVE_DIR_NAME, DEFAULT_LOGS_DIR_NAME, DEFAULT_PROMPTS_DIR_NAME,
-    DEFAULT_TMP_DIR_NAME, DEFAULT_TRANSCRIPT_DIR,
+    DEFAULT_GROVE_DIR_NAME, DEFAULT_LOGS_DIR_NAME, DEFAULT_PROMPTS_DIR_NAME, DEFAULT_TMP_DIR_NAME,
+    DEFAULT_TRANSCRIPT_DIR,
 };
 pub use loader::{
-    LoadedConfig, RequiredTooling, ToolCapability, apply_env_overrides,
-    build_claude_environment, detect_required_tooling, load_from_path, load_from_path_with_env,
-    load_from_workspace,
+    LoadedConfig, RequiredTooling, ToolCapability, apply_env_overrides, build_claude_environment,
+    detect_required_tooling, load_from_path, load_from_path_with_env, load_from_workspace,
 };
 pub use model::{
     CheckpointConfig, CircuitBreakerConfig, ExitPolicyConfig, GroveConfig, LoggingConfig,
@@ -47,12 +46,7 @@ pub const CRATE_PURPOSE: &str = "Configuration loading, validation, and path own
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
-    use std::{
-        collections::HashMap,
-        error::Error,
-        fs,
-        io::Error as IoError,
-    };
+    use std::{collections::HashMap, error::Error, fs, io::Error as IoError};
     use tempfile::tempdir;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -73,10 +67,7 @@ mod tests {
         let dir = tempdir()?;
         let workspace_root = utf8(dir.path())?;
         let config_path = workspace_root.join("grove.toml");
-        fs::write(
-            &config_path,
-            "[runtime]\nworkspace_root = \".\"\n",
-        )?;
+        fs::write(&config_path, "[runtime]\nworkspace_root = \".\"\n")?;
 
         let loaded = load_from_path_with_env(&config_path, &HashMap::new())?;
         assert_eq!(loaded.config.runtime.workspace_root, ".");
@@ -167,7 +158,9 @@ persist_jsonl = false
         )
         .err()
         .ok_or_else(|| IoError::other("expected validation error"))?;
-        assert!(matches!(err, ConfigError::Validation { field, .. } if field == "checkpoint.rotate_pct"));
+        assert!(
+            matches!(err, ConfigError::Validation { field, .. } if field == "checkpoint.rotate_pct")
+        );
         Ok(())
     }
 
@@ -179,7 +172,9 @@ persist_jsonl = false
         )
         .err()
         .ok_or_else(|| IoError::other("expected validation error"))?;
-        assert!(matches!(err, ConfigError::Validation { field, .. } if field == "checkpoint.hard_stop_pct"));
+        assert!(
+            matches!(err, ConfigError::Validation { field, .. } if field == "checkpoint.hard_stop_pct")
+        );
         Ok(())
     }
 
@@ -188,7 +183,9 @@ persist_jsonl = false
         let err = load_with_text("[scheduler]\nmax_parallel = 0\n", &HashMap::new())
             .err()
             .ok_or_else(|| IoError::other("expected validation error"))?;
-        assert!(matches!(err, ConfigError::Validation { field, .. } if field == "scheduler.max_parallel"));
+        assert!(
+            matches!(err, ConfigError::Validation { field, .. } if field == "scheduler.max_parallel")
+        );
         Ok(())
     }
 
@@ -197,7 +194,9 @@ persist_jsonl = false
         let err = load_with_text("[scheduler]\nretry_max = 0\n", &HashMap::new())
             .err()
             .ok_or_else(|| IoError::other("expected validation error"))?;
-        assert!(matches!(err, ConfigError::Validation { field, .. } if field == "scheduler.retry_max"));
+        assert!(
+            matches!(err, ConfigError::Validation { field, .. } if field == "scheduler.retry_max")
+        );
         Ok(())
     }
 
@@ -206,7 +205,9 @@ persist_jsonl = false
         let err = load_with_text("[checkpoint]\nwarn_pct = 1.2\n", &HashMap::new())
             .err()
             .ok_or_else(|| IoError::other("expected validation error"))?;
-        assert!(matches!(err, ConfigError::Validation { field, .. } if field == "checkpoint.warn_pct"));
+        assert!(
+            matches!(err, ConfigError::Validation { field, .. } if field == "checkpoint.warn_pct")
+        );
         Ok(())
     }
 
@@ -218,19 +219,20 @@ persist_jsonl = false
         )
         .err()
         .ok_or_else(|| IoError::other("expected validation error"))?;
-        assert!(matches!(err, ConfigError::Validation { field, .. } if field == "exit_policy.completion_indicator_threshold"));
+        assert!(
+            matches!(err, ConfigError::Validation { field, .. } if field == "exit_policy.completion_indicator_threshold")
+        );
         Ok(())
     }
 
     #[test]
     fn validation_cooldown_minutes_gte_1() -> TestResult {
-        let err = load_with_text(
-            "[circuit_breaker]\ncooldown_minutes = 0\n",
-            &HashMap::new(),
-        )
-        .err()
-        .ok_or_else(|| IoError::other("expected validation error"))?;
-        assert!(matches!(err, ConfigError::Validation { field, .. } if field == "circuit_breaker.cooldown_minutes"));
+        let err = load_with_text("[circuit_breaker]\ncooldown_minutes = 0\n", &HashMap::new())
+            .err()
+            .ok_or_else(|| IoError::other("expected validation error"))?;
+        assert!(
+            matches!(err, ConfigError::Validation { field, .. } if field == "circuit_breaker.cooldown_minutes")
+        );
         Ok(())
     }
 
@@ -241,7 +243,13 @@ persist_jsonl = false
             &HashMap::new(),
         )?;
         assert!(loaded.paths.db_path().as_str().ends_with("data/grove.db"));
-        assert!(loaded.paths.transcript_dir().as_str().ends_with("data/transcripts"));
+        assert!(
+            loaded
+                .paths
+                .transcript_dir()
+                .as_str()
+                .ends_with("data/transcripts")
+        );
         Ok(())
     }
 
@@ -250,10 +258,7 @@ persist_jsonl = false
         let dir = tempdir()?;
         let workspace_root = utf8(dir.path())?;
         let absolute_db = workspace_root.join("outside.db");
-        let text = format!(
-            "[memory]\ndb_path = \"{}\"\n",
-            absolute_db.as_str()
-        );
+        let text = format!("[memory]\ndb_path = \"{}\"\n", absolute_db.as_str());
         let loaded = load_with_text(&text, &HashMap::new())?;
         assert_eq!(loaded.paths.db_path(), absolute_db.as_path());
         Ok(())
@@ -309,7 +314,10 @@ persist_jsonl = false
         Ok(())
     }
 
-    fn load_with_text(text: &str, env: &HashMap<String, String>) -> Result<LoadedConfig, ConfigError> {
+    fn load_with_text(
+        text: &str,
+        env: &HashMap<String, String>,
+    ) -> Result<LoadedConfig, ConfigError> {
         let dir = tempdir().map_err(|source| ConfigError::Validation {
             field: "test.tempdir".to_owned(),
             message: source.to_string(),

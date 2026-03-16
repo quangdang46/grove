@@ -22,7 +22,7 @@ pub struct CheckpointRecord {
     pub next_step: String,
     pub payload: Value,
     pub saved_at: Timestamp,
-    pub resume_generation: u32,
+    pub resume_generation: ResumeGeneration,
 }
 
 pub type ResumeGeneration = u32;

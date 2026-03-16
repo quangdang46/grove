@@ -1,4 +1,4 @@
-use crate::{BeadId, RunId, SessionId, SourceId};
+use crate::{BeadId, RunId, SessionId, SourceId, Timestamp};
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,8 +29,8 @@ pub struct ConversationRecord {
     pub workspace: Option<Utf8PathBuf>,
     pub title: Option<String>,
     pub source_path: Utf8PathBuf,
-    pub started_at: Option<i64>,
-    pub ended_at: Option<i64>,
+    pub started_at: Option<Timestamp>,
+    pub ended_at: Option<Timestamp>,
     pub approx_tokens: Option<i64>,
     pub metadata_json: Value,
     pub messages: Vec<MessageRecord>,
@@ -44,7 +44,7 @@ pub struct MessageRecord {
     pub idx: i64,
     pub role: MessageRole,
     pub author: Option<String>,
-    pub created_at: Option<i64>,
+    pub created_at: Option<Timestamp>,
     pub content: String,
     pub extra_json: Value,
     pub snippets: Vec<SnippetRecord>,

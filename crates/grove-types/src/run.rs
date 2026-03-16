@@ -1,4 +1,4 @@
-use crate::{errors::InvalidTransition, BeadId, CheckpointId, Timestamp};
+use crate::{BeadId, CheckpointId, Timestamp, errors::InvalidTransition};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
