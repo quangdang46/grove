@@ -233,7 +233,7 @@ impl SuppressionReasonView {
                 code: reason.code(),
                 summary: "retry backoff still pending".to_owned(),
                 run_id: None,
-                retry_after: retry_after.clone(),
+                retry_after: *retry_after,
                 label: None,
                 issue_type: None,
                 conflict: None,
