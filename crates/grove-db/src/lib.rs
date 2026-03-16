@@ -7,7 +7,9 @@ use grove_br::{
     BeadCacheStore, BrDependencySnapshot, BrIssueSummary, CachedBeadState, UpsertOutcome,
 };
 use grove_types::{
-    BeadId, BeadPriority, BeadRef, FailureClass, GroveBeadRecord, GroveBeadStatus, RunId, Timestamp,
+    BeadId, BeadPriority, BeadRef, CheckpointId, CheckpointRecord, ClaudeSessionRecord, EventKind,
+    EventLogRecord, FailureClass, GroveBeadRecord, GroveBeadStatus, HandoffRecord, RunId,
+    RunStatus, SessionId, SessionStatus, StopReason, TaskRunRecord, Timestamp,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde_json::Value;
@@ -66,6 +68,74 @@ struct RawBeadRecordRow {
     last_failure_class: Option<String>,
     last_failure_detail: Option<String>,
     runtime_updated_at: Option<String>,
+}
+
+#[derive(Debug)]
+struct RawTaskRunRow {
+    id: String,
+    bead_id: String,
+    attempt_no: i32,
+    status: String,
+    failure_class: Option<String>,
+    failure_detail: Option<String>,
+    started_at: String,
+    ended_at: Option<String>,
+    session_count: i32,
+    checkpoint_count: i32,
+    last_checkpoint_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct RawSessionRow {
+    id: String,
+    run_id: String,
+    external_session_id: Option<String>,
+    ordinal_in_run: i32,
+    status: String,
+    started_at: String,
+    ended_at: Option<String>,
+    prompt_bytes: i32,
+    estimated_input_tokens: i32,
+    estimated_output_tokens: i32,
+    exit_code: Option<i32>,
+    stop_reason: Option<String>,
+    transcript_path: String,
+}
+
+#[derive(Debug)]
+struct RawCheckpointRow {
+    id: String,
+    bead_id: String,
+    run_id: String,
+    session_id: String,
+    progress: String,
+    next_step: String,
+    payload_json: String,
+    saved_at: String,
+    resume_generation: u32,
+}
+
+#[derive(Debug)]
+struct RawHandoffRow {
+    bead_id: String,
+    run_id: String,
+    summary: String,
+    artifacts_json: String,
+    lessons_json: String,
+    decisions_json: String,
+    warnings_json: String,
+    completed_at: String,
+}
+
+#[derive(Debug)]
+struct RawEventLogRow {
+    id: i64,
+    kind: String,
+    bead_id: Option<String>,
+    run_id: Option<String>,
+    session_id: Option<String>,
+    payload_json: String,
+    created_at: String,
 }
 
 impl Database {
@@ -234,6 +304,110 @@ impl Database {
             blocks,
             rows: Vec::new(),
         })
+    }
+
+    pub fn list_task_runs_for_bead(&self, bead_id: &BeadId) -> Result<Vec<TaskRunRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, \
+                    session_count, checkpoint_count, last_checkpoint_id \
+                 FROM task_runs \
+                 WHERE bead_id = ?1 \
+                 ORDER BY attempt_no DESC, started_at DESC",
+            )
+            .context("prepare task run list query")?;
+
+        let rows = stmt
+            .query_map([bead_id.as_str()], raw_task_run_row)
+            .with_context(|| format!("query task runs for {}", bead_id.as_str()))?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect task run rows")?
+            .into_iter()
+            .map(raw_task_run_into_record)
+            .collect()
+    }
+
+    pub fn latest_session_for_run(&self, run_id: &RunId) -> Result<Option<ClaudeSessionRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, \
+                    prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path \
+                 FROM claude_sessions \
+                 WHERE run_id = ?1 \
+                 ORDER BY ordinal_in_run DESC, started_at DESC \
+                 LIMIT 1",
+            )
+            .context("prepare latest session query")?;
+
+        let raw = stmt
+            .query_row([run_id.as_str()], raw_session_row)
+            .optional()
+            .with_context(|| format!("query latest session for {}", run_id.as_str()))?;
+
+        raw.map(raw_session_into_record).transpose()
+    }
+
+    pub fn latest_checkpoint_for_bead(&self, bead_id: &BeadId) -> Result<Option<CheckpointRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, bead_id, run_id, session_id, progress, next_step, payload_json, saved_at, resume_generation \
+                 FROM checkpoints \
+                 WHERE bead_id = ?1 \
+                 ORDER BY saved_at DESC, id DESC \
+                 LIMIT 1",
+            )
+            .context("prepare latest checkpoint query")?;
+
+        let raw = stmt
+            .query_row([bead_id.as_str()], raw_checkpoint_row)
+            .optional()
+            .with_context(|| format!("query latest checkpoint for {}", bead_id.as_str()))?;
+
+        raw.map(raw_checkpoint_into_record).transpose()
+    }
+
+    pub fn handoff_for_bead(&self, bead_id: &BeadId) -> Result<Option<HandoffRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bead_id, run_id, summary, artifacts_json, lessons_json, decisions_json, warnings_json, completed_at \
+                 FROM handoffs \
+                 WHERE bead_id = ?1",
+            )
+            .context("prepare handoff query")?;
+
+        let raw = stmt
+            .query_row([bead_id.as_str()], raw_handoff_row)
+            .optional()
+            .with_context(|| format!("query handoff for {}", bead_id.as_str()))?;
+
+        raw.map(raw_handoff_into_record).transpose()
+    }
+
+    pub fn list_event_logs_for_bead(&self, bead_id: &BeadId) -> Result<Vec<EventLogRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, kind, bead_id, run_id, session_id, payload_json, created_at \
+                 FROM event_log \
+                 WHERE bead_id = ?1 \
+                 ORDER BY id DESC",
+            )
+            .context("prepare event log list query")?;
+
+        let rows = stmt
+            .query_map([bead_id.as_str()], raw_event_log_row)
+            .with_context(|| format!("query event log for {}", bead_id.as_str()))?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect event log rows")?
+            .into_iter()
+            .map(raw_event_log_into_record)
+            .collect()
     }
 
     fn applied_migration_name(&self, version: i64) -> Result<Option<String>> {
@@ -495,6 +669,79 @@ fn raw_bead_record_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawBeadRecor
     })
 }
 
+fn raw_task_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTaskRunRow> {
+    Ok(RawTaskRunRow {
+        id: row.get(0)?,
+        bead_id: row.get(1)?,
+        attempt_no: row.get(2)?,
+        status: row.get(3)?,
+        failure_class: row.get(4)?,
+        failure_detail: row.get(5)?,
+        started_at: row.get(6)?,
+        ended_at: row.get(7)?,
+        session_count: row.get(8)?,
+        checkpoint_count: row.get(9)?,
+        last_checkpoint_id: row.get(10)?,
+    })
+}
+
+fn raw_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSessionRow> {
+    Ok(RawSessionRow {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        external_session_id: row.get(2)?,
+        ordinal_in_run: row.get(3)?,
+        status: row.get(4)?,
+        started_at: row.get(5)?,
+        ended_at: row.get(6)?,
+        prompt_bytes: row.get(7)?,
+        estimated_input_tokens: row.get(8)?,
+        estimated_output_tokens: row.get(9)?,
+        exit_code: row.get(10)?,
+        stop_reason: row.get(11)?,
+        transcript_path: row.get(12)?,
+    })
+}
+
+fn raw_checkpoint_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawCheckpointRow> {
+    Ok(RawCheckpointRow {
+        id: row.get(0)?,
+        bead_id: row.get(1)?,
+        run_id: row.get(2)?,
+        session_id: row.get(3)?,
+        progress: row.get(4)?,
+        next_step: row.get(5)?,
+        payload_json: row.get(6)?,
+        saved_at: row.get(7)?,
+        resume_generation: row.get(8)?,
+    })
+}
+
+fn raw_handoff_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawHandoffRow> {
+    Ok(RawHandoffRow {
+        bead_id: row.get(0)?,
+        run_id: row.get(1)?,
+        summary: row.get(2)?,
+        artifacts_json: row.get(3)?,
+        lessons_json: row.get(4)?,
+        decisions_json: row.get(5)?,
+        warnings_json: row.get(6)?,
+        completed_at: row.get(7)?,
+    })
+}
+
+fn raw_event_log_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEventLogRow> {
+    Ok(RawEventLogRow {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        bead_id: row.get(2)?,
+        run_id: row.get(3)?,
+        session_id: row.get(4)?,
+        payload_json: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
 fn raw_bead_record_into_record(row: RawBeadRecordRow) -> Result<GroveBeadRecord> {
     let raw_json: Value = parse_json(&row.raw_json, "raw bead JSON")?;
     let synced_at = parse_timestamp(&row.synced_at)?;
@@ -548,6 +795,83 @@ fn raw_bead_record_into_record(row: RawBeadRecordRow) -> Result<GroveBeadRecord>
         last_failure_detail: row.last_failure_detail,
         synced_at,
         runtime_updated_at,
+    })
+}
+
+fn raw_task_run_into_record(row: RawTaskRunRow) -> Result<TaskRunRecord> {
+    Ok(TaskRunRecord {
+        id: RunId::new(row.id),
+        bead_id: BeadId::new(row.bead_id),
+        attempt_no: row.attempt_no,
+        status: parse_run_status(&row.status)?,
+        failure_class: row
+            .failure_class
+            .as_deref()
+            .map(parse_failure_class)
+            .transpose()?,
+        failure_detail: row.failure_detail,
+        started_at: parse_timestamp(&row.started_at)?,
+        ended_at: row.ended_at.as_deref().map(parse_timestamp).transpose()?,
+        session_count: row.session_count,
+        checkpoint_count: row.checkpoint_count,
+        last_checkpoint_id: row.last_checkpoint_id.map(CheckpointId::new),
+    })
+}
+
+fn raw_session_into_record(row: RawSessionRow) -> Result<ClaudeSessionRecord> {
+    Ok(ClaudeSessionRecord {
+        id: SessionId::new(row.id),
+        run_id: RunId::new(row.run_id),
+        external_session_id: row.external_session_id,
+        ordinal_in_run: row.ordinal_in_run,
+        status: parse_session_status(&row.status)?,
+        started_at: parse_timestamp(&row.started_at)?,
+        ended_at: row.ended_at.as_deref().map(parse_timestamp).transpose()?,
+        prompt_bytes: row.prompt_bytes,
+        estimated_input_tokens: row.estimated_input_tokens,
+        estimated_output_tokens: row.estimated_output_tokens,
+        exit_code: row.exit_code,
+        stop_reason: row.stop_reason.as_deref().map(parse_stop_reason).transpose()?,
+        transcript_path: row.transcript_path,
+    })
+}
+
+fn raw_checkpoint_into_record(row: RawCheckpointRow) -> Result<CheckpointRecord> {
+    Ok(CheckpointRecord {
+        id: CheckpointId::new(row.id),
+        bead_id: BeadId::new(row.bead_id),
+        run_id: RunId::new(row.run_id),
+        session_id: SessionId::new(row.session_id),
+        progress: row.progress,
+        next_step: row.next_step,
+        payload: parse_json(&row.payload_json, "checkpoint payload")?,
+        saved_at: parse_timestamp(&row.saved_at)?,
+        resume_generation: row.resume_generation,
+    })
+}
+
+fn raw_handoff_into_record(row: RawHandoffRow) -> Result<HandoffRecord> {
+    Ok(HandoffRecord {
+        bead_id: BeadId::new(row.bead_id),
+        run_id: RunId::new(row.run_id),
+        summary: row.summary,
+        artifacts: parse_json(&row.artifacts_json, "handoff artifacts")?,
+        lessons: parse_json(&row.lessons_json, "handoff lessons")?,
+        decisions: parse_json(&row.decisions_json, "handoff decisions")?,
+        warnings: parse_json(&row.warnings_json, "handoff warnings")?,
+        completed_at: parse_timestamp(&row.completed_at)?,
+    })
+}
+
+fn raw_event_log_into_record(row: RawEventLogRow) -> Result<EventLogRecord> {
+    Ok(EventLogRecord {
+        id: row.id,
+        kind: parse_event_kind(&row.kind)?,
+        bead_id: row.bead_id.map(BeadId::new),
+        run_id: row.run_id.map(RunId::new),
+        session_id: row.session_id.map(SessionId::new),
+        payload: parse_json(&row.payload_json, "event log payload")?,
+        created_at: parse_timestamp(&row.created_at)?,
     })
 }
 
@@ -641,6 +965,75 @@ fn parse_failure_class(text: &str) -> Result<FailureClass> {
     }
 }
 
+fn parse_run_status(text: &str) -> Result<RunStatus> {
+    match normalize_enum_token(text).as_str() {
+        "active" => Ok(RunStatus::Active),
+        "waitingtoretry" => Ok(RunStatus::WaitingToRetry),
+        "checkpointed" => Ok(RunStatus::Checkpointed),
+        "succeeded" => Ok(RunStatus::Succeeded),
+        "failed" => Ok(RunStatus::Failed),
+        _ => bail!("unsupported run status {text}"),
+    }
+}
+
+fn parse_session_status(text: &str) -> Result<SessionStatus> {
+    match normalize_enum_token(text).as_str() {
+        "starting" => Ok(SessionStatus::Starting),
+        "running" => Ok(SessionStatus::Running),
+        "checkpointed" => Ok(SessionStatus::Checkpointed),
+        "completed" => Ok(SessionStatus::Completed),
+        "timedout" => Ok(SessionStatus::TimedOut),
+        "ratelimited" => Ok(SessionStatus::RateLimited),
+        "permissiondenied" => Ok(SessionStatus::PermissionDenied),
+        "crashed" => Ok(SessionStatus::Crashed),
+        "unknownfailure" => Ok(SessionStatus::UnknownFailure),
+        _ => bail!("unsupported session status {text}"),
+    }
+}
+
+fn parse_stop_reason(text: &str) -> Result<StopReason> {
+    match normalize_enum_token(text).as_str() {
+        "exit" => Ok(StopReason::Exit),
+        "checkpoint" => Ok(StopReason::Checkpoint),
+        "timeout" => Ok(StopReason::Timeout),
+        "ratelimit" => Ok(StopReason::RateLimit),
+        "permissiondenied" => Ok(StopReason::PermissionDenied),
+        "crash" => Ok(StopReason::Crash),
+        "kill" => Ok(StopReason::Kill),
+        "unknown" => Ok(StopReason::Unknown),
+        _ => bail!("unsupported stop reason {text}"),
+    }
+}
+
+fn parse_event_kind(text: &str) -> Result<EventKind> {
+    match normalize_enum_token(text).as_str() {
+        "beadcachesynced" => Ok(EventKind::BeadCacheSynced),
+        "dependencysnapshotsynced" => Ok(EventKind::DependencySnapshotSynced),
+        "grovestatusupdated" => Ok(EventKind::GroveStatusUpdated),
+        "runstarted" => Ok(EventKind::RunStarted),
+        "sessionstarted" => Ok(EventKind::SessionStarted),
+        "sessioncheckpointed" => Ok(EventKind::SessionCheckpointed),
+        "sessionsucceeded" => Ok(EventKind::SessionSucceeded),
+        "sessionfailed" => Ok(EventKind::SessionFailed),
+        "handoffwritten" => Ok(EventKind::HandoffWritten),
+        "reservationgranted" => Ok(EventKind::ReservationGranted),
+        "reservationconflictdetected" => Ok(EventKind::ReservationConflictDetected),
+        "reservationexpired" => Ok(EventKind::ReservationExpired),
+        "recoveryactiontaken" => Ok(EventKind::RecoveryActionTaken),
+        "leaseacquired" => Ok(EventKind::LeaseAcquired),
+        "leaseheartbeat" => Ok(EventKind::LeaseHeartbeat),
+        "leasereleased" => Ok(EventKind::LeaseReleased),
+        "archiveingested" => Ok(EventKind::ArchiveIngested),
+        "playbookbulletadded" => Ok(EventKind::PlaybookBulletAdded),
+        "playbookbulletpromoted" => Ok(EventKind::PlaybookBulletPromoted),
+        "playbookbulletdeprecated" => Ok(EventKind::PlaybookBulletDeprecated),
+        "brmirrorrequested" => Ok(EventKind::BrMirrorRequested),
+        "brmirrorsucceeded" => Ok(EventKind::BrMirrorSucceeded),
+        "brmirrorfailed" => Ok(EventKind::BrMirrorFailed),
+        _ => bail!("unsupported event kind {text}"),
+    }
+}
+
 fn normalize_enum_token(text: &str) -> String {
     text.chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
@@ -656,7 +1049,7 @@ mod tests {
         BeadCacheStore, BrCapability, BrClient, BrDependencySnapshot, BrError, BrIssueDetail,
         BrIssueSummary, BrVersion, sync_bead_cache,
     };
-    use grove_types::{BeadId, BeadPriority, Timestamp};
+    use grove_types::{BeadId, BeadPriority, RunId, Timestamp};
     use rusqlite::OptionalExtension;
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -863,6 +1256,148 @@ mod tests {
         assert_eq!(record.metadata, json!({}));
         assert_eq!(record.bead.created_at, record.synced_at);
         assert_eq!(record.bead.updated_at, record.bead.created_at);
+        Ok(())
+    }
+
+    #[test]
+    fn query_helpers_read_runs_sessions_checkpoints_handoffs_and_events() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| anyhow::anyhow!("temp path was not valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        db.connection().execute(
+            "INSERT INTO bead_cache(\
+                bead_id, title, description, priority, issue_type, status, assignee,\
+                labels_json, parent_ids_json, dependency_ids_json, dependent_ids_json, raw_json, synced_at\
+            ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, '[]', '[]', '[]', '[]', ?6, ?7)",
+            rusqlite::params![
+                "grove-query",
+                "Query bead",
+                0,
+                "task",
+                "open",
+                "{}",
+                "2026-03-16T10:00:00Z",
+            ],
+        )?;
+
+        db.connection().execute(
+            "INSERT INTO task_runs(\
+                id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id\
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                "run-query",
+                "grove-query",
+                2,
+                "Checkpointed",
+                "RateLimit",
+                "wait before retry",
+                "2026-03-16T11:00:00Z",
+                "2026-03-16T11:10:00Z",
+                1,
+                1,
+                "chk-query",
+            ],
+        )?;
+
+        db.connection().execute(
+            "INSERT INTO claude_sessions(\
+                id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path\
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                "ses-query",
+                "run-query",
+                "claude-123",
+                1,
+                "Checkpointed",
+                "2026-03-16T11:00:00Z",
+                "2026-03-16T11:05:00Z",
+                120,
+                30,
+                45,
+                0,
+                "Checkpoint",
+                ".grove/transcripts/grove-query/ses-query.jsonl",
+            ],
+        )?;
+
+        db.connection().execute(
+            "INSERT INTO checkpoints(\
+                id, bead_id, run_id, session_id, progress, next_step, payload_json, saved_at, resume_generation\
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                "chk-query",
+                "grove-query",
+                "run-query",
+                "ses-query",
+                "halfway there",
+                "finish the query layer",
+                "{\"claimed_paths\":[\"crates/grove-db/src/lib.rs\"]}",
+                "2026-03-16T11:06:00Z",
+                3,
+            ],
+        )?;
+
+        db.connection().execute(
+            "INSERT INTO handoffs(\
+                bead_id, run_id, summary, artifacts_json, lessons_json, decisions_json, warnings_json, completed_at\
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                "grove-query",
+                "run-query",
+                "finished query helpers",
+                "[\"artifact-1\"]",
+                "[\"lesson-1\"]",
+                "[\"decision-1\"]",
+                "[\"warning-1\"]",
+                "2026-03-16T11:20:00Z",
+            ],
+        )?;
+
+        db.connection().execute(
+            "INSERT INTO event_log(kind, bead_id, run_id, session_id, payload_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "BrMirrorFailed",
+                "grove-query",
+                "run-query",
+                "ses-query",
+                "{\"error\":\"network hiccup\"}",
+                "2026-03-16T11:21:00Z",
+            ],
+        )?;
+
+        let runs = db.list_task_runs_for_bead(&BeadId::new("grove-query"))?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id.as_str(), "run-query");
+        assert_eq!(format!("{:?}", runs[0].status), "Checkpointed");
+        assert_eq!(format!("{:?}", runs[0].failure_class), "Some(RateLimit)");
+        assert_eq!(runs[0].last_checkpoint_id.as_ref().map(|id| id.as_str()), Some("chk-query"));
+
+        let session = db.latest_session_for_run(&RunId::new("run-query"))?
+            .ok_or_else(|| anyhow::anyhow!("expected latest session"))?;
+        assert_eq!(session.id.as_str(), "ses-query");
+        assert_eq!(format!("{:?}", session.status), "Checkpointed");
+        assert_eq!(format!("{:?}", session.stop_reason), "Some(Checkpoint)");
+
+        let checkpoint = db.latest_checkpoint_for_bead(&BeadId::new("grove-query"))?
+            .ok_or_else(|| anyhow::anyhow!("expected latest checkpoint"))?;
+        assert_eq!(checkpoint.id.as_str(), "chk-query");
+        assert_eq!(checkpoint.resume_generation, 3);
+        assert_eq!(checkpoint.progress, "halfway there");
+
+        let handoff = db.handoff_for_bead(&BeadId::new("grove-query"))?
+            .ok_or_else(|| anyhow::anyhow!("expected handoff"))?;
+        assert_eq!(handoff.summary, "finished query helpers");
+        assert_eq!(handoff.artifacts, vec!["artifact-1"]);
+
+        let events = db.list_event_logs_for_bead(&BeadId::new("grove-query"))?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(format!("{:?}", events[0].kind), "BrMirrorFailed");
+        assert_eq!(events[0].run_id.as_ref().map(|id| id.as_str()), Some("run-query"));
+        assert!(events[0].payload.to_string().contains("network hiccup"));
         Ok(())
     }
 
