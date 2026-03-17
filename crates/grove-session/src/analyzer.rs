@@ -332,6 +332,8 @@ mod tests {
                 status: SessionStatus::Completed,
                 started_at,
                 ended_at: Some(started_at),
+                prompt_id: None,
+                prompt_manifest_path: None,
                 prompt_bytes: 0,
                 estimated_input_tokens: 0,
                 estimated_output_tokens: 0,

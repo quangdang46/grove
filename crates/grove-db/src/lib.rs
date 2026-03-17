@@ -8,9 +8,9 @@ use grove_br::{
 };
 use grove_types::{
     BeadId, BeadPriority, BeadRef, CheckpointId, CheckpointRecord, ClaudeSessionRecord, EventKind,
-    EventLogRecord, FailureClass, GroveBeadRecord, GroveBeadStatus, HandoffRecord, ReservationMode,
-    ReservationRecord, RunId, RunStatus, SessionId, SessionStatus, StopReason, TaskRunRecord,
-    Timestamp,
+    EventLogRecord, FailureClass, GroveBeadRecord, GroveBeadStatus, HandoffRecord, PromptId,
+    ReservationMode, ReservationRecord, RunId, RunStatus, SessionId, SessionStatus, StopReason,
+    TaskRunRecord, Timestamp,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde_json::Value;
@@ -25,11 +25,18 @@ const PRAGMAS: &[&str] = &[
     "PRAGMA busy_timeout = 5000;",
 ];
 
-const MIGRATION_MANIFEST: &[Migration<'_>] = &[Migration {
-    version: 1,
-    name: "0001_init.sql",
-    sql: include_str!("../migrations/0001_init.sql"),
-}];
+const MIGRATION_MANIFEST: &[Migration<'_>] = &[
+    Migration {
+        version: 1,
+        name: "0001_init.sql",
+        sql: include_str!("../migrations/0001_init.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_prompt_manifest_columns.sql",
+        sql: include_str!("../migrations/0002_prompt_manifest_columns.sql"),
+    },
+];
 
 #[derive(Debug)]
 pub struct Database {
@@ -95,6 +102,8 @@ struct RawSessionRow {
     status: String,
     started_at: String,
     ended_at: Option<String>,
+    prompt_id: Option<String>,
+    prompt_manifest_path: Option<String>,
     prompt_bytes: i32,
     estimated_input_tokens: i32,
     estimated_output_tokens: i32,
@@ -347,7 +356,7 @@ impl Database {
             .conn
             .prepare(
                 "SELECT id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, \
-                    prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path \
+                    prompt_id, prompt_manifest_path, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path \
                  FROM claude_sessions \
                  WHERE run_id = ?1 \
                  ORDER BY ordinal_in_run DESC, started_at DESC \
@@ -731,12 +740,14 @@ fn raw_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSessionRow> {
         status: row.get(4)?,
         started_at: row.get(5)?,
         ended_at: row.get(6)?,
-        prompt_bytes: row.get(7)?,
-        estimated_input_tokens: row.get(8)?,
-        estimated_output_tokens: row.get(9)?,
-        exit_code: row.get(10)?,
-        stop_reason: row.get(11)?,
-        transcript_path: row.get(12)?,
+        prompt_id: row.get(7)?,
+        prompt_manifest_path: row.get(8)?,
+        prompt_bytes: row.get(9)?,
+        estimated_input_tokens: row.get(10)?,
+        estimated_output_tokens: row.get(11)?,
+        exit_code: row.get(12)?,
+        stop_reason: row.get(13)?,
+        transcript_path: row.get(14)?,
     })
 }
 
@@ -877,6 +888,8 @@ fn raw_session_into_record(row: RawSessionRow) -> Result<ClaudeSessionRecord> {
         status: parse_session_status(&row.status)?,
         started_at: parse_timestamp(&row.started_at)?,
         ended_at: row.ended_at.as_deref().map(parse_timestamp).transpose()?,
+        prompt_id: row.prompt_id.map(PromptId::new),
+        prompt_manifest_path: row.prompt_manifest_path,
         prompt_bytes: row.prompt_bytes,
         estimated_input_tokens: row.estimated_input_tokens,
         estimated_output_tokens: row.estimated_output_tokens,
@@ -1156,12 +1169,19 @@ mod tests {
         db.migrate()?;
 
         let migrations = db.applied_migrations()?;
-        assert_eq!(migrations.len(), 1);
+        assert_eq!(migrations.len(), 2);
         assert_eq!(
             migrations[0],
             MigrationState {
                 version: 1,
                 name: "0001_init.sql".into(),
+            }
+        );
+        assert_eq!(
+            migrations[1],
+            MigrationState {
+                version: 2,
+                name: "0002_prompt_manifest_columns.sql".into(),
             }
         );
         Ok(())
@@ -1379,8 +1399,8 @@ mod tests {
 
         db.connection().execute(
             "INSERT INTO claude_sessions(\
-                id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path\
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, prompt_id, prompt_manifest_path, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path\
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 "ses-query",
                 "run-query",
@@ -1389,6 +1409,8 @@ mod tests {
                 "Checkpointed",
                 "2026-03-16T11:00:00Z",
                 "2026-03-16T11:05:00Z",
+                "prompt-query",
+                ".grove/prompts/prompt-query.json",
                 120,
                 30,
                 45,
@@ -1474,6 +1496,11 @@ mod tests {
         assert_eq!(session.id.as_str(), "ses-query");
         assert_eq!(format!("{:?}", session.status), "Checkpointed");
         assert_eq!(format!("{:?}", session.stop_reason), "Some(Checkpoint)");
+        assert_eq!(session.prompt_id.as_ref().map(|id| id.as_str()), Some("prompt-query"));
+        assert_eq!(
+            session.prompt_manifest_path.as_deref(),
+            Some(".grove/prompts/prompt-query.json")
+        );
 
         let checkpoint = db
             .latest_checkpoint_for_bead(&BeadId::new("grove-query"))?

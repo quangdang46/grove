@@ -643,6 +643,41 @@ fn print_inspect_report(
                     println!("- exit code: {}", display_option(session.exit_code));
                     println!("- transcript: {}", session.transcript_path);
                     println!(
+                        "- prompt id: {}",
+                        display_option(session.prompt_id.as_deref())
+                    );
+                    println!(
+                        "- prompt manifest: {}",
+                        display_option(session.prompt_manifest_path.as_deref())
+                    );
+                    if let Some(prompt) = session.prompt_provenance.as_ref() {
+                        println!("- prompt contract: {}", prompt.contract);
+                        println!("- prompt estimated tokens: {}", prompt.estimated_tokens);
+                        println!("- prompt bytes: {}", prompt.prompt_bytes);
+                        println!("- prompt trimmed: {}", prompt.trimmed);
+                        println!(
+                            "- retry delta summary: {}",
+                            display_option(prompt.retry_delta_summary.as_deref())
+                        );
+                        if prompt.sections.is_empty() {
+                            println!("- prompt sections: none");
+                        } else {
+                            println!("- prompt sections:");
+                            for section in &prompt.sections {
+                                println!(
+                                    "  - #{} {} [{}] included={} tokens={} trim={} ",
+                                    section.ordinal,
+                                    section.heading,
+                                    section.kind,
+                                    section.included,
+                                    section.estimated_tokens,
+                                    display_option(section.trim_reason.as_deref())
+                                );
+                                println!("    preview: {}", section.preview);
+                            }
+                        }
+                    }
+                    println!(
                         "- result summary: {}",
                         display_option(session.result_summary.as_deref())
                     );

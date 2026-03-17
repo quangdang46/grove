@@ -73,9 +73,11 @@ fn init_creates_database_with_migrations() -> TestResult {
 
     // Verify migrations were applied
     let applied_migrations = db.applied_migrations()?;
-    assert_eq!(applied_migrations.len(), 1, "should have 1 applied migration");
+    assert_eq!(applied_migrations.len(), 2, "should have 2 applied migrations");
     assert_eq!(applied_migrations[0].version, 1);
     assert_eq!(applied_migrations[0].name, "0001_init.sql");
+    assert_eq!(applied_migrations[1].version, 2);
+    assert_eq!(applied_migrations[1].name, "0002_prompt_manifest_columns.sql");
 
     // Verify tables exist by attempting to query them
     let conn = db.connection();

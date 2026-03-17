@@ -1,4 +1,4 @@
-use crate::{ProtocolEvent, SessionId, Timestamp, errors::InvalidTransition};
+use crate::{PromptId, ProtocolEvent, SessionId, Timestamp, errors::InvalidTransition};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +90,8 @@ pub struct ClaudeSessionRecord {
     pub status: SessionStatus,
     pub started_at: Timestamp,
     pub ended_at: Option<Timestamp>,
+    pub prompt_id: Option<PromptId>,
+    pub prompt_manifest_path: Option<String>,
     pub prompt_bytes: i32,
     pub estimated_input_tokens: i32,
     pub estimated_output_tokens: i32,

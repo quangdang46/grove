@@ -6,6 +6,7 @@ mod handoff;
 mod ids;
 mod playbook;
 mod priority;
+mod prompt;
 mod reservation;
 mod run;
 mod session;
@@ -28,6 +29,10 @@ pub use playbook::{
     MemoryDiaryRecord, PlaybookBulletRecord,
 };
 pub use priority::BeadPriority;
+pub use prompt::{
+    ExecutionContract, PromptManifest, PromptManifestSection, PromptSectionProvenance,
+    PromptSegment, PromptSegmentKind, PromptTrimReason,
+};
 pub use reservation::{ReservationConflict, ReservationMode, ReservationRecord};
 pub use run::{FailureClass, RetryPolicy, RunStatus, TaskRunRecord};
 pub use session::{

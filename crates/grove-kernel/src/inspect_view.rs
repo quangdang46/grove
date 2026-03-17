@@ -8,10 +8,11 @@ use chrono::Utc;
 use grove_br::BrClient;
 use grove_config::GroveConfig;
 use grove_db::Database;
+use std::fs;
 use grove_types::{
     BeadId, CheckpointRecord, ClaudeSessionRecord, EventLogRecord, GroveBeadRecord, HandoffRecord,
-    PlaybookBulletRecord, RelevantSnippet, RetrievalBundle, RunId, SessionOutcome, TaskRunRecord,
-    Timestamp,
+    PlaybookBulletRecord, PromptManifest, RelevantSnippet, RetrievalBundle, RunId, SessionOutcome,
+    TaskRunRecord, Timestamp,
 };
 
 pub const QUERY_PURPOSE: &str =
@@ -64,9 +65,13 @@ pub fn load_inspect_snapshot<C: BrClient>(
     });
     let runs = db.list_task_runs_for_bead(bead_id)?;
     let latest_session = match runs.first() {
-        Some(run) => db
-            .latest_session_for_run(&run.id)?
-            .map(|session| SessionSummaryView::from_parts(session, None)),
+        Some(run) => db.latest_session_for_run(&run.id)?.map(|session| {
+            let prompt_manifest = session
+                .prompt_manifest_path
+                .as_deref()
+                .and_then(load_prompt_manifest);
+            SessionSummaryView::from_parts(session, None, prompt_manifest)
+        }),
         None => None,
     };
     let latest_checkpoint = db
@@ -102,6 +107,11 @@ pub fn load_inspect_snapshot<C: BrClient>(
         selected_playbook_bullets: Vec::new(),
         mirror_pending,
     }))
+}
+
+fn load_prompt_manifest(path: &str) -> Option<PromptManifest> {
+    let contents = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
 }
 
 fn dependency_edge_view<C: BrClient>(
@@ -291,6 +301,9 @@ pub struct SessionSummaryView {
     pub terminal_class: Option<String>,
     pub exit_code: Option<i32>,
     pub transcript_path: String,
+    pub prompt_id: Option<String>,
+    pub prompt_manifest_path: Option<String>,
+    pub prompt_provenance: Option<PromptProvenanceView>,
     pub result_summary: Option<String>,
     pub completion_indicators: Option<u32>,
     pub explicit_exit: Option<bool>,
@@ -298,7 +311,11 @@ pub struct SessionSummaryView {
 
 impl SessionSummaryView {
     #[must_use]
-    pub fn from_parts(session: ClaudeSessionRecord, outcome: Option<&SessionOutcome>) -> Self {
+    pub fn from_parts(
+        session: ClaudeSessionRecord,
+        outcome: Option<&SessionOutcome>,
+        prompt_manifest: Option<PromptManifest>,
+    ) -> Self {
         Self {
             session_id: session.id,
             run_id: session.run_id,
@@ -309,6 +326,9 @@ impl SessionSummaryView {
             terminal_class: outcome.map(|outcome| format!("{:?}", outcome.terminal_class)),
             exit_code: session.exit_code,
             transcript_path: session.transcript_path,
+            prompt_id: session.prompt_id.as_ref().map(ToString::to_string),
+            prompt_manifest_path: session.prompt_manifest_path,
+            prompt_provenance: prompt_manifest.map(PromptProvenanceView::from),
             result_summary: outcome.and_then(|outcome| {
                 outcome
                     .protocol_events
@@ -329,6 +349,76 @@ impl SessionSummaryView {
                         _ => None,
                     })
             }),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptProvenanceView {
+    pub contract: String,
+    pub estimated_tokens: u32,
+    pub prompt_bytes: u32,
+    pub trimmed: bool,
+    pub retry_delta_summary: Option<String>,
+    pub sections: Vec<PromptSectionView>,
+}
+
+impl From<PromptManifest> for PromptProvenanceView {
+    fn from(manifest: PromptManifest) -> Self {
+        Self {
+            contract: manifest.contract.as_str().to_owned(),
+            estimated_tokens: manifest.estimated_tokens,
+            prompt_bytes: manifest.prompt_bytes,
+            trimmed: manifest.trimmed,
+            retry_delta_summary: manifest.retry_delta_summary,
+            sections: manifest
+                .sections
+                .into_iter()
+                .map(PromptSectionView::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptSectionView {
+    pub ordinal: u32,
+    pub kind: String,
+    pub heading: String,
+    pub included: bool,
+    pub estimated_tokens: u32,
+    pub trim_reason: Option<String>,
+    pub source_ids: Vec<String>,
+    pub bullet_ids: Vec<String>,
+    pub checkpoint_id: Option<String>,
+    pub handoff_run_id: Option<String>,
+    pub preview: String,
+}
+
+impl From<grove_types::PromptManifestSection> for PromptSectionView {
+    fn from(section: grove_types::PromptManifestSection) -> Self {
+        Self {
+            ordinal: section.ordinal,
+            kind: section.kind.as_str().to_owned(),
+            heading: section.heading,
+            included: section.included,
+            estimated_tokens: section.estimated_tokens,
+            trim_reason: section.trim_reason.map(|reason| reason.as_str().to_owned()),
+            source_ids: section
+                .provenance
+                .source_ids
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect(),
+            bullet_ids: section
+                .provenance
+                .bullet_ids
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect(),
+            checkpoint_id: section.provenance.checkpoint_id.map(|id| id.to_string()),
+            handoff_run_id: section.provenance.handoff_run_id.map(|id| id.to_string()),
+            preview: section.preview,
         }
     }
 }
@@ -500,7 +590,7 @@ mod tests {
     use grove_db::Database;
     use grove_types::{
         BeadPriority, BeadRef, EventKind, GroveBeadStatus, IterationAnalysis, MessageRole,
-        ProtocolEvent, SessionStatus, SessionTerminalClass, StopReason,
+        PromptManifest, ProtocolEvent, SessionStatus, SessionTerminalClass, StopReason,
     };
     use std::{collections::BTreeMap, error::Error, io::Error as IoError};
     use tempfile::tempdir;
@@ -537,6 +627,8 @@ mod tests {
             status: SessionStatus::Completed,
             started_at: parse_ts("2026-03-16T10:00:00Z")?,
             ended_at: Some(parse_ts("2026-03-16T10:10:00Z")?),
+            prompt_id: Some(grove_types::PromptId::new("prompt-1")),
+            prompt_manifest_path: Some(".grove/prompts/prompt-1.json".to_owned()),
             prompt_bytes: 12,
             estimated_input_tokens: 34,
             estimated_output_tokens: 56,
@@ -557,11 +649,13 @@ mod tests {
                 ..IterationAnalysis::default()
             },
             terminal_class: SessionTerminalClass::Success,
+            context_pressure_pct: None,
+            context_pressure_level: grove_types::ContextPressureLevel::Ok,
             stdout_tail: Vec::new(),
             stderr_tail: Vec::new(),
         };
 
-        let view = SessionSummaryView::from_parts(session, Some(&outcome));
+        let view = SessionSummaryView::from_parts(session, Some(&outcome), None);
 
         assert_eq!(
             view.result_summary.as_deref(),
@@ -569,6 +663,53 @@ mod tests {
         );
         assert_eq!(view.explicit_exit, Some(true));
         assert_eq!(view.completion_indicators, Some(3));
+        assert_eq!(view.prompt_id.as_deref(), Some("prompt-1"));
+        assert_eq!(
+            view.prompt_manifest_path.as_deref(),
+            Some(".grove/prompts/prompt-1.json")
+        );
+        assert!(view.prompt_provenance.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_provenance_view_maps_manifest() -> TestResult {
+        let manifest = PromptManifest {
+            prompt_id: grove_types::PromptId::new("prompt-1"),
+            bead_id: BeadId::new("grove-1"),
+            run_id: RunId::new("run-1"),
+            session_id: Some(grove_types::SessionId::new("ses-1")),
+            contract: grove_types::ExecutionContract::Implement,
+            created_at: parse_ts("2026-03-16T10:00:00Z")?,
+            token_budget: Some(120),
+            estimated_tokens: 91,
+            prompt_bytes: 420,
+            trimmed: true,
+            retry_delta_summary: Some("changed retry framing".to_owned()),
+            retrieval_query: None,
+            retrieval_ranking_summary: Vec::new(),
+            sections: vec![grove_types::PromptManifestSection {
+                ordinal: 1,
+                kind: grove_types::PromptSegmentKind::Task,
+                heading: "Task".to_owned(),
+                included: true,
+                estimated_tokens: 20,
+                char_count: 80,
+                trim_reason: Some(grove_types::PromptTrimReason::VerboseParentHandoff),
+                provenance: grove_types::PromptSectionProvenance::default(),
+                preview: "[TASK]".to_owned(),
+            }],
+        };
+
+        let view = PromptProvenanceView::from(manifest);
+        assert_eq!(view.contract, "implement");
+        assert!(view.trimmed);
+        assert_eq!(view.sections.len(), 1);
+        assert_eq!(view.sections[0].kind, "task");
+        assert_eq!(
+            view.sections[0].trim_reason.as_deref(),
+            Some("verbose_parent_handoff")
+        );
         Ok(())
     }
 
@@ -803,8 +944,8 @@ mod tests {
         )?;
         db.connection().execute(
             "INSERT INTO claude_sessions(\
-                id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path\
-            ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, prompt_id, prompt_manifest_path, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path\
+            ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 "ses-child",
                 "run-child",
@@ -812,6 +953,8 @@ mod tests {
                 "Checkpointed",
                 "2026-03-16T11:00:00Z",
                 "2026-03-16T11:08:00Z",
+                "prompt-child",
+                ".grove/prompts/prompt-child.json",
                 150,
                 40,
                 60,

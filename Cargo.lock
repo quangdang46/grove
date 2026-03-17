@@ -330,6 +330,7 @@ dependencies = [
  "grove-session",
  "grove-types",
  "rusqlite",
+ "serde_json",
  "tempfile",
 ]
 

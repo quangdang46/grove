@@ -2,6 +2,7 @@ mod analysis;
 mod analyzer;
 mod backend;
 mod exit_policy;
+mod materializer;
 mod parser;
 mod progress;
 mod protocol;
@@ -15,6 +16,9 @@ pub use analyzer::{
 };
 pub use backend::{ClaudeBackend, CliClaudeBackend, RunningSession, StartSessionRequest};
 pub use exit_policy::{ExitDecision, ExitPolicy};
+pub use materializer::{
+    CheckpointPromptInput, PromptMaterialization, PromptMaterializationInput, materialize_prompt,
+};
 pub use parser::{ParserLineKind, ProtocolParser, ProtocolWarning};
 pub use progress::infer_progress_signal;
 pub use protocol::{
