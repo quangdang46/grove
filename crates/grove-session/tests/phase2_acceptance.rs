@@ -101,6 +101,56 @@ fn sample_previous_outcome(
 }
 
 #[test]
+fn one_task_success_path_persists_prompt_and_transcript_artifacts() -> TestResult {
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    fs::create_dir_all(&workspace_dir)?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir.clone())
+        .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+
+    let script_path = dir.path().join("fake-claude");
+    write_fake_claude_script(&script_path)?;
+    let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+    let mut request = sample_request(workspace_dir.clone());
+    request.env = vec![
+        (
+            "STDOUT_SCRIPT".to_owned(),
+            concat!(
+                "working through the task\n",
+                "GROVE_RESULT: session runner wired\n",
+                "GROVE_ARTIFACTS: [\"crates/grove-session/src/runner.rs\"]\n",
+                "GROVE_EXIT: true\n",
+                "all tasks complete\n",
+                "implementation complete\n"
+            )
+            .to_owned(),
+        ),
+        ("STDERR_SCRIPT".to_owned(), "minor stderr note\n".to_owned()),
+        ("EXIT_CODE".to_owned(), "0".to_owned()),
+    ];
+
+    let result = execute_single_task_session(&backend, request)?;
+
+    assert_eq!(result.outcome.session.status, SessionStatus::Completed);
+    assert_eq!(result.outcome.terminal_class, SessionTerminalClass::Success);
+    assert_eq!(result.protocol_state.result_summary.as_deref(), Some("session runner wired"));
+    assert_eq!(
+        result.protocol_state.artifacts,
+        vec!["crates/grove-session/src/runner.rs".to_owned()]
+    );
+
+    let prompt_path = workspace_dir.join(".grove/prompts/prompt-1.json");
+    let transcript_path = workspace_dir.join(".grove/transcripts/grove-1j9.6.9/ses-1.jsonl");
+    assert!(prompt_path.exists());
+    assert!(transcript_path.exists());
+
+    let replay = grove_session::replay_transcript(transcript_path.as_std_path())?;
+    assert!(replay.events.len() >= 5);
+    Ok(())
+}
+
+#[test]
 fn success_requires_explicit_exit_and_indicator_threshold() -> TestResult {
     let dir = tempdir()?;
     let workspace_dir = dir.path().join("workspace");
@@ -252,6 +302,122 @@ fn permission_denied_preempts_generic_crash_classification() -> TestResult {
     assert_eq!(result.outcome.terminal_class, SessionTerminalClass::PermissionDenied);
     assert_eq!(result.outcome.session.status, SessionStatus::PermissionDenied);
     assert_eq!(result.outcome.session.stop_reason, Some(StopReason::PermissionDenied));
+    Ok(())
+}
+
+#[test]
+fn rate_limit_preempts_generic_crash_classification() -> TestResult {
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    fs::create_dir_all(&workspace_dir)?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+
+    let script_path = dir.path().join("fake-claude");
+    write_fake_claude_script(&script_path)?;
+    let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+    let mut request = sample_request(workspace_dir);
+    request.env = vec![
+        (
+            "STDOUT_SCRIPT".to_owned(),
+            "rate limit exceeded by upstream\n".to_owned(),
+        ),
+        (
+            "STDERR_SCRIPT".to_owned(),
+            "ratelimit retry window still active\n".to_owned(),
+        ),
+        ("EXIT_CODE".to_owned(), "1".to_owned()),
+    ];
+
+    let result = execute_single_task_session(&backend, request)?;
+
+    assert_eq!(result.outcome.terminal_class, SessionTerminalClass::RateLimit);
+    assert_eq!(result.outcome.session.status, SessionStatus::RateLimited);
+    assert_eq!(result.outcome.session.stop_reason, Some(StopReason::RateLimit));
+    assert_eq!(
+        result.outcome.stdout_tail,
+        vec!["rate limit exceeded by upstream".to_owned()]
+    );
+    assert_eq!(
+        result.outcome.stderr_tail,
+        vec!["ratelimit retry window still active".to_owned()]
+    );
+    Ok(())
+}
+
+#[test]
+fn repeated_error_retry_context_uses_retry_rescue_contract_and_persists_manifest_details() -> TestResult {
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    fs::create_dir_all(&workspace_dir)?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir.clone())
+        .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+
+    let script_path = dir.path().join("fake-claude");
+    write_fake_claude_script(&script_path)?;
+    let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+    let previous_outcome = sample_previous_outcome(
+        IterationAnalysis {
+            probable_progress: ProgressSignal::Weak,
+            repeated_error_fingerprint: Some(
+                "error: protocol marker was malformed and failed to parse".to_owned(),
+            ),
+            has_explicit_exit_false: true,
+            ..IterationAnalysis::default()
+        },
+        SessionTerminalClass::UnknownFailure,
+    );
+
+    let mut request = sample_request(workspace_dir.clone())
+        .with_retry_context(FailureClass::RepeatedError, Some(previous_outcome));
+    assert_eq!(request.previous_failure_class, Some(FailureClass::RepeatedError));
+    assert_eq!(request.contract, ExecutionContract::RetryRescue);
+    assert!(request.retry_delta_summary.as_deref().is_some_and(|summary| {
+        summary.contains("repeated error path")
+    }));
+    assert!(request.rescue_card.as_deref().is_some_and(|card| {
+        card.contains("Previous repeated error to avoid") && card.contains("`GROVE_EXIT: false`")
+    }));
+
+    request.env = vec![
+        (
+            "STDOUT_SCRIPT".to_owned(),
+            concat!(
+                "retry attempt with changed approach\n",
+                "GROVE_RESULT: retry mutation applied\n",
+                "GROVE_EXIT: true\n",
+                "all tasks complete\n",
+                "implementation complete\n"
+            )
+            .to_owned(),
+        ),
+        ("STDERR_SCRIPT".to_owned(), String::new()),
+        ("EXIT_CODE".to_owned(), "0".to_owned()),
+    ];
+
+    let result = execute_single_task_session(&backend, request)?;
+
+    let prompt_path = workspace_dir.join(".grove/prompts/prompt-1.json");
+    let manifest: PromptManifest =
+        serde_json::from_str(&fs::read_to_string(prompt_path.as_std_path())?)?;
+    assert_eq!(manifest.contract, ExecutionContract::RetryRescue);
+    assert!(manifest.retry_delta_summary.as_deref().is_some_and(|summary| {
+        summary.contains("repeated error path")
+    }));
+    let rescue_card = manifest
+        .sections
+        .iter()
+        .find(|section| section.kind == PromptSegmentKind::RescueCard)
+        .ok_or("missing rescue-card section")?;
+    assert!(rescue_card.included);
+    assert!(rescue_card.preview.contains("Do not repeat the same failing path"));
+    assert_eq!(
+        result.protocol_state.result_summary.as_deref(),
+        Some("retry mutation applied")
+    );
+    assert_eq!(result.outcome.terminal_class, SessionTerminalClass::Success);
     Ok(())
 }
 

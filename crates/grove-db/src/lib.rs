@@ -9,13 +9,38 @@ use grove_br::{
 use grove_types::{
     BeadId, BeadPriority, BeadRef, CheckpointId, CheckpointRecord, ClaudeSessionRecord, EventKind,
     EventLogRecord, FailureClass, GroveBeadRecord, GroveBeadStatus, HandoffRecord, PromptId,
-    ReservationMode, ReservationRecord, RunId, RunStatus, SessionId, SessionStatus, StopReason,
-    TaskRunRecord, Timestamp,
+    ReservationConflict, ReservationMode, ReservationRecord, RunId, RunStatus, SessionId,
+    SessionStatus, StopReason, TaskRunRecord, Timestamp,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde_json::Value;
 
 pub const CRATE_PURPOSE: &str = "SQLite bootstrap, migrations, and runtime persistence.";
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReservationRequest<'a> {
+    pub path_pattern: &'a str,
+    pub mode: ReservationMode,
+    pub reason: Option<&'a str>,
+    pub expires_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReservationAcquireOutcome {
+    pub acquired: Vec<ReservationRecord>,
+    pub conflicts: Vec<ReservationConflict>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryReason {
+    RunNoLongerActive,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveredReservation {
+    pub reservation: ReservationRecord,
+    pub reason: RecoveryReason,
+}
 
 const PRAGMAS: &[&str] = &[
     "PRAGMA journal_mode = WAL;",
@@ -433,6 +458,13 @@ impl Database {
     }
 
     pub fn list_active_reservations(&self) -> Result<Vec<ReservationRecord>> {
+        self.list_active_reservations_at(&Utc::now())
+    }
+
+    pub fn list_active_reservations_at(
+        &self,
+        now: &chrono::DateTime<Utc>,
+    ) -> Result<Vec<ReservationRecord>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -444,7 +476,7 @@ impl Database {
             )
             .context("prepare active reservation list query")?;
 
-        let now = now_timestamp_string();
+        let now = timestamp_string(now);
         let rows = stmt
             .query_map([&now], raw_reservation_row)
             .context("query active reservations")?;
@@ -454,6 +486,260 @@ impl Database {
             .into_iter()
             .map(raw_reservation_into_record)
             .collect()
+    }
+
+    pub fn list_reservations_for_bead(&self, bead_id: &BeadId) -> Result<Vec<ReservationRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, bead_id, run_id, path_pattern, exclusive, reason, expires_at, released_at \
+                 FROM reservations \
+                 WHERE bead_id = ?1 \
+                 ORDER BY id ASC",
+            )
+            .context("prepare bead reservation list query")?;
+
+        let rows = stmt
+            .query_map([bead_id.as_str()], raw_reservation_row)
+            .with_context(|| format!("query reservations for {}", bead_id.as_str()))?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect bead reservation rows")?
+            .into_iter()
+            .map(raw_reservation_into_record)
+            .collect()
+    }
+
+    pub fn acquire_reservations(
+        &mut self,
+        bead_id: &BeadId,
+        run_id: Option<&RunId>,
+        requests: &[ReservationRequest<'_>],
+        acquired_at: &chrono::DateTime<Utc>,
+    ) -> Result<ReservationAcquireOutcome> {
+        let tx = self.conn.transaction().context("begin reservation acquire transaction")?;
+        ensure_bead_exists(&tx, bead_id)?;
+        if let Some(run_id) = run_id {
+            ensure_run_exists(&tx, run_id)?;
+        }
+
+        let active = list_active_reservations_tx(&tx, acquired_at)?;
+        let mut conflicts = Vec::new();
+        for request in requests {
+            conflicts.extend(conflicts_for_request(bead_id, run_id, request, &active));
+        }
+
+        if !conflicts.is_empty() {
+            for conflict in &conflicts {
+                insert_event_log_tx(
+                    &tx,
+                    EventKind::ReservationConflictDetected,
+                    Some(bead_id),
+                    run_id,
+                    None,
+                    &serde_json::json!({
+                        "requested_pattern": conflict.requested_pattern,
+                        "held_pattern": conflict.held_pattern,
+                        "conflicting_bead": conflict.conflicting_bead.as_str(),
+                        "conflicting_run_id": conflict.conflicting_run_id.as_ref().map(RunId::as_str),
+                    }),
+                    acquired_at,
+                )?;
+            }
+            tx.commit().context("commit reservation conflict transaction")?;
+            return Ok(ReservationAcquireOutcome {
+                acquired: Vec::new(),
+                conflicts,
+            });
+        }
+
+        let expires_at = *acquired_at;
+        let mut acquired = Vec::with_capacity(requests.len());
+        for request in requests {
+            tx.execute(
+                "INSERT INTO reservations(\
+                    bead_id, run_id, path_pattern, exclusive, reason, expires_at, released_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                params![
+                    bead_id.as_str(),
+                    run_id.map(RunId::as_str),
+                    request.path_pattern,
+                    matches!(request.mode, ReservationMode::Exclusive),
+                    request.reason,
+                    timestamp_string(&request.expires_at),
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "insert reservation {} for {}",
+                    request.path_pattern,
+                    bead_id.as_str()
+                )
+            })?;
+            let reservation_id = tx.last_insert_rowid();
+            let record = ReservationRecord {
+                id: reservation_id,
+                bead_id: bead_id.clone(),
+                run_id: run_id.cloned(),
+                path_pattern: request.path_pattern.to_owned(),
+                mode: request.mode,
+                reason: request.reason.map(ToOwned::to_owned),
+                expires_at: request.expires_at,
+                released_at: None,
+            };
+            insert_event_log_tx(
+                &tx,
+                EventKind::ReservationGranted,
+                Some(bead_id),
+                run_id,
+                None,
+                &serde_json::json!({
+                    "reservation_id": reservation_id,
+                    "path_pattern": record.path_pattern,
+                    "mode": encode_reservation_mode(record.mode),
+                    "reason": record.reason,
+                    "expires_at": record.expires_at.to_rfc3339(),
+                }),
+                acquired_at,
+            )?;
+            acquired.push(record);
+        }
+
+        if !acquired.is_empty() {
+            set_declared_paths_tx(&tx, bead_id, run_id, &active_declared_paths_tx(&tx, bead_id, acquired_at)?)?;
+        }
+
+        tx.commit().context("commit reservation acquire transaction")?;
+        Ok(ReservationAcquireOutcome {
+            acquired,
+            conflicts: Vec::new(),
+        })
+    }
+
+    pub fn release_reservations_for_run(
+        &mut self,
+        bead_id: &BeadId,
+        run_id: &RunId,
+        released_at: &chrono::DateTime<Utc>,
+    ) -> Result<Vec<ReservationRecord>> {
+        self.release_reservations_matching(bead_id, Some(run_id), None, released_at)
+    }
+
+    pub fn release_reservations_for_bead(
+        &mut self,
+        bead_id: &BeadId,
+        released_at: &chrono::DateTime<Utc>,
+    ) -> Result<Vec<ReservationRecord>> {
+        self.release_reservations_matching(bead_id, None, None, released_at)
+    }
+
+    pub fn expire_reservations(
+        &mut self,
+        now: &chrono::DateTime<Utc>,
+    ) -> Result<Vec<ReservationRecord>> {
+        let tx = self.conn.transaction().context("begin reservation expiry transaction")?;
+        let expired = list_expired_unreleased_reservations_tx(&tx, now)?;
+        for record in &expired {
+            mark_reservation_released_tx(&tx, record.id, now)?;
+            insert_event_log_tx(
+                &tx,
+                EventKind::ReservationExpired,
+                Some(&record.bead_id),
+                record.run_id.as_ref(),
+                None,
+                &serde_json::json!({
+                    "reservation_id": record.id,
+                    "path_pattern": record.path_pattern,
+                    "expired_at": timestamp_string(now),
+                }),
+                now,
+            )?;
+        }
+        refresh_declared_paths_for_beads_tx(&tx, expired.iter().map(|r| r.bead_id.clone()).collect(), now)?;
+        tx.commit().context("commit reservation expiry transaction")?;
+        Ok(expired)
+    }
+
+    pub fn recover_stale_reservations(
+        &mut self,
+        now: &chrono::DateTime<Utc>,
+    ) -> Result<Vec<RecoveredReservation>> {
+        let tx = self.conn.transaction().context("begin reservation recovery transaction")?;
+        let active = list_active_reservations_tx(&tx, now)?;
+        let stale = active
+            .into_iter()
+            .filter(|record| record.run_id.as_ref().is_some_and(|run_id| is_run_terminal_tx(&tx, run_id).unwrap_or(false)))
+            .collect::<Vec<_>>();
+
+        let mut recovered = Vec::with_capacity(stale.len());
+        for record in stale {
+            mark_reservation_released_tx(&tx, record.id, now)?;
+            let run_terminal = record
+                .run_id
+                .as_ref()
+                .map(|run_id| run_status_for_event_tx(&tx, run_id))
+                .transpose()?;
+            insert_event_log_tx(
+                &tx,
+                EventKind::RecoveryActionTaken,
+                Some(&record.bead_id),
+                record.run_id.as_ref(),
+                None,
+                &serde_json::json!({
+                    "action": "release_stale_reservation",
+                    "reservation_id": record.id,
+                    "path_pattern": record.path_pattern,
+                    "run_status": run_terminal,
+                }),
+                now,
+            )?;
+            recovered.push(RecoveredReservation {
+                reservation: record,
+                reason: RecoveryReason::RunNoLongerActive,
+            });
+        }
+
+        refresh_declared_paths_for_beads_tx(
+            &tx,
+            recovered
+                .iter()
+                .map(|entry| entry.reservation.bead_id.clone())
+                .collect(),
+            now,
+        )?;
+        tx.commit().context("commit reservation recovery transaction")?;
+        Ok(recovered)
+    }
+
+    fn release_reservations_matching(
+        &mut self,
+        bead_id: &BeadId,
+        run_id: Option<&RunId>,
+        path_patterns: Option<&[String]>,
+        released_at: &chrono::DateTime<Utc>,
+    ) -> Result<Vec<ReservationRecord>> {
+        let tx = self.conn.transaction().context("begin reservation release transaction")?;
+        let matching = list_releasable_reservations_tx(&tx, bead_id, run_id, path_patterns)?;
+        for record in &matching {
+            mark_reservation_released_tx(&tx, record.id, released_at)?;
+            insert_event_log_tx(
+                &tx,
+                EventKind::RecoveryActionTaken,
+                Some(&record.bead_id),
+                record.run_id.as_ref(),
+                None,
+                &serde_json::json!({
+                    "action": "release_reservation",
+                    "reservation_id": record.id,
+                    "path_pattern": record.path_pattern,
+                    "released_at": timestamp_string(released_at),
+                }),
+                released_at,
+            )?;
+        }
+        refresh_declared_paths_for_beads_tx(&tx, vec![bead_id.clone()], released_at)?;
+        tx.commit().context("commit reservation release transaction")?;
+        Ok(matching)
     }
 
     fn applied_migration_name(&self, version: i64) -> Result<Option<String>> {
@@ -963,6 +1249,297 @@ fn raw_reservation_into_record(row: RawReservationRow) -> Result<ReservationReco
     })
 }
 
+fn ensure_bead_exists(tx: &Transaction<'_>, bead_id: &BeadId) -> Result<()> {
+    let exists = tx
+        .query_row(
+            "SELECT 1 FROM bead_cache WHERE bead_id = ?1",
+            [bead_id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()
+        .with_context(|| format!("check bead existence for {}", bead_id.as_str()))?;
+    if exists.is_some() {
+        Ok(())
+    } else {
+        bail!("bead {} does not exist", bead_id.as_str())
+    }
+}
+
+fn ensure_run_exists(tx: &Transaction<'_>, run_id: &RunId) -> Result<()> {
+    let exists = tx
+        .query_row("SELECT 1 FROM task_runs WHERE id = ?1", [run_id.as_str()], |_| Ok(()))
+        .optional()
+        .with_context(|| format!("check run existence for {}", run_id.as_str()))?;
+    if exists.is_some() {
+        Ok(())
+    } else {
+        bail!("run {} does not exist", run_id.as_str())
+    }
+}
+
+fn list_active_reservations_tx(
+    tx: &Transaction<'_>,
+    now: &chrono::DateTime<Utc>,
+) -> Result<Vec<ReservationRecord>> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT id, bead_id, run_id, path_pattern, exclusive, reason, expires_at, released_at \
+             FROM reservations \
+             WHERE released_at IS NULL \
+               AND expires_at > ?1 \
+             ORDER BY bead_id ASC, id ASC",
+        )
+        .context("prepare active reservations tx query")?;
+    let now = timestamp_string(now);
+    let rows = stmt
+        .query_map([&now], raw_reservation_row)
+        .context("query active reservations in tx")?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("collect active reservations in tx")?
+        .into_iter()
+        .map(raw_reservation_into_record)
+        .collect()
+}
+
+fn list_expired_unreleased_reservations_tx(
+    tx: &Transaction<'_>,
+    now: &chrono::DateTime<Utc>,
+) -> Result<Vec<ReservationRecord>> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT id, bead_id, run_id, path_pattern, exclusive, reason, expires_at, released_at \
+             FROM reservations \
+             WHERE released_at IS NULL \
+               AND expires_at <= ?1 \
+             ORDER BY bead_id ASC, id ASC",
+        )
+        .context("prepare expired reservation query")?;
+    let now = timestamp_string(now);
+    let rows = stmt
+        .query_map([&now], raw_reservation_row)
+        .context("query expired reservations")?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("collect expired reservations")?
+        .into_iter()
+        .map(raw_reservation_into_record)
+        .collect()
+}
+
+fn list_releasable_reservations_tx(
+    tx: &Transaction<'_>,
+    bead_id: &BeadId,
+    run_id: Option<&RunId>,
+    path_patterns: Option<&[String]>,
+) -> Result<Vec<ReservationRecord>> {
+    let mut reservations = list_all_reservations_for_bead_tx(tx, bead_id)?;
+    reservations.retain(|record| {
+        record.released_at.is_none()
+            && run_id.is_none_or(|expected| record.run_id.as_ref() == Some(expected))
+            && path_patterns.is_none_or(|patterns| patterns.iter().any(|pattern| pattern == &record.path_pattern))
+    });
+    Ok(reservations)
+}
+
+fn list_all_reservations_for_bead_tx(
+    tx: &Transaction<'_>,
+    bead_id: &BeadId,
+) -> Result<Vec<ReservationRecord>> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT id, bead_id, run_id, path_pattern, exclusive, reason, expires_at, released_at \
+             FROM reservations \
+             WHERE bead_id = ?1 \
+             ORDER BY id ASC",
+        )
+        .context("prepare bead reservations tx query")?;
+    let rows = stmt
+        .query_map([bead_id.as_str()], raw_reservation_row)
+        .with_context(|| format!("query reservations in tx for {}", bead_id.as_str()))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("collect bead reservations in tx")?
+        .into_iter()
+        .map(raw_reservation_into_record)
+        .collect()
+}
+
+fn mark_reservation_released_tx(
+    tx: &Transaction<'_>,
+    reservation_id: i64,
+    released_at: &chrono::DateTime<Utc>,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE reservations SET released_at = ?2 WHERE id = ?1 AND released_at IS NULL",
+        params![reservation_id, timestamp_string(released_at)],
+    )
+    .with_context(|| format!("release reservation {reservation_id}"))?;
+    Ok(())
+}
+
+fn active_declared_paths_tx(
+    tx: &Transaction<'_>,
+    bead_id: &BeadId,
+    now: &chrono::DateTime<Utc>,
+) -> Result<Vec<String>> {
+    let mut records = list_all_reservations_for_bead_tx(tx, bead_id)?;
+    records.retain(|record| record.released_at.is_none() && record.expires_at > *now);
+    Ok(records.into_iter().map(|record| record.path_pattern).collect())
+}
+
+fn refresh_declared_paths_for_beads_tx(
+    tx: &Transaction<'_>,
+    bead_ids: Vec<BeadId>,
+    now: &chrono::DateTime<Utc>,
+) -> Result<()> {
+    let mut unique = bead_ids;
+    unique.sort();
+    unique.dedup();
+    for bead_id in unique {
+        let paths = active_declared_paths_tx(tx, &bead_id, now)?;
+        set_declared_paths_tx(tx, &bead_id, None, &paths)?;
+    }
+    Ok(())
+}
+
+fn set_declared_paths_tx(
+    tx: &Transaction<'_>,
+    bead_id: &BeadId,
+    run_id: Option<&RunId>,
+    declared_paths: &[String],
+) -> Result<()> {
+    let runtime_updated_at = now_timestamp_string();
+    tx.execute(
+        "INSERT INTO bead_runtime(\
+            bead_id, grove_status, declared_paths_json, metadata_json, last_run_id, retry_after,\
+            last_failure_class, last_failure_detail, runtime_updated_at\
+         ) VALUES (\
+            ?1, COALESCE((SELECT grove_status FROM bead_runtime WHERE bead_id = ?1), 'Idle'), ?2,\
+            COALESCE((SELECT metadata_json FROM bead_runtime WHERE bead_id = ?1), '{}'),\
+            COALESCE(?3, (SELECT last_run_id FROM bead_runtime WHERE bead_id = ?1)),\
+            COALESCE((SELECT retry_after FROM bead_runtime WHERE bead_id = ?1), NULL),\
+            COALESCE((SELECT last_failure_class FROM bead_runtime WHERE bead_id = ?1), NULL),\
+            COALESCE((SELECT last_failure_detail FROM bead_runtime WHERE bead_id = ?1), NULL),\
+            ?4\
+         )\
+         ON CONFLICT(bead_id) DO UPDATE SET \
+            declared_paths_json = excluded.declared_paths_json,\
+            last_run_id = COALESCE(excluded.last_run_id, bead_runtime.last_run_id),\
+            runtime_updated_at = excluded.runtime_updated_at",
+        params![
+            bead_id.as_str(),
+            serde_json::to_string(declared_paths).context("serialize declared paths")?,
+            run_id.map(RunId::as_str),
+            runtime_updated_at,
+        ],
+    )
+    .with_context(|| format!("update declared paths for {}", bead_id.as_str()))?;
+    Ok(())
+}
+
+fn insert_event_log_tx(
+    tx: &Transaction<'_>,
+    kind: EventKind,
+    bead_id: Option<&BeadId>,
+    run_id: Option<&RunId>,
+    session_id: Option<&SessionId>,
+    payload: &serde_json::Value,
+    created_at: &chrono::DateTime<Utc>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO event_log(kind, bead_id, run_id, session_id, payload_json, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            encode_event_kind(kind),
+            bead_id.map(BeadId::as_str),
+            run_id.map(RunId::as_str),
+            session_id.map(SessionId::as_str),
+            payload.to_string(),
+            timestamp_string(created_at),
+        ],
+    )
+    .with_context(|| format!("insert event log {:?}", kind))?;
+    Ok(())
+}
+
+fn encode_event_kind(kind: EventKind) -> &'static str {
+    match kind {
+        EventKind::BeadCacheSynced => "BeadCacheSynced",
+        EventKind::DependencySnapshotSynced => "DependencySnapshotSynced",
+        EventKind::GroveStatusUpdated => "GroveStatusUpdated",
+        EventKind::RunStarted => "RunStarted",
+        EventKind::SessionStarted => "SessionStarted",
+        EventKind::SessionCheckpointed => "SessionCheckpointed",
+        EventKind::SessionSucceeded => "SessionSucceeded",
+        EventKind::SessionFailed => "SessionFailed",
+        EventKind::HandoffWritten => "HandoffWritten",
+        EventKind::ReservationGranted => "ReservationGranted",
+        EventKind::ReservationConflictDetected => "ReservationConflictDetected",
+        EventKind::ReservationExpired => "ReservationExpired",
+        EventKind::RecoveryActionTaken => "RecoveryActionTaken",
+        EventKind::LeaseAcquired => "LeaseAcquired",
+        EventKind::LeaseHeartbeat => "LeaseHeartbeat",
+        EventKind::LeaseReleased => "LeaseReleased",
+        EventKind::ArchiveIngested => "ArchiveIngested",
+        EventKind::PlaybookBulletAdded => "PlaybookBulletAdded",
+        EventKind::PlaybookBulletPromoted => "PlaybookBulletPromoted",
+        EventKind::PlaybookBulletDeprecated => "PlaybookBulletDeprecated",
+        EventKind::BrMirrorRequested => "BrMirrorRequested",
+        EventKind::BrMirrorSucceeded => "BrMirrorSucceeded",
+        EventKind::BrMirrorFailed => "BrMirrorFailed",
+    }
+}
+
+fn is_run_terminal_tx(tx: &Transaction<'_>, run_id: &RunId) -> Result<bool> {
+    let status = tx
+        .query_row("SELECT status FROM task_runs WHERE id = ?1", [run_id.as_str()], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .with_context(|| format!("query run status for {}", run_id.as_str()))?;
+    Ok(status
+        .as_deref()
+        .map(parse_run_status)
+        .transpose()?
+        .is_some_and(|status| status != RunStatus::Active))
+}
+
+fn run_status_for_event_tx(tx: &Transaction<'_>, run_id: &RunId) -> Result<String> {
+    tx.query_row("SELECT status FROM task_runs WHERE id = ?1", [run_id.as_str()], |row| {
+        row.get::<_, String>(0)
+    })
+    .with_context(|| format!("query run status text for {}", run_id.as_str()))
+}
+
+fn conflicts_for_request(
+    bead_id: &BeadId,
+    run_id: Option<&RunId>,
+    request: &ReservationRequest<'_>,
+    active: &[ReservationRecord],
+) -> Vec<ReservationConflict> {
+    active
+        .iter()
+        .filter(|record| record.bead_id != *bead_id)
+        .filter(|record| {
+            request.mode == ReservationMode::Exclusive || record.mode == ReservationMode::Exclusive
+        })
+        .filter(|record| patterns_overlap(request.path_pattern, &record.path_pattern))
+        .map(|record| ReservationConflict {
+            requested_by_bead: bead_id.clone(),
+            conflicting_bead: record.bead_id.clone(),
+            requested_pattern: request.path_pattern.to_owned(),
+            held_pattern: record.path_pattern.clone(),
+            conflicting_run_id: record.run_id.clone().or_else(|| run_id.cloned()),
+        })
+        .collect()
+}
+
+fn patterns_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left.starts_with(right.trim_end_matches('*'))
+        || right.starts_with(left.trim_end_matches('*'))
+        || left.contains("**") && right.starts_with(left.split("**").next().unwrap_or_default())
+        || right.contains("**") && left.starts_with(right.split("**").next().unwrap_or_default())
+}
+
 fn parse_json<T: serde::de::DeserializeOwned>(text: &str, label: &str) -> Result<T> {
     serde_json::from_str(text).with_context(|| format!("parse {label} JSON"))
 }
@@ -987,7 +1564,18 @@ fn parse_timestamp(text: &str) -> Result<Timestamp> {
 }
 
 fn now_timestamp_string() -> String {
-    Utc::now().to_rfc3339()
+    timestamp_string(&Utc::now())
+}
+
+fn timestamp_string(timestamp: &chrono::DateTime<Utc>) -> String {
+    timestamp.to_rfc3339()
+}
+
+fn encode_reservation_mode(mode: ReservationMode) -> &'static str {
+    match mode {
+        ReservationMode::Shared => "shared",
+        ReservationMode::Exclusive => "exclusive",
+    }
 }
 
 fn parse_bead_priority(value: i64) -> Result<BeadPriority> {

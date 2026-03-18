@@ -1,18 +1,20 @@
 use crate::status_view::{
     conflicts_for_bead, find_reservation_conflicts, latest_mirror_pending_for_bead,
-    DispatchExplanationView, MirrorPendingView, ReservationConflictView,
+    ready_age_minutes, triage_context_for_bead, DispatchExplanationView, MirrorPendingView,
+    ReservationConflictView, ScoreComponentView,
 };
 use crate::{evaluate_dispatch_eligibility, DispatchEligibilityContext};
 use anyhow::Result;
 use chrono::Utc;
 use grove_br::BrClient;
+use grove_bv::BvTriageOutput;
 use grove_config::GroveConfig;
 use grove_db::Database;
 use std::fs;
 use grove_types::{
-    BeadId, CheckpointRecord, ClaudeSessionRecord, EventLogRecord, GroveBeadRecord, HandoffRecord,
-    PlaybookBulletRecord, PromptManifest, RelevantSnippet, RetrievalBundle, RunId, SessionOutcome,
-    TaskRunRecord, Timestamp,
+    BeadId, CheckpointRecord, ClaudeSessionRecord, EventLogRecord, GroveBeadRecord,
+    GroveBeadStatus, HandoffRecord, PlaybookBulletRecord, PromptManifest, RelevantSnippet,
+    RetrievalBundle, RunId, SessionOutcome, TaskRunRecord, Timestamp,
 };
 
 pub const QUERY_PURPOSE: &str =
@@ -22,7 +24,8 @@ pub fn load_inspect_snapshot<C: BrClient>(
     db: &Database,
     br: &C,
     bead_id: &BeadId,
-    _config: &GroveConfig,
+    config: &GroveConfig,
+    triage: Option<&BvTriageOutput>,
 ) -> Result<Option<InspectSnapshot>> {
     let Some(bead) = db.get_bead_record(bead_id)? else {
         return Ok(None);
@@ -43,25 +46,44 @@ pub fn load_inspect_snapshot<C: BrClient>(
     let reservation_conflicts = find_reservation_conflicts(&reservations);
     let bead_conflicts = conflicts_for_bead(bead_id, &reservation_conflicts);
     let ready_in_br = ready_ids.contains(bead_id);
+    let now = Utc::now();
     let eligibility = evaluate_dispatch_eligibility(
         &bead,
         &DispatchEligibilityContext {
             ready_in_br,
             circuit_state: grove_types::CircuitState::Closed,
             reservation_conflicts: bead_conflicts.clone(),
-            now: Utc::now(),
+            now,
         },
     );
 
+    let bv_context = triage_context_for_bead(triage, bead_id);
+    let ready_minutes = ready_age_minutes(&bead, now);
     let latest_dispatch = Some(DispatchDecisionView {
         attempted_at: ready_in_br.then_some(bead.runtime_updated_at),
         dispatch: DispatchExplanationView::from_eligibility(&eligibility),
-        score: None,
-        why: inspect_dispatch_why(&bead, ready_in_br, &dependency_snapshot, &bead_conflicts),
+        score: bv_context.as_ref().map(|context| context.score),
+        score_breakdown: inspect_score_breakdown(
+            &bead,
+            &dependency_snapshot,
+            &bead_conflicts,
+            config,
+            bv_context.as_ref(),
+            ready_minutes,
+        ),
+        why: inspect_dispatch_why(
+            &bead,
+            ready_in_br,
+            &dependency_snapshot,
+            &bead_conflicts,
+            bv_context.as_ref(),
+        ),
         reservation_conflicts: bead_conflicts
             .iter()
             .map(ReservationConflictView::from_conflict)
             .collect(),
+        ready_minutes,
+        bv_score: bv_context.as_ref().map(|context| context.score),
     });
     let runs = db.list_task_runs_for_bead(bead_id)?;
     let latest_session = match runs.first() {
@@ -114,6 +136,64 @@ fn load_prompt_manifest(path: &str) -> Option<PromptManifest> {
     serde_json::from_str(&contents).ok()
 }
 
+fn inspect_score_breakdown(
+    bead: &GroveBeadRecord,
+    dependency_snapshot: &grove_br::BrDependencySnapshot,
+    conflicts: &[grove_types::ReservationConflict],
+    config: &GroveConfig,
+    bv_context: Option<&crate::status_view::BvScoreContext<'_>>,
+    ready_minutes: Option<i64>,
+) -> Vec<ScoreComponentView> {
+    let mut breakdown = vec![ScoreComponentView {
+        label: "priority".to_owned(),
+        value: bead.bead.priority.base_score() as f64,
+        note: Some(format!("{:?} priority", bead.bead.priority)),
+    }];
+
+    if let Some(context) = bv_context {
+        breakdown.push(ScoreComponentView {
+            label: "bv_triage".to_owned(),
+            value: context.score,
+            note: Some(context.summary()),
+        });
+    }
+
+    if !dependency_snapshot.blocks.is_empty() {
+        breakdown.push(ScoreComponentView {
+            label: "critical_path".to_owned(),
+            value: f64::from(config.scheduler.critical_path_bonus),
+            note: Some(format!("{} downstream bead(s)", dependency_snapshot.blocks.len())),
+        });
+    }
+
+    if let Some(minutes) = ready_minutes.filter(|minutes| *minutes > 0) {
+        let bonus = minutes.min(i64::from(i32::MAX)) as i32 * config.scheduler.ready_age_bonus_per_min;
+        breakdown.push(ScoreComponentView {
+            label: "ready_age".to_owned(),
+            value: f64::from(bonus),
+            note: Some(format!("ready for {} minute(s)", minutes)),
+        });
+    }
+
+    if bead.grove_status == GroveBeadStatus::WaitingToRetry {
+        breakdown.push(ScoreComponentView {
+            label: "retry_penalty".to_owned(),
+            value: -f64::from(config.scheduler.retry_penalty),
+            note: Some("waiting to retry".to_owned()),
+        });
+    }
+
+    if !conflicts.is_empty() {
+        breakdown.push(ScoreComponentView {
+            label: "reservation_conflict_penalty".to_owned(),
+            value: -f64::from(config.scheduler.reservation_conflict_penalty),
+            note: Some(format!("{} active conflict(s)", conflicts.len())),
+        });
+    }
+
+    breakdown
+}
+
 fn dependency_edge_view<C: BrClient>(
     br: &C,
     bead_id: &BeadId,
@@ -144,8 +224,12 @@ fn inspect_dispatch_why(
     ready_in_br: bool,
     dependency_snapshot: &grove_br::BrDependencySnapshot,
     conflicts: &[grove_types::ReservationConflict],
+    bv_context: Option<&crate::status_view::BvScoreContext<'_>>,
 ) -> Vec<String> {
     let mut why = vec![format!("{:?} priority", bead.bead.priority)];
+    if let Some(context) = bv_context {
+        why.push(format!("bv triage {:.2}: {}", context.score, context.summary()));
+    }
     if ready_in_br {
         why.push("ready in br".to_owned());
     } else if !dependency_snapshot.blocked_by.is_empty() {
@@ -257,8 +341,11 @@ pub struct DispatchDecisionView {
     pub attempted_at: Option<Timestamp>,
     pub dispatch: DispatchExplanationView,
     pub score: Option<f64>,
+    pub score_breakdown: Vec<ScoreComponentView>,
     pub why: Vec<String>,
     pub reservation_conflicts: Vec<ReservationConflictView>,
+    pub ready_minutes: Option<i64>,
+    pub bv_score: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -746,8 +833,11 @@ mod tests {
                     }],
                 },
                 score: Some(123.0),
+                score_breakdown: Vec::new(),
                 why: vec!["high priority".to_owned()],
                 reservation_conflicts: Vec::new(),
+                ready_minutes: Some(5),
+                bv_score: Some(0.75),
             }),
             runs: vec![TaskRunRecord {
                 id: RunId::new("run-1"),
@@ -1042,6 +1132,7 @@ mod tests {
             &br,
             &BeadId::new("grove-child"),
             &GroveConfig::default(),
+            None,
         )?
         .ok_or_else(|| IoError::other("expected inspect snapshot"))?;
 
@@ -1159,6 +1250,7 @@ mod tests {
             &br,
             &BeadId::new("grove-blocked"),
             &GroveConfig::default(),
+            None,
         )?
         .ok_or_else(|| IoError::other("expected inspect snapshot"))?;
 

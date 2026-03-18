@@ -140,19 +140,20 @@ fn handle_init() -> Result<()> {
 
 fn handle_status() -> Result<()> {
     let (loaded, db, br) = open_runtime()?;
-    let view = load_workspace_status_view(
-        &db,
-        &br,
-        loaded.paths.workspace_root().as_str(),
-        &loaded.config,
-    )
-    .context("load workspace status view")?;
-
     let bv = CliBvClient::new("bv", loaded.paths.workspace_root().as_str());
     let (triage, triage_error) = match bv.triage() {
         Ok(output) => (Some(output), None),
         Err(error) => (None, Some(error.to_string())),
     };
+
+    let view = load_workspace_status_view(
+        &db,
+        &br,
+        loaded.paths.workspace_root().as_str(),
+        &loaded.config,
+        triage.as_ref(),
+    )
+    .context("load workspace status view")?;
 
     print_status_view(
         &view,
@@ -165,8 +166,10 @@ fn handle_status() -> Result<()> {
 
 fn handle_inspect(bead_id: &BeadId) -> Result<()> {
     let (loaded, db, br) = open_runtime()?;
+    let bv = CliBvClient::new("bv", loaded.paths.workspace_root().as_str());
+    let triage = bv.triage().ok();
     let issue_detail = br.show(bead_id).ok();
-    let view = load_bead_inspect_view(&db, &br, bead_id, &loaded.config)
+    let view = load_bead_inspect_view(&db, &br, bead_id, &loaded.config, triage.as_ref())
         .with_context(|| format!("load inspect view for {bead_id}"))?;
 
     if issue_detail.is_none() && view.is_none() {
@@ -582,6 +585,21 @@ fn print_inspect_report(
                     );
                     println!("- summary: {}", dispatch.dispatch.summary());
                     println!("- score: {}", format_score(dispatch.score));
+                    if let Some(bv_score) = dispatch.bv_score {
+                        println!("- bv score: {:.2}", bv_score);
+                    }
+                    if let Some(ready_minutes) = dispatch.ready_minutes {
+                        println!("- ready age: {} minute(s)", ready_minutes);
+                    }
+                    if !dispatch.score_breakdown.is_empty() {
+                        let breakdown = dispatch
+                            .score_breakdown
+                            .iter()
+                            .map(|component| format!("{}={:.1}", component.label, component.value))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!("- score breakdown: {breakdown}");
+                    }
                     if !dispatch.why.is_empty() {
                         println!("- why: {}", dispatch.why.join(", "));
                     }

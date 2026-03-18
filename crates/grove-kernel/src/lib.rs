@@ -3,10 +3,12 @@ pub mod status_view;
 
 use anyhow::Result;
 use grove_br::{BrClient, BrDependencySnapshot};
+use grove_bv::BvTriageOutput;
 use grove_config::GroveConfig;
-use grove_db::Database;
+use grove_db::{Database, RecoveredReservation, ReservationAcquireOutcome, ReservationRequest};
 use grove_types::{
-    BeadId, CircuitState, GroveBeadRecord, GroveBeadStatus, ReservationConflict, RunId, Timestamp,
+    BeadId, CircuitState, GroveBeadRecord, GroveBeadStatus, ReservationConflict, ReservationMode,
+    ReservationRecord, RunId, Timestamp,
 };
 use std::collections::BTreeMap;
 
@@ -14,6 +16,67 @@ pub use inspect_view::BeadInspectView;
 pub use status_view::WorkspaceStatusView;
 
 pub const CRATE_PURPOSE: &str = "Core Grove runtime domain and service boundaries.";
+
+#[derive(Debug, Clone)]
+pub struct AcquireReservationInput {
+    pub path_pattern: String,
+    pub mode: ReservationMode,
+    pub reason: Option<String>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReservationManager;
+
+impl ReservationManager {
+    pub fn acquire_for_run(
+        db: &mut Database,
+        bead_id: &BeadId,
+        run_id: Option<&RunId>,
+        requests: &[AcquireReservationInput],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ReservationAcquireOutcome> {
+        let requests = requests
+            .iter()
+            .map(|request| ReservationRequest {
+                path_pattern: request.path_pattern.as_str(),
+                mode: request.mode,
+                reason: request.reason.as_deref(),
+                expires_at: request.expires_at,
+            })
+            .collect::<Vec<_>>();
+        db.acquire_reservations(bead_id, run_id, &requests, &now)
+    }
+
+    pub fn release_for_run(
+        db: &mut Database,
+        bead_id: &BeadId,
+        run_id: &RunId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<ReservationRecord>> {
+        db.release_reservations_for_run(bead_id, run_id, &now)
+    }
+
+    pub fn release_for_bead(
+        db: &mut Database,
+        bead_id: &BeadId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<ReservationRecord>> {
+        db.release_reservations_for_bead(bead_id, &now)
+    }
+
+    pub fn reconcile(db: &mut Database, now: chrono::DateTime<chrono::Utc>) -> Result<ReservationReconcileReport> {
+        let expired = db.expire_reservations(&now)?;
+        let recovered = db.recover_stale_reservations(&now)?;
+        Ok(ReservationReconcileReport { expired, recovered })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReservationReconcileReport {
+    pub expired: Vec<ReservationRecord>,
+    pub recovered: Vec<RecoveredReservation>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DependencySnapshotIssue {
@@ -128,8 +191,9 @@ pub fn load_workspace_status_view<C: BrClient>(
     br: &C,
     workspace_root: &str,
     config: &GroveConfig,
+    triage: Option<&BvTriageOutput>,
 ) -> Result<WorkspaceStatusView> {
-    Ok(status_view::load_status_snapshot(db, br, workspace_root, config)?.into_view())
+    Ok(status_view::load_status_snapshot(db, br, workspace_root, config, triage)?.into_view())
 }
 
 pub fn load_bead_inspect_view<C: BrClient>(
@@ -137,9 +201,10 @@ pub fn load_bead_inspect_view<C: BrClient>(
     br: &C,
     bead_id: &BeadId,
     config: &GroveConfig,
+    triage: Option<&BvTriageOutput>,
 ) -> Result<Option<BeadInspectView>> {
     Ok(
-        inspect_view::load_inspect_snapshot(db, br, bead_id, config)?
+        inspect_view::load_inspect_snapshot(db, br, bead_id, config, triage)?
             .map(|snapshot| snapshot.into_view()),
     )
 }

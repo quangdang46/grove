@@ -1,7 +1,8 @@
 use crate::{DispatchEligibility, DispatchEligibilityContext, LocalSuppressionReason};
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use grove_br::{BrClient, BrDependencySnapshot};
+use grove_bv::BvTriageOutput;
 use grove_config::GroveConfig;
 use grove_db::Database;
 use grove_types::{
@@ -96,6 +97,8 @@ pub struct ReadyQueueEntry {
     pub why: Vec<String>,
     pub dispatch: DispatchExplanationView,
     pub mirror_pending: bool,
+    pub bv_score: Option<f64>,
+    pub ready_minutes: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +354,7 @@ pub fn load_status_snapshot<C: BrClient>(
     br: &C,
     workspace_root: &str,
     config: &GroveConfig,
+    triage: Option<&BvTriageOutput>,
 ) -> Result<StatusSnapshot> {
     let beads = db.list_bead_records()?;
     let ready_ids = br
@@ -372,6 +376,7 @@ pub fn load_status_snapshot<C: BrClient>(
         &reservation_conflicts,
         &mirror_pending_map,
         config,
+        triage,
     );
     let checkpointed_beads = build_checkpointed_beads(&beads, db, &reservation_map)?;
     let failed_beads = build_failed_beads(
@@ -432,6 +437,7 @@ fn build_ready_queue(
     reservation_conflicts: &[ReservationConflict],
     mirror_pending_map: &HashMap<BeadId, MirrorPendingView>,
     config: &GroveConfig,
+    triage: Option<&BvTriageOutput>,
 ) -> Vec<ReadyQueueEntry> {
     let now = Utc::now();
     let mut entries = beads
@@ -453,14 +459,25 @@ fn build_ready_queue(
                 return None;
             }
 
-            let score_breakdown =
-                compute_score_breakdown(bead, dependency_snapshot, conflicts.len(), config);
+            let bv_context = triage_context_for_bead(triage, &bead.bead.id);
+            let ready_minutes = ready_age_minutes(bead, now);
+            let score_breakdown = compute_score_breakdown(
+                bead,
+                dependency_snapshot,
+                conflicts.len(),
+                config,
+                bv_context.as_ref(),
+                ready_minutes,
+            );
             let score = score_breakdown
                 .iter()
                 .map(|component| component.value)
                 .sum::<f64>();
             let dependent_count = dependency_snapshot.map_or(0, |snapshot| snapshot.blocks.len());
             let mut why = vec![priority_why(bead.bead.priority)];
+            if let Some(context) = bv_context.as_ref() {
+                why.push(format!("bv triage {:.2}: {}", context.score, context.summary()));
+            }
             if dependent_count > 0 {
                 why.push(format!(
                     "{} downstream bead{}",
@@ -483,6 +500,8 @@ fn build_ready_queue(
                 why,
                 dispatch,
                 mirror_pending: mirror_pending_map.contains_key(&bead.bead.id),
+                bv_score: bv_context.map(|context| context.score),
+                ready_minutes,
             })
         })
         .collect::<Vec<_>>();
@@ -720,6 +739,8 @@ fn compute_score_breakdown(
     dependency_snapshot: Option<&BrDependencySnapshot>,
     conflict_count: usize,
     config: &GroveConfig,
+    bv_context: Option<&BvScoreContext<'_>>,
+    ready_minutes: Option<i64>,
 ) -> Vec<ScoreComponentView> {
     let mut breakdown = vec![ScoreComponentView {
         label: "priority".to_owned(),
@@ -727,12 +748,29 @@ fn compute_score_breakdown(
         note: Some(priority_why(bead.bead.priority)),
     }];
 
+    if let Some(context) = bv_context {
+        breakdown.push(ScoreComponentView {
+            label: "bv_triage".to_owned(),
+            value: context.score,
+            note: Some(context.summary()),
+        });
+    }
+
     let dependent_count = dependency_snapshot.map_or(0, |snapshot| snapshot.blocks.len());
     if dependent_count > 0 {
         breakdown.push(ScoreComponentView {
             label: "critical_path".to_owned(),
             value: f64::from(config.scheduler.critical_path_bonus),
             note: Some(format!("{} downstream bead(s)", dependent_count)),
+        });
+    }
+
+    if let Some(minutes) = ready_minutes.filter(|minutes| *minutes > 0) {
+        let bonus = minutes.min(i64::from(i32::MAX)) as i32 * config.scheduler.ready_age_bonus_per_min;
+        breakdown.push(ScoreComponentView {
+            label: "ready_age".to_owned(),
+            value: f64::from(bonus),
+            note: Some(format!("ready for {} minute(s)", minutes)),
         });
     }
 
@@ -753,6 +791,57 @@ fn compute_score_breakdown(
     }
 
     breakdown
+}
+
+pub(crate) struct BvScoreContext<'a> {
+    pub(crate) score: f64,
+    reasons: &'a [String],
+}
+
+impl BvScoreContext<'_> {
+    pub(crate) fn summary(&self) -> String {
+        if self.reasons.is_empty() {
+            "bv recommendation".to_owned()
+        } else {
+            self.reasons.join(", ")
+        }
+    }
+}
+
+pub(crate) fn triage_context_for_bead<'a>(
+    triage: Option<&'a BvTriageOutput>,
+    bead_id: &BeadId,
+) -> Option<BvScoreContext<'a>> {
+    let triage = triage?;
+    triage
+        .recommendations
+        .iter()
+        .find(|recommendation| &recommendation.id == bead_id)
+        .map(|recommendation| BvScoreContext {
+            score: recommendation.score,
+            reasons: recommendation.reasons.as_slice(),
+        })
+        .or_else(|| {
+            triage
+                .quick_ref
+                .top_picks
+                .iter()
+                .find(|pick| &pick.id == bead_id)
+                .map(|pick| BvScoreContext {
+                    score: pick.score,
+                    reasons: pick.reasons.as_slice(),
+                })
+        })
+}
+
+pub(crate) fn ready_age_minutes(bead: &GroveBeadRecord, now: Timestamp) -> Option<i64> {
+    let reference = if bead.grove_status == GroveBeadStatus::Ready {
+        bead.runtime_updated_at
+    } else {
+        bead.synced_at
+    };
+    let elapsed = now.signed_duration_since(reference);
+    (elapsed >= Duration::zero()).then(|| elapsed.num_minutes())
 }
 
 fn priority_score(priority: BeadPriority) -> f64 {
@@ -793,7 +882,10 @@ fn recovery_hint(bead: &GroveBeadRecord, config: &GroveConfig) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grove_br::BrDependencySnapshot;
+    use grove_bv::{BvCommand, BvGraphHealth, BvProjectCounts, BvProjectHealth, BvQuickRef, BvRecommendation, BvTriageMeta, BvTriageOutput, BvVelocitySummary};
     use grove_types::{BeadRef, CircuitState, RunId, Timestamp};
+    use std::collections::{HashMap, HashSet};
     use std::error::Error;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -870,10 +962,215 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ready_queue_orders_by_score_then_bead_id() -> TestResult {
+        let mut p1_with_bonus = sample_bead_with_priority(
+            "grove-a",
+            "open",
+            GroveBeadStatus::Ready,
+            BeadPriority::P1,
+        )?;
+        p1_with_bonus.bead.title = "priority bonus".to_owned();
+
+        let mut p0 =
+            sample_bead_with_priority("grove-b", "open", GroveBeadStatus::Ready, BeadPriority::P0)?;
+        p0.bead.title = "top priority".to_owned();
+
+        let mut p1_plain = sample_bead_with_priority(
+            "grove-c",
+            "open",
+            GroveBeadStatus::Ready,
+            BeadPriority::P1,
+        )?;
+        p1_plain.bead.title = "plain p1".to_owned();
+
+        let ready_ids = HashSet::from([
+            p1_with_bonus.bead.id.clone(),
+            p0.bead.id.clone(),
+            p1_plain.bead.id.clone(),
+        ]);
+        let dependency_map = HashMap::from([(
+            p1_with_bonus.bead.id.clone(),
+            dependency_snapshot(&p1_with_bonus.bead.id, &["grove-child"]),
+        )]);
+
+        let queue = build_ready_queue(
+            &[p1_with_bonus, p0, p1_plain],
+            &ready_ids,
+            &dependency_map,
+            &[],
+            &HashMap::new(),
+            &GroveConfig::default(),
+            None,
+        );
+
+        let ordered_ids = queue
+            .iter()
+            .map(|entry| entry.bead_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ordered_ids, vec!["grove-b", "grove-a", "grove-c"]);
+
+        let p0_entry = &queue[0];
+        assert!(p0_entry.score.is_some_and(|score| score >= 100.0));
+        assert!(p0_entry.why.iter().any(|item| item == "P0 priority"));
+        assert!(p0_entry.why.iter().any(|item| item == "no reservation conflicts"));
+        assert!(p0_entry
+            .score_breakdown
+            .iter()
+            .any(|component| component.label == "ready_age"));
+
+        let bonus_entry = &queue[1];
+        assert!(bonus_entry.score.is_some_and(|score| score >= 95.0));
+        assert!(bonus_entry
+            .score_breakdown
+            .iter()
+            .any(|component| component.label == "critical_path" && component.value == 20.0));
+        assert!(bonus_entry.why.iter().any(|item| item == "1 downstream bead"));
+
+        let tied_queue = build_ready_queue(
+            &[
+                sample_bead_with_priority("grove-z", "open", GroveBeadStatus::Ready, BeadPriority::P1)?,
+                sample_bead_with_priority("grove-y", "open", GroveBeadStatus::Ready, BeadPriority::P1)?,
+            ],
+            &HashSet::from([BeadId::new("grove-z"), BeadId::new("grove-y")]),
+            &HashMap::new(),
+            &[],
+            &HashMap::new(),
+            &GroveConfig::default(),
+            None,
+        );
+        let tied_ids = tied_queue
+            .iter()
+            .map(|entry| entry.bead_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(tied_ids, vec!["grove-y", "grove-z"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn ready_queue_keeps_ready_but_suppressed_entries_with_conflict_penalty() -> TestResult {
+        let clean = sample_bead_with_priority("grove-clean", "open", GroveBeadStatus::Ready, BeadPriority::P1)?;
+        let conflicted = sample_bead_with_priority(
+            "grove-conflicted",
+            "open",
+            GroveBeadStatus::Ready,
+            BeadPriority::P1,
+        )?;
+
+        let ready_ids = HashSet::from([clean.bead.id.clone(), conflicted.bead.id.clone()]);
+        let conflict = ReservationConflict {
+            requested_by_bead: conflicted.bead.id.clone(),
+            conflicting_bead: BeadId::new("grove-held"),
+            requested_pattern: "crates/grove-kernel/src/status_view.rs".to_owned(),
+            held_pattern: "crates/grove-kernel/src/*".to_owned(),
+            conflicting_run_id: Some(RunId::new("run-held")),
+        };
+
+        let queue = build_ready_queue(
+            &[clean, conflicted],
+            &ready_ids,
+            &HashMap::new(),
+            &[conflict],
+            &HashMap::new(),
+            &GroveConfig::default(),
+            None,
+        );
+
+        assert_eq!(queue.len(), 2);
+
+        let clean_entry = queue
+            .iter()
+            .find(|entry| entry.bead_id.as_str() == "grove-clean")
+            .expect("clean ready bead should stay in queue");
+        assert!(clean_entry.dispatch.dispatchable_in_grove);
+        assert!(clean_entry.score.is_some_and(|score| score >= 75.0));
+        assert!(clean_entry
+            .score_breakdown
+            .iter()
+            .all(|component| component.label != "reservation_conflict_penalty"));
+
+        let conflicted_entry = queue
+            .iter()
+            .find(|entry| entry.bead_id.as_str() == "grove-conflicted")
+            .expect("conflicted ready bead should stay in queue");
+        assert!(!conflicted_entry.dispatch.dispatchable_in_grove);
+        assert_eq!(
+            conflicted_entry.dispatch.summary(),
+            "reservation conflict with grove-held on crates/grove-kernel/src/*"
+        );
+        assert!(conflicted_entry
+            .dispatch
+            .local_suppression_reasons
+            .iter()
+            .any(|reason| reason.code == "reservation_conflict"));
+        assert!(conflicted_entry
+            .score_breakdown
+            .iter()
+            .any(|component| {
+                component.label == "reservation_conflict_penalty"
+                    && component.value == -1000.0
+                    && component.note.as_deref() == Some("1 active conflict(s)")
+            }));
+        assert!(conflicted_entry
+            .score_breakdown
+            .iter()
+            .any(|component| component.label == "ready_age"));
+        assert!(conflicted_entry
+            .why
+            .iter()
+            .any(|item| item == "1 reservation conflict(s)"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn ready_queue_blends_bv_triage_and_ready_age_bonus() -> TestResult {
+        let bead = sample_bead_with_priority("grove-bv", "open", GroveBeadStatus::Ready, BeadPriority::P1)?;
+        let ready_ids = HashSet::from([bead.bead.id.clone()]);
+        let triage = sample_triage_output(&bead.bead.id, 0.75, &["critical path bead", "top pagerank"])?;
+
+        let queue = build_ready_queue(
+            &[bead],
+            &ready_ids,
+            &HashMap::new(),
+            &[],
+            &HashMap::new(),
+            &GroveConfig::default(),
+            Some(&triage),
+        );
+
+        let entry = queue.first().ok_or("expected ready entry")?;
+        assert_eq!(entry.bv_score, Some(0.75));
+        assert!(entry.ready_minutes.is_some());
+        assert!(entry
+            .score_breakdown
+            .iter()
+            .any(|component| component.label == "bv_triage" && component.value == 0.75));
+        assert!(entry
+            .score_breakdown
+            .iter()
+            .any(|component| component.label == "ready_age"));
+        assert!(entry
+            .why
+            .iter()
+            .any(|item| item.contains("bv triage 0.75: critical path bead, top pagerank")));
+        Ok(())
+    }
+
     fn sample_bead(
         id: &str,
         br_status: &str,
         grove_status: GroveBeadStatus,
+    ) -> TestResult<GroveBeadRecord> {
+        sample_bead_with_priority(id, br_status, grove_status, BeadPriority::P1)
+    }
+
+    fn sample_bead_with_priority(
+        id: &str,
+        br_status: &str,
+        grove_status: GroveBeadStatus,
+        priority: BeadPriority,
     ) -> TestResult<GroveBeadRecord> {
         let created_at = parse_ts("2026-03-16T10:00:00Z")?;
         let updated_at = parse_ts("2026-03-16T11:00:00Z")?;
@@ -887,7 +1184,7 @@ mod tests {
                 id: BeadId::new(id),
                 title: format!("title-{id}"),
                 description: None,
-                priority: BeadPriority::P1,
+                priority,
                 issue_type: "task".to_owned(),
                 br_status: br_status.to_owned(),
                 assignee: None,
@@ -904,6 +1201,84 @@ mod tests {
             last_failure_detail: None,
             synced_at: updated_at,
             runtime_updated_at: updated_at,
+        })
+    }
+
+    fn dependency_snapshot(bead_id: &BeadId, blocks: &[&str]) -> BrDependencySnapshot {
+        BrDependencySnapshot {
+            bead_id: bead_id.clone(),
+            blocked_by: Vec::new(),
+            blocks: blocks.iter().map(|id| BeadId::new(*id)).collect(),
+            rows: Vec::new(),
+        }
+    }
+
+    fn sample_triage_output(bead_id: &BeadId, score: f64, reasons: &[&str]) -> TestResult<BvTriageOutput> {
+        Ok(BvTriageOutput {
+            generated_at: parse_ts("2026-03-16T12:00:00Z")?,
+            data_hash: "hash".to_owned(),
+            meta: BvTriageMeta {
+                version: "test".to_owned(),
+                generated_at: parse_ts("2026-03-16T12:00:00Z")?,
+                phase2_ready: true,
+                issue_count: 1,
+                compute_time_ms: 1,
+            },
+            quick_ref: BvQuickRef {
+                open_count: 1,
+                actionable_count: 1,
+                blocked_count: 0,
+                in_progress_count: 0,
+                top_picks: Vec::new(),
+            },
+            recommendations: vec![BvRecommendation {
+                id: bead_id.clone(),
+                title: "triaged".to_owned(),
+                issue_type: "task".to_owned(),
+                status: "open".to_owned(),
+                priority: BeadPriority::P1,
+                labels: Vec::new(),
+                score,
+                breakdown_json: serde_json::json!({}),
+                action: None,
+                reasons: reasons.iter().map(|reason| (*reason).to_owned()).collect(),
+                unblocks: Vec::new(),
+                blocked_by: Vec::new(),
+                page_rank: Some(0.5),
+                betweenness: Some(0.2),
+            }],
+            quick_wins: Vec::new(),
+            blockers_to_clear: Vec::new(),
+            project_health: BvProjectHealth {
+                counts: BvProjectCounts {
+                    total: 1,
+                    open: 1,
+                    closed: 0,
+                    blocked: 0,
+                    actionable: 1,
+                    by_status: HashMap::new(),
+                    by_type: HashMap::new(),
+                    by_priority: HashMap::new(),
+                },
+                graph: BvGraphHealth {
+                    node_count: 1,
+                    edge_count: 0,
+                    density: None,
+                    has_cycles: false,
+                    phase2_ready: true,
+                },
+                velocity: BvVelocitySummary {
+                    closed_last_7_days: 0,
+                    closed_last_30_days: 0,
+                    avg_days_to_close: None,
+                    weekly: Vec::new(),
+                },
+            },
+            commands: vec![BvCommand {
+                label: "next".to_owned(),
+                command: "bv --robot-next".to_owned(),
+            }],
+            usage_hints: Vec::new(),
         })
     }
 
