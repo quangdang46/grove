@@ -118,6 +118,16 @@ pub fn classify_session_outcome(
     exit_code: Option<i32>,
     timed_out: bool,
 ) -> SessionTerminalClass {
+    classify_session_outcome_with_policy(&ExitPolicy::default(), analysis, exit_code, timed_out)
+}
+
+#[must_use]
+pub fn classify_session_outcome_with_policy(
+    policy: &ExitPolicy,
+    analysis: &IterationAnalysis,
+    exit_code: Option<i32>,
+    timed_out: bool,
+) -> SessionTerminalClass {
     if analysis.checkpoint_emitted {
         return SessionTerminalClass::Checkpoint;
     }
@@ -133,7 +143,7 @@ pub fn classify_session_outcome(
     if matches!(exit_code, Some(code) if code != 0) {
         return SessionTerminalClass::Crash;
     }
-    if ExitPolicy::default().evaluate(analysis) == ExitDecision::Success {
+    if policy.evaluate(analysis) == ExitDecision::Success {
         return SessionTerminalClass::Success;
     }
     SessionTerminalClass::UnknownFailure

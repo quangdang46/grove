@@ -387,6 +387,32 @@ mod tests {
     }
 
     #[test]
+    fn materializer_persists_retry_delta_summary_and_rescue_card_section() -> TestResult {
+        let mut input = sample_input(ExecutionContract::RetryRescue);
+        input.rescue_card = Some("Avoid replaying the repeated parse failure.".to_owned());
+        input.retry_delta_summary =
+            Some("Changed retry framing: use a different verification path.".to_owned());
+
+        let materialized = materialize_prompt(input);
+
+        assert_eq!(
+            materialized.manifest.retry_delta_summary.as_deref(),
+            Some("Changed retry framing: use a different verification path.")
+        );
+        let rescue_card = materialized
+            .manifest
+            .sections
+            .iter()
+            .find(|section| section.kind == PromptSegmentKind::RescueCard)
+            .ok_or("missing rescue-card section")?;
+        assert!(rescue_card.included);
+        assert!(materialized
+            .rendered_prompt
+            .contains("Avoid replaying the repeated parse failure."));
+        Ok(())
+    }
+
+    #[test]
     fn manifest_tracks_checkpoint_provenance() -> TestResult {
         let materialized = materialize_prompt(sample_input(ExecutionContract::Resume));
         let checkpoint = materialized

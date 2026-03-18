@@ -6,13 +6,15 @@ mod materializer;
 mod parser;
 mod progress;
 mod protocol;
+mod retry;
+mod runner;
 mod transcript;
 
 pub use analysis::{analyze_iteration, AnalysisInput};
 pub use analyzer::{
-    analyze_session_outcome, classify_session_outcome, evaluate_exit_policy,
-    evaluate_outcome_exit_policy, update_circuit_breaker, ContextMonitor, ContextPressure,
-    ContextPressureDecision, SessionAnalysisContext,
+    analyze_session_outcome, classify_session_outcome, classify_session_outcome_with_policy,
+    evaluate_exit_policy, evaluate_outcome_exit_policy, update_circuit_breaker, ContextMonitor,
+    ContextPressure, ContextPressureDecision, SessionAnalysisContext,
 };
 pub use backend::{ClaudeBackend, CliClaudeBackend, RunningSession, StartSessionRequest};
 pub use exit_policy::{ExitDecision, ExitPolicy};
@@ -25,6 +27,11 @@ pub use protocol::{
     parse_protocol_event, ProtocolMarker, ProtocolParseError, GROVE_ARTIFACTS_PREFIX,
     GROVE_CHECKPOINT_PREFIX, GROVE_DECISIONS_PREFIX, GROVE_EXIT_PREFIX, GROVE_LESSONS_PREFIX,
     GROVE_RESULT_PREFIX, GROVE_WARNINGS_PREFIX,
+};
+pub use retry::{plan_retry_mutation, RetryMutationPlan};
+pub use runner::{
+    execute_single_task_session, SingleTaskSessionRequest, SingleTaskSessionResult,
+    SingleTaskSessionRunnerError,
 };
 pub use transcript::{replay_transcript, TranscriptError, TranscriptReplay, TranscriptWriter};
 
