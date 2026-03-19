@@ -7,8 +7,9 @@ use crate::{
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::Utc;
 use grove_types::{
-    BeadId, ClaudeSessionRecord, ExecutionContract, FailureClass, PromptId, ProtocolState, RunId,
-    SessionId, SessionOutcome, SessionStatus, SessionTerminalClass, StopReason,
+    BeadId, ClaudeSessionRecord, ContextPressureLevel, ExecutionContract, FailureClass, PromptId,
+    ProtocolState, RunId, SessionId, SessionOutcome, SessionStatus, SessionTerminalClass,
+    StopReason,
 };
 use std::{fs, path::Path};
 use thiserror::Error;
@@ -48,6 +49,18 @@ pub struct SingleTaskSessionResult {
     pub protocol_warnings: Vec<ProtocolWarning>,
 }
 
+pub trait SessionLifecycleHooks {
+    fn on_session_started(&mut self, _session: &ClaudeSessionRecord) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn on_session_finished(&mut self, _result: &SingleTaskSessionResult) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl SessionLifecycleHooks for () {}
+
 impl SingleTaskSessionRequest {
     #[must_use]
     pub fn with_retry_context(
@@ -84,11 +97,21 @@ pub enum SingleTaskSessionRunnerError {
     ReadStderr(std::io::Error),
     #[error("failed to wait for Claude session: {0}")]
     Wait(std::io::Error),
+    #[error("session lifecycle hook failed: {0}")]
+    LifecycleHook(anyhow::Error),
 }
 
 pub fn execute_single_task_session<B: ClaudeBackend>(
     backend: &B,
     request: SingleTaskSessionRequest,
+) -> Result<SingleTaskSessionResult, SingleTaskSessionRunnerError> {
+    execute_single_task_session_with_hooks(backend, request, &mut ())
+}
+
+pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecycleHooks>(
+    backend: &B,
+    request: SingleTaskSessionRequest,
+    hooks: &mut H,
 ) -> Result<SingleTaskSessionResult, SingleTaskSessionRunnerError> {
     let started_at = Utc::now();
     let protocol_block = default_protocol_block();
@@ -120,93 +143,137 @@ pub fn execute_single_task_session<B: ClaudeBackend>(
     let mut transcript = TranscriptWriter::open(transcript_abs.as_std_path())?;
     transcript.append_session_started(request.session_id.clone(), started_at)?;
 
-    let mut running = backend.start(StartSessionRequest {
-        model: request.model.clone(),
-        prompt: materialized.rendered_prompt.clone(),
-        working_dir: request.working_dir.clone(),
-        timeout: request.timeout,
-        env: request.env.clone(),
-    })?;
+    let started_session = ClaudeSessionRecord {
+        id: request.session_id.clone(),
+        run_id: request.run_id.clone(),
+        external_session_id: None,
+        ordinal_in_run: request.ordinal_in_run,
+        status: SessionStatus::Running,
+        started_at,
+        ended_at: None,
+        prompt_id: Some(request.prompt_id.clone()),
+        prompt_manifest_path: Some(request.prompt_manifest_path.to_string()),
+        prompt_bytes: materialized.prompt_bytes as i32,
+        estimated_input_tokens: materialized.estimated_input_tokens as i32,
+        estimated_output_tokens: 0,
+        exit_code: None,
+        stop_reason: None,
+        transcript_path: request.transcript_path.to_string(),
+    };
+    hooks.on_session_started(&started_session)
+        .map_err(SingleTaskSessionRunnerError::LifecycleHook)?;
 
     let mut parser = ProtocolParser::default();
     let mut stdout_lines = Vec::new();
     let mut stderr_lines = Vec::new();
 
-    while let Some(line) = running.stdout.next() {
-        let line = line.map_err(SingleTaskSessionRunnerError::ReadStdout)?;
-        let ts = Utc::now();
-        transcript.append_stdout_line(line.clone(), ts)?;
-        match parser.parse_stdout_line(&line) {
-            ParserLineKind::Protocol(event) => transcript.append_protocol_event(event, ts)?,
-            ParserLineKind::PlainStdout(text) => stdout_lines.push(text),
-            ParserLineKind::PlainStderr(_) => {}
+    let result = (|| {
+        let mut running = backend.start(StartSessionRequest {
+            model: request.model.clone(),
+            prompt: materialized.rendered_prompt.clone(),
+            working_dir: request.working_dir.clone(),
+            timeout: request.timeout,
+            env: request.env.clone(),
+        })?;
+
+        while let Some(line) = running.stdout.next() {
+            let line = line.map_err(SingleTaskSessionRunnerError::ReadStdout)?;
+            let ts = Utc::now();
+            transcript.append_stdout_line(line.clone(), ts)?;
+            match parser.parse_stdout_line(&line) {
+                ParserLineKind::Protocol(event) => transcript.append_protocol_event(event, ts)?,
+                ParserLineKind::PlainStdout(text) => stdout_lines.push(text),
+                ParserLineKind::PlainStderr(_) => {}
+            }
         }
-    }
 
-    while let Some(line) = running.stderr.next() {
-        let line = line.map_err(SingleTaskSessionRunnerError::ReadStderr)?;
-        let ts = Utc::now();
-        transcript.append_stderr_line(line.clone(), ts)?;
-        if let ParserLineKind::PlainStderr(text) = parser.parse_stderr_line(&line) {
-            stderr_lines.push(text);
+        while let Some(line) = running.stderr.next() {
+            let line = line.map_err(SingleTaskSessionRunnerError::ReadStderr)?;
+            let ts = Utc::now();
+            transcript.append_stderr_line(line.clone(), ts)?;
+            if let ParserLineKind::PlainStderr(text) = parser.parse_stderr_line(&line) {
+                stderr_lines.push(text);
+            }
         }
-    }
 
-    let status = running.child.wait().map_err(SingleTaskSessionRunnerError::Wait)?;
-    let ended_at = Utc::now();
-    transcript.append_session_ended(status.code(), ended_at)?;
+        let status = running.child.wait().map_err(SingleTaskSessionRunnerError::Wait)?;
+        let ended_at = Utc::now();
+        transcript.append_session_ended(status.code(), ended_at)?;
 
-    let protocol_warnings = parser.warnings().to_vec();
-    let protocol_state = parser.into_state();
-    let analysis = analyze_session_outcome(crate::SessionAnalysisContext {
-        protocol_state: &protocol_state,
-        protocol_warnings: &protocol_warnings,
-        stdout_lines: &stdout_lines,
-        stderr_lines: &stderr_lines,
-        estimated_prompt_tokens: materialized.estimated_input_tokens,
-        estimated_output_tokens: estimate_output_tokens(&stdout_lines, &stderr_lines),
-    });
-    let context_pressure = request.context_monitor.estimate(&analysis);
-    let context_pressure_level = request.context_monitor.classify(&analysis);
-    let terminal_class = classify_session_outcome_with_policy(
-        &request.exit_policy,
-        &analysis,
-        status.code(),
-        false,
-    );
+        let protocol_warnings = parser.warnings().to_vec();
+        let protocol_state = parser.into_state();
+        let analysis = analyze_session_outcome(crate::SessionAnalysisContext {
+            protocol_state: &protocol_state,
+            protocol_warnings: &protocol_warnings,
+            stdout_lines: &stdout_lines,
+            stderr_lines: &stderr_lines,
+            estimated_prompt_tokens: materialized.estimated_input_tokens,
+            estimated_output_tokens: estimate_output_tokens(&stdout_lines, &stderr_lines),
+        });
+        let context_pressure = request.context_monitor.estimate(&analysis);
+        let context_pressure_level = request.context_monitor.classify(&analysis);
+        let terminal_class = classify_session_outcome_with_policy(
+            &request.exit_policy,
+            &analysis,
+            status.code(),
+            false,
+        );
 
-    let session = ClaudeSessionRecord {
-        id: request.session_id,
-        run_id: request.run_id,
-        external_session_id: None,
-        ordinal_in_run: request.ordinal_in_run,
-        status: status_from_terminal_class(terminal_class),
-        started_at,
-        ended_at: Some(ended_at),
-        prompt_id: Some(request.prompt_id),
-        prompt_manifest_path: Some(request.prompt_manifest_path.to_string()),
-        prompt_bytes: materialized.prompt_bytes as i32,
-        estimated_input_tokens: materialized.estimated_input_tokens as i32,
-        estimated_output_tokens: analysis.estimated_output_tokens as i32,
-        exit_code: status.code(),
-        stop_reason: Some(stop_reason_from_terminal_class(terminal_class)),
-        transcript_path: request.transcript_path.to_string(),
+        let session = ClaudeSessionRecord {
+            id: request.session_id.clone(),
+            run_id: request.run_id.clone(),
+            external_session_id: None,
+            ordinal_in_run: request.ordinal_in_run,
+            status: status_from_terminal_class(terminal_class),
+            started_at,
+            ended_at: Some(ended_at),
+            prompt_id: Some(request.prompt_id.clone()),
+            prompt_manifest_path: Some(request.prompt_manifest_path.to_string()),
+            prompt_bytes: materialized.prompt_bytes as i32,
+            estimated_input_tokens: materialized.estimated_input_tokens as i32,
+            estimated_output_tokens: analysis.estimated_output_tokens as i32,
+            exit_code: status.code(),
+            stop_reason: Some(stop_reason_from_terminal_class(terminal_class)),
+            transcript_path: request.transcript_path.to_string(),
+        };
+
+        Ok(SingleTaskSessionResult {
+            outcome: SessionOutcome {
+                session,
+                protocol_events: protocol_state.events.clone(),
+                analysis,
+                terminal_class,
+                context_pressure_pct: Some(context_pressure.usage_pct),
+                context_pressure_level,
+                stdout_tail: tail(&stdout_lines),
+                stderr_tail: tail(&stderr_lines),
+            },
+            protocol_state,
+            protocol_warnings,
+        })
+    })();
+
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let result = failure_result_from_error(
+                &request,
+                &materialized,
+                started_at,
+                &stdout_lines,
+                &stderr_lines,
+                &error,
+            );
+            hooks.on_session_finished(&result)
+                .map_err(SingleTaskSessionRunnerError::LifecycleHook)?;
+            return Err(error);
+        }
     };
 
-    Ok(SingleTaskSessionResult {
-        outcome: SessionOutcome {
-            session,
-            protocol_events: protocol_state.events.clone(),
-            analysis,
-            terminal_class,
-            context_pressure_pct: Some(context_pressure.usage_pct),
-            context_pressure_level,
-            stdout_tail: tail(&stdout_lines),
-            stderr_tail: tail(&stderr_lines),
-        },
-        protocol_state,
-        protocol_warnings,
-    })
+    hooks.on_session_finished(&result)
+        .map_err(SingleTaskSessionRunnerError::LifecycleHook)?;
+
+    Ok(result)
 }
 
 fn resolve_under_working_dir(base: &Utf8Path, path: &Utf8Path) -> Utf8PathBuf {
@@ -239,6 +306,71 @@ fn persist_prompt_manifest(
         path: path.display().to_string(),
         source,
     })
+}
+
+fn failure_result_from_error(
+    request: &SingleTaskSessionRequest,
+    materialized: &crate::PromptMaterialization,
+    started_at: chrono::DateTime<Utc>,
+    stdout_lines: &[String],
+    stderr_lines: &[String],
+    error: &SingleTaskSessionRunnerError,
+) -> SingleTaskSessionResult {
+    let ended_at = Utc::now();
+    let terminal_class = terminal_class_from_error(error);
+    let analysis = analyze_session_outcome(crate::SessionAnalysisContext {
+        protocol_state: &ProtocolState::default(),
+        protocol_warnings: &[],
+        stdout_lines,
+        stderr_lines,
+        estimated_prompt_tokens: materialized.estimated_input_tokens,
+        estimated_output_tokens: estimate_output_tokens(stdout_lines, stderr_lines),
+    });
+    let session = ClaudeSessionRecord {
+        id: request.session_id.clone(),
+        run_id: request.run_id.clone(),
+        external_session_id: None,
+        ordinal_in_run: request.ordinal_in_run,
+        status: status_from_terminal_class(terminal_class),
+        started_at,
+        ended_at: Some(ended_at),
+        prompt_id: Some(request.prompt_id.clone()),
+        prompt_manifest_path: Some(request.prompt_manifest_path.to_string()),
+        prompt_bytes: materialized.prompt_bytes as i32,
+        estimated_input_tokens: materialized.estimated_input_tokens as i32,
+        estimated_output_tokens: analysis.estimated_output_tokens as i32,
+        exit_code: None,
+        stop_reason: Some(stop_reason_from_terminal_class(terminal_class)),
+        transcript_path: request.transcript_path.to_string(),
+    };
+
+    SingleTaskSessionResult {
+        outcome: SessionOutcome {
+            session,
+            protocol_events: Vec::new(),
+            analysis,
+            terminal_class,
+            context_pressure_pct: None,
+            context_pressure_level: ContextPressureLevel::Ok,
+            stdout_tail: tail(stdout_lines),
+            stderr_tail: tail(stderr_lines),
+        },
+        protocol_state: ProtocolState::default(),
+        protocol_warnings: Vec::new(),
+    }
+}
+
+fn terminal_class_from_error(error: &SingleTaskSessionRunnerError) -> SessionTerminalClass {
+    match error {
+        SingleTaskSessionRunnerError::ReadStdout(_)
+        | SingleTaskSessionRunnerError::ReadStderr(_)
+        | SingleTaskSessionRunnerError::Wait(_) => SessionTerminalClass::Crash,
+        SingleTaskSessionRunnerError::BackendStart(_) => SessionTerminalClass::UnknownFailure,
+        SingleTaskSessionRunnerError::Transcript(_)
+        | SingleTaskSessionRunnerError::PersistPromptManifest { .. }
+        | SingleTaskSessionRunnerError::EncodePromptManifest { .. }
+        | SingleTaskSessionRunnerError::LifecycleHook(_) => SessionTerminalClass::UnknownFailure,
+    }
 }
 
 fn default_protocol_block() -> String {

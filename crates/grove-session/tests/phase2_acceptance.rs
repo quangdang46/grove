@@ -5,14 +5,15 @@ use std::{
     fs,
     io,
     os::unix::fs::PermissionsExt,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use camino::Utf8PathBuf;
 use chrono::Utc;
 use grove_session::{
-    CliClaudeBackend, ContextMonitor, ExitPolicy, SingleTaskSessionRequest,
-    execute_single_task_session,
+    CliClaudeBackend, ContextMonitor, ExitPolicy, SessionLifecycleHooks, SingleTaskSessionRequest,
+    execute_single_task_session, execute_single_task_session_with_hooks,
 };
 use grove_types::{
     BeadId, ClaudeSessionRecord, ContextPressureLevel, ExecutionContract, FailureClass,
@@ -98,6 +99,182 @@ fn sample_previous_outcome(
         stdout_tail: Vec::new(),
         stderr_tail: Vec::new(),
     }
+}
+
+#[derive(Clone, Default)]
+struct RecordingHooks {
+    started: Arc<Mutex<Vec<ClaudeSessionRecord>>>,
+    finished: Arc<Mutex<Vec<SessionOutcome>>>,
+}
+
+impl SessionLifecycleHooks for RecordingHooks {
+    fn on_session_started(&mut self, session: &ClaudeSessionRecord) -> anyhow::Result<()> {
+        self.started.lock().expect("lock started hooks").push(session.clone());
+        Ok(())
+    }
+
+    fn on_session_finished(&mut self, result: &grove_session::SingleTaskSessionResult) -> anyhow::Result<()> {
+        self.finished
+            .lock()
+            .expect("lock finished hooks")
+            .push(result.outcome.clone());
+        Ok(())
+    }
+}
+
+struct FailingStartHooks;
+
+impl SessionLifecycleHooks for FailingStartHooks {
+    fn on_session_started(&mut self, _session: &ClaudeSessionRecord) -> anyhow::Result<()> {
+        anyhow::bail!("persist start")
+    }
+}
+
+struct FailingFinishHooks;
+
+impl SessionLifecycleHooks for FailingFinishHooks {
+    fn on_session_finished(&mut self, _result: &grove_session::SingleTaskSessionResult) -> anyhow::Result<()> {
+        anyhow::bail!("persist finish")
+    }
+}
+
+#[test]
+fn lifecycle_hooks_observe_session_start_and_finish() -> TestResult {
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    fs::create_dir_all(&workspace_dir)?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+
+    let script_path = dir.path().join("fake-claude");
+    write_fake_claude_script(&script_path)?;
+    let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+    let mut request = sample_request(workspace_dir);
+    request.env = vec![
+        (
+            "STDOUT_SCRIPT".to_owned(),
+            concat!(
+                "working through the task\n",
+                "GROVE_RESULT: session runner wired\n",
+                "GROVE_EXIT: true\n",
+                "all tasks complete\n",
+                "implementation complete\n"
+            )
+            .to_owned(),
+        ),
+        ("STDERR_SCRIPT".to_owned(), String::new()),
+        ("EXIT_CODE".to_owned(), "0".to_owned()),
+    ];
+
+    let mut hooks = RecordingHooks::default();
+    let result = execute_single_task_session_with_hooks(&backend, request, &mut hooks)?;
+
+    let started = hooks.started.lock().expect("lock started assertions");
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].status, SessionStatus::Running);
+    assert_eq!(started[0].ended_at, None);
+    assert_eq!(started[0].prompt_id.as_ref().map(|id| id.as_str()), Some("prompt-1"));
+
+    let finished = hooks.finished.lock().expect("lock finished assertions");
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].session.status, SessionStatus::Completed);
+    assert_eq!(finished[0].session.id.as_str(), result.outcome.session.id.as_str());
+    Ok(())
+}
+
+#[test]
+fn started_then_runner_failure_still_emits_terminal_finish_callback() -> TestResult {
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    fs::create_dir_all(&workspace_dir)?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+
+    let script_path = dir.path().join("missing-claude");
+    let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+    let request = sample_request(workspace_dir);
+    let mut hooks = RecordingHooks::default();
+    let error = execute_single_task_session_with_hooks(&backend, request, &mut hooks)
+        .expect_err("backend start should fail");
+    assert!(matches!(
+        error,
+        grove_session::SingleTaskSessionRunnerError::BackendStart(_)
+    ));
+
+    let started = hooks.started.lock().expect("lock started assertions");
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].status, SessionStatus::Running);
+
+    let finished = hooks.finished.lock().expect("lock finished assertions");
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].session.status, SessionStatus::UnknownFailure);
+    assert_eq!(finished[0].terminal_class, SessionTerminalClass::UnknownFailure);
+    assert!(finished[0].session.ended_at.is_some());
+    Ok(())
+}
+
+#[test]
+fn lifecycle_start_hook_failure_surfaces_as_runner_error() -> TestResult {
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    fs::create_dir_all(&workspace_dir)?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+
+    let script_path = dir.path().join("fake-claude");
+    write_fake_claude_script(&script_path)?;
+    let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+    let request = sample_request(workspace_dir);
+    let error = execute_single_task_session_with_hooks(&backend, request, &mut FailingStartHooks)
+        .expect_err("hook failure should bubble out");
+    assert!(matches!(
+        error,
+        grove_session::SingleTaskSessionRunnerError::LifecycleHook(_)
+    ));
+    assert!(error.to_string().contains("persist start"));
+    Ok(())
+}
+
+#[test]
+fn successful_run_with_finish_hook_failure_surfaces_error() -> TestResult {
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    fs::create_dir_all(&workspace_dir)?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+
+    let script_path = dir.path().join("fake-claude");
+    write_fake_claude_script(&script_path)?;
+    let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+    let mut request = sample_request(workspace_dir);
+    request.env = vec![
+        (
+            "STDOUT_SCRIPT".to_owned(),
+            concat!(
+                "working through the task\n",
+                "GROVE_RESULT: session runner wired\n",
+                "GROVE_EXIT: true\n",
+                "all tasks complete\n",
+                "implementation complete\n"
+            )
+            .to_owned(),
+        ),
+        ("STDERR_SCRIPT".to_owned(), String::new()),
+        ("EXIT_CODE".to_owned(), "0".to_owned()),
+    ];
+
+    let error = execute_single_task_session_with_hooks(&backend, request, &mut FailingFinishHooks)
+        .expect_err("finish hook failure should bubble out");
+    assert!(matches!(
+        error,
+        grove_session::SingleTaskSessionRunnerError::LifecycleHook(_)
+    ));
+    assert!(error.to_string().contains("persist finish"));
+    Ok(())
 }
 
 #[test]
@@ -443,11 +620,16 @@ fn interrupted_retry_context_uses_resume_contract_and_persists_manifest_details(
 
     let mut request =
         sample_request(workspace_dir.clone()).with_retry_context(FailureClass::Interrupted, Some(previous_outcome));
+    assert_eq!(request.previous_failure_class, Some(FailureClass::Interrupted));
     assert_eq!(request.contract, ExecutionContract::Resume);
     assert!(request
         .retry_delta_summary
         .as_deref()
         .is_some_and(|summary| summary.contains("resumes from durable progress")));
+    assert!(request
+        .rescue_card
+        .as_deref()
+        .is_some_and(|card| card.contains("Resume from the first unfinished step only")));
 
     request.env = vec![
         (
@@ -483,5 +665,102 @@ fn interrupted_retry_context_uses_resume_contract_and_persists_manifest_details(
     assert!(rescue_card.preview.contains("Resume from the first unfinished step only"));
     assert_eq!(result.outcome.terminal_class, SessionTerminalClass::Success);
     assert_eq!(result.outcome.session.status, SessionStatus::Completed);
+    Ok(())
+}
+
+#[test]
+fn lifecycle_hooks_expose_started_record_fields_needed_for_persistence() -> TestResult {
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    fs::create_dir_all(&workspace_dir)?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+
+    let script_path = dir.path().join("fake-claude");
+    write_fake_claude_script(&script_path)?;
+    let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+    let mut request = sample_request(workspace_dir);
+    request.env = vec![
+        (
+            "STDOUT_SCRIPT".to_owned(),
+            concat!(
+                "working through the task\n",
+                "GROVE_RESULT: session runner wired\n",
+                "GROVE_EXIT: true\n",
+                "all tasks complete\n",
+                "implementation complete\n"
+            )
+            .to_owned(),
+        ),
+        ("STDERR_SCRIPT".to_owned(), String::new()),
+        ("EXIT_CODE".to_owned(), "0".to_owned()),
+    ];
+
+    let mut hooks = RecordingHooks::default();
+    execute_single_task_session_with_hooks(&backend, request, &mut hooks)?;
+
+    let started = hooks.started.lock().expect("lock started assertions");
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].ordinal_in_run, 1);
+    assert_eq!(
+        started[0].prompt_manifest_path.as_deref(),
+        Some(".grove/prompts/prompt-1.json")
+    );
+    assert_eq!(
+        started[0].transcript_path,
+        ".grove/transcripts/grove-1j9.6.9/ses-1.jsonl"
+    );
+    assert!(started[0].prompt_bytes > 0);
+    assert!(started[0].estimated_input_tokens > 0);
+    Ok(())
+}
+
+#[test]
+fn lifecycle_hooks_observe_checkpoint_terminal_outcome_and_payload() -> TestResult {
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    fs::create_dir_all(&workspace_dir)?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+
+    let script_path = dir.path().join("fake-claude");
+    write_fake_claude_script(&script_path)?;
+    let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+    let mut request = sample_request(workspace_dir);
+    request.env = vec![
+        (
+            "STDOUT_SCRIPT".to_owned(),
+            concat!(
+                "GROVE_RESULT: checkpoint before rotation\n",
+                "GROVE_EXIT: true\n",
+                "all tasks complete\n",
+                "implementation complete\n",
+                "GROVE_CHECKPOINT: {\"progress\":\"halfway\",\"next_step\":\"finish wiring\",\"context\":{},\"open_questions\":[],\"claimed_paths\":[\"crates/grove-session/src/**\"]}\n"
+            )
+            .to_owned(),
+        ),
+        ("STDERR_SCRIPT".to_owned(), String::new()),
+        ("EXIT_CODE".to_owned(), "0".to_owned()),
+    ];
+
+    let mut hooks = RecordingHooks::default();
+    let result = execute_single_task_session_with_hooks(&backend, request, &mut hooks)?;
+
+    let finished = hooks.finished.lock().expect("lock finished assertions");
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].terminal_class, SessionTerminalClass::Checkpoint);
+    assert_eq!(finished[0].session.status, SessionStatus::Checkpointed);
+    assert_eq!(finished[0].session.stop_reason, Some(StopReason::Checkpoint));
+    assert!(finished[0].session.ended_at.is_some());
+    assert_eq!(
+        result
+            .protocol_state
+            .latest_checkpoint
+            .as_ref()
+            .map(|payload| payload.next_step.as_str()),
+        Some("finish wiring")
+    );
     Ok(())
 }

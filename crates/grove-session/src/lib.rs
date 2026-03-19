@@ -30,8 +30,9 @@ pub use protocol::{
 };
 pub use retry::{plan_retry_mutation, RetryMutationPlan};
 pub use runner::{
-    execute_single_task_session, SingleTaskSessionRequest, SingleTaskSessionResult,
-    SingleTaskSessionRunnerError,
+    SessionLifecycleHooks, SingleTaskSessionRequest, SingleTaskSessionResult,
+    SingleTaskSessionRunnerError, execute_single_task_session,
+    execute_single_task_session_with_hooks,
 };
 pub use transcript::{replay_transcript, TranscriptError, TranscriptReplay, TranscriptWriter};
 

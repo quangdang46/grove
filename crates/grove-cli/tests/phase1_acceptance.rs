@@ -22,7 +22,7 @@ use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 use grove_br::{BrClient, BrIssueSummary, BrDependencySnapshot, BeadCacheStore, sync_bead_cache};
 use grove_config::{GroveConfig, GrovePaths, validate_config};
-use grove_db::Database;
+use grove_db::{reservation_patterns_overlap, Database};
 use grove_kernel::{
     DispatchEligibilityContext, LocalSuppressionReason, evaluate_dispatch_eligibility,
     dispatch_suppression_label, validate_dependency_snapshot,
@@ -73,11 +73,13 @@ fn init_creates_database_with_migrations() -> TestResult {
 
     // Verify migrations were applied
     let applied_migrations = db.applied_migrations()?;
-    assert_eq!(applied_migrations.len(), 2, "should have 2 applied migrations");
+    assert_eq!(applied_migrations.len(), 3, "should have 3 applied migrations");
     assert_eq!(applied_migrations[0].version, 1);
     assert_eq!(applied_migrations[0].name, "0001_init.sql");
     assert_eq!(applied_migrations[1].version, 2);
     assert_eq!(applied_migrations[1].name, "0002_prompt_manifest_columns.sql");
+    assert_eq!(applied_migrations[2].version, 3);
+    assert_eq!(applied_migrations[2].name, "0003_leader_lease.sql");
 
     // Verify tables exist by attempting to query them
     let conn = db.connection();
@@ -95,6 +97,7 @@ fn init_creates_database_with_migrations() -> TestResult {
         "claude_sessions",
         "checkpoints",
         "handoffs",
+        "leader_leases",
         "reservations",
         "event_log",
     ]);
@@ -444,6 +447,51 @@ fn failed_status_suppresses_dispatch() -> TestResult {
 }
 
 #[test]
+fn reservation_conflict_preserves_null_holder_run_id() -> TestResult {
+    let bead = sample_bead_record(GroveBeadStatus::Ready, "task", &[]);
+    let conflict = ReservationConflict {
+        requested_by_bead: bead.bead.id.clone(),
+        conflicting_bead: BeadId::new("grove-held"),
+        requested_pattern: "crates/grove-db/src/lib.rs".to_owned(),
+        held_pattern: "crates/grove-db/src/*.rs".to_owned(),
+        conflicting_run_id: None,
+    };
+
+    let context = sample_context(true, CircuitState::Closed, vec![conflict]);
+    let eligibility = evaluate_dispatch_eligibility(&bead, &context);
+
+    assert!(!eligibility.dispatchable_in_grove);
+    let preserved = eligibility
+        .local_suppression_reasons
+        .iter()
+        .find_map(|reason| match reason {
+            LocalSuppressionReason::ReservationConflict { conflict } => Some(conflict),
+            _ => None,
+        })
+        .ok_or("expected reservation conflict reason")?;
+    assert_eq!(preserved.conflicting_bead.as_str(), "grove-held");
+    assert_eq!(preserved.conflicting_run_id, None);
+
+    Ok(())
+}
+
+#[test]
+fn reservation_overlap_helper_handles_common_file_and_glob_cases() {
+    assert!(reservation_patterns_overlap(
+        "crates/grove-db/src/lib.rs",
+        "crates/grove-db/src/*.rs"
+    ));
+    assert!(reservation_patterns_overlap(
+        "crates/grove-db/src/**",
+        "crates/grove-db/src/nested/lib.rs"
+    ));
+    assert!(!reservation_patterns_overlap(
+        "crates/grove-db/src/*.rs",
+        "crates/grove-db/tests/*.rs"
+    ));
+}
+
+#[test]
 fn circuit_open_suppresses_all_dispatch() -> TestResult {
     let bead = sample_bead_record(GroveBeadStatus::Ready, "task", &[]);
 
@@ -666,6 +714,26 @@ fn inspect_merges_br_detail_with_local_runtime_view() -> TestResult {
     assert!(stdout.contains("Grove runtime:"));
     assert!(stdout.contains("- status: Running"));
     assert!(stdout.contains("Latest dispatch:"));
+
+    Ok(())
+}
+
+#[test]
+fn inspect_from_nested_directory_loads_relative_prompt_manifest() -> TestResult {
+    let harness = CliHarness::new()?;
+    harness.enable_beads()?;
+    harness.seed_runtime_bead_with_prompt_manifest(GroveBeadStatus::Running)?;
+    let nested_dir = harness.workspace_root.join("nested/child");
+    fs::create_dir_all(&nested_dir)?;
+
+    let output = harness.run_from_dir(["inspect", "grove-cli-test"], nested_dir.as_std_path())?;
+
+    assert!(output.status.success(), "inspect should resolve workspace root from nested directory: {}", output_text(&output));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("- prompt manifest: .grove/prompts/prompt-cli-test.json"));
+    assert!(stdout.contains("- prompt contract: implement"));
+    assert!(stdout.contains("- section 1 [task] included=yes heading=Task"));
+    assert!(stdout.contains("preview: [TASK] inspect from nested cwd"));
 
     Ok(())
 }
@@ -1066,6 +1134,86 @@ impl CliHarness {
         Ok(())
     }
 
+    fn seed_runtime_bead_with_prompt_manifest(
+        &self,
+        grove_status: GroveBeadStatus,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.seed_runtime_bead(grove_status)?;
+        fs::create_dir_all(self.workspace_root.join(".grove/prompts"))?;
+        fs::write(
+            self.workspace_root.join(".grove/prompts/prompt-cli-test.json"),
+            serde_json::to_string(&grove_types::PromptManifest {
+                prompt_id: grove_types::PromptId::new("prompt-cli-test"),
+                bead_id: grove_types::BeadId::new("grove-cli-test"),
+                run_id: grove_types::RunId::new("run-cli-test"),
+                session_id: Some(grove_types::SessionId::new("ses-cli-test")),
+                contract: grove_types::ExecutionContract::Implement,
+                created_at: "2026-03-17T00:00:00Z".parse()?,
+                token_budget: Some(200),
+                estimated_tokens: 120,
+                prompt_bytes: 512,
+                trimmed: false,
+                retry_delta_summary: None,
+                retrieval_query: None,
+                retrieval_ranking_summary: Vec::new(),
+                sections: vec![grove_types::PromptManifestSection {
+                    ordinal: 1,
+                    kind: grove_types::PromptSegmentKind::Task,
+                    heading: "Task".to_owned(),
+                    included: true,
+                    estimated_tokens: 20,
+                    char_count: 80,
+                    trim_reason: None,
+                    provenance: grove_types::PromptSectionProvenance::default(),
+                    preview: "[TASK] inspect from nested cwd".to_owned(),
+                }],
+            })?,
+        )?;
+
+        let db = Database::open(&self.workspace_root.join(".grove/grove.db"))?;
+        db.connection().execute(
+            "INSERT INTO task_runs(\
+                id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id\
+            ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, NULL, ?6, ?7, ?8)",
+            rusqlite::params![
+                "run-cli-test",
+                "grove-cli-test",
+                1,
+                "Active",
+                "2026-03-17T00:00:00Z",
+                1,
+                0,
+                Option::<String>::None,
+            ],
+        )?;
+        db.connection().execute(
+            "UPDATE bead_runtime SET last_run_id = ?2 WHERE bead_id = ?1",
+            rusqlite::params!["grove-cli-test", "run-cli-test"],
+        )?;
+        db.connection().execute(
+            "INSERT INTO claude_sessions(\
+                id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, prompt_id, prompt_manifest_path, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path\
+            ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                "ses-cli-test",
+                "run-cli-test",
+                1,
+                "Running",
+                "2026-03-17T00:00:00Z",
+                Option::<String>::None,
+                "prompt-cli-test",
+                ".grove/prompts/prompt-cli-test.json",
+                512,
+                120,
+                0,
+                Option::<i32>::None,
+                Option::<String>::None,
+                ".grove/transcripts/grove-cli-test/ses-cli-test.jsonl",
+            ],
+        )?;
+        Ok(())
+    }
+
     fn run<I, S>(&self, args: I) -> Result<Output, Box<dyn std::error::Error>>
     where
         I: IntoIterator<Item = S>,
@@ -1074,10 +1222,38 @@ impl CliHarness {
         self.run_with_env(args, std::iter::empty::<(&str, &str)>())
     }
 
+    fn run_from_dir<I, S>(
+        &self,
+        args: I,
+        current_dir: &std::path::Path,
+    ) -> Result<Output, Box<dyn std::error::Error>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.run_with_env_from_dir(args, std::iter::empty::<(&str, &str)>(), current_dir)
+    }
+
     fn run_with_env<I, S, E, K, V>(
         &self,
         args: I,
         env_vars: E,
+    ) -> Result<Output, Box<dyn std::error::Error>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+        E: IntoIterator<Item = (K, V)>,
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        self.run_with_env_from_dir(args, env_vars, self.workspace_root.as_std_path())
+    }
+
+    fn run_with_env_from_dir<I, S, E, K, V>(
+        &self,
+        args: I,
+        env_vars: E,
+        current_dir: &std::path::Path,
     ) -> Result<Output, Box<dyn std::error::Error>>
     where
         I: IntoIterator<Item = S>,
@@ -1095,7 +1271,7 @@ impl CliHarness {
         let mut command = Command::new(binary);
         command
             .args(args)
-            .current_dir(self.workspace_root.as_std_path())
+            .current_dir(current_dir)
             .env("PATH", &joined_path)
             .env_remove("GROVE_TEST_BV_TRIAGE_FAIL");
 

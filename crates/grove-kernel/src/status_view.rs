@@ -4,9 +4,10 @@ use chrono::{Duration, Utc};
 use grove_br::{BrClient, BrDependencySnapshot};
 use grove_bv::BvTriageOutput;
 use grove_config::GroveConfig;
-use grove_db::Database;
+use grove_db::{reservation_patterns_overlap, Database};
 use grove_types::{
-    BeadId, BeadPriority, FailureClass, GroveBeadRecord, GroveBeadStatus, ReservationConflict,
+    BeadId, BeadPriority, FailureClass, GroveBeadRecord, GroveBeadStatus, LeaderLeaseRecord,
+    PromptManifest, RecoveryCapsule, RecoveryCapsuleOutcome, ReservationConflict,
     ReservationMode, ReservationRecord, RunId, SessionId, Timestamp,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -73,6 +74,18 @@ pub struct LeaderLeaseView {
     pub expires_at: Option<Timestamp>,
 }
 
+impl LeaderLeaseView {
+    #[must_use]
+    pub fn from_record(record: LeaderLeaseRecord) -> Self {
+        Self {
+            owner_label: record.owner_label,
+            acquired_at: Some(record.acquired_at),
+            heartbeat_at: Some(record.heartbeat_at),
+            expires_at: Some(record.expires_at),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RunningBeadView {
     pub bead_id: BeadId,
@@ -118,6 +131,7 @@ pub struct CheckpointedBeadView {
     pub next_step: Option<String>,
     pub claimed_paths: Vec<String>,
     pub saved_at: Option<Timestamp>,
+    pub recovery_capsule: Option<RecoveryCapsule>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +145,7 @@ pub struct FailedBeadView {
     pub retry_after: Option<Timestamp>,
     pub dispatch: Option<DispatchExplanationView>,
     pub recovery_hint: Option<String>,
+    pub recovery_capsule: Option<RecoveryCapsule>,
     pub mirror_pending: bool,
 }
 
@@ -258,8 +273,11 @@ impl SuppressionReasonView {
             LocalSuppressionReason::ReservationConflict { conflict } => Self {
                 code: reason.code(),
                 summary: format!(
-                    "reservation conflict with {} on {}",
-                    conflict.conflicting_bead, conflict.held_pattern
+                    "reservation conflict between {} ({}) and {} ({})",
+                    conflict.requested_by_bead,
+                    conflict.requested_pattern,
+                    conflict.conflicting_bead,
+                    conflict.held_pattern
                 ),
                 run_id: conflict.conflicting_run_id.clone(),
                 retry_after: None,
@@ -356,6 +374,7 @@ pub fn load_status_snapshot<C: BrClient>(
     config: &GroveConfig,
     triage: Option<&BvTriageOutput>,
 ) -> Result<StatusSnapshot> {
+    let now = Utc::now();
     let beads = db.list_bead_records()?;
     let ready_ids = br
         .ready()?
@@ -368,6 +387,7 @@ pub fn load_status_snapshot<C: BrClient>(
     let mirror_pending_map = mirror_pending_by_bead(&beads, db)?;
     let dependency_map = dependency_snapshots_by_bead(&beads, db)?;
 
+    let leader = db.active_leader_lease(&now)?;
     let running_beads = build_running_beads(&beads, db)?;
     let ready_queue = build_ready_queue(
         &beads,
@@ -381,6 +401,7 @@ pub fn load_status_snapshot<C: BrClient>(
     let checkpointed_beads = build_checkpointed_beads(&beads, db, &reservation_map)?;
     let failed_beads = build_failed_beads(
         &beads,
+        db,
         &ready_ids,
         &reservation_conflicts,
         &mirror_pending_map,
@@ -389,7 +410,7 @@ pub fn load_status_snapshot<C: BrClient>(
 
     Ok(StatusSnapshot {
         workspace_root: workspace_root.to_owned(),
-        leader: None,
+        leader: leader.map(LeaderLeaseView::from_record),
         beads,
         running_beads,
         ready_queue,
@@ -476,7 +497,11 @@ fn build_ready_queue(
             let dependent_count = dependency_snapshot.map_or(0, |snapshot| snapshot.blocks.len());
             let mut why = vec![priority_why(bead.bead.priority)];
             if let Some(context) = bv_context.as_ref() {
-                why.push(format!("bv triage {:.2}: {}", context.score, context.summary()));
+                why.push(format!(
+                    "bv triage {:.2}: {}",
+                    context.score,
+                    context.summary()
+                ));
             }
             if dependent_count > 0 {
                 why.push(format!(
@@ -525,7 +550,25 @@ fn build_checkpointed_beads(
         .iter()
         .filter(|bead| bead.grove_status == GroveBeadStatus::Checkpointed)
         .map(|bead| {
-            let checkpoint = db.latest_checkpoint_for_bead(&bead.bead.id)?;
+            let runs = db.list_task_runs_for_bead(&bead.bead.id)?;
+            let current_run = bead
+                .last_run_id
+                .as_ref()
+                .and_then(|run_id| runs.iter().find(|run| &run.id == run_id));
+            let checkpoint = match (
+                current_run,
+                db.latest_checkpoint_for_bead(&bead.bead.id)?,
+            ) {
+                (Some(run), Some(checkpoint))
+                    if run
+                        .last_checkpoint_id
+                        .as_ref()
+                        .is_some_and(|checkpoint_id| checkpoint_id == &checkpoint.id) =>
+                {
+                    Some(checkpoint)
+                }
+                _ => None,
+            };
             let claimed_paths = checkpoint
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.payload.get("claimed_paths"))
@@ -546,6 +589,23 @@ fn build_checkpointed_beads(
                         .collect()
                 });
 
+            let prompt_manifest = bead
+                .last_run_id
+                .as_ref()
+                .map(|run_id| db.latest_session_for_run(run_id))
+                .transpose()?
+                .flatten()
+                .and_then(|session| {
+                    session
+                        .prompt_manifest_path
+                        .as_deref()
+                        .and_then(load_prompt_manifest)
+                });
+            let recovery_capsule = recovery_capsule_for_checkpointed(
+                checkpoint.as_ref(),
+                prompt_manifest.as_ref(),
+            );
+
             Ok(CheckpointedBeadView {
                 bead_id: bead.bead.id.clone(),
                 title: bead.bead.title.clone(),
@@ -561,6 +621,7 @@ fn build_checkpointed_beads(
                     .map(|checkpoint| checkpoint.next_step.clone()),
                 claimed_paths,
                 saved_at: checkpoint.as_ref().map(|checkpoint| checkpoint.saved_at),
+                recovery_capsule,
             })
         })
         .collect()
@@ -568,6 +629,7 @@ fn build_checkpointed_beads(
 
 fn build_failed_beads(
     beads: &[GroveBeadRecord],
+    db: &Database,
     ready_ids: &HashSet<BeadId>,
     reservation_conflicts: &[ReservationConflict],
     mirror_pending_map: &HashMap<BeadId, MirrorPendingView>,
@@ -595,6 +657,30 @@ fn build_failed_beads(
             .contains(&bead.bead.id)
             .then(|| DispatchExplanationView::from_eligibility(&eligibility));
 
+        let prompt_manifest = bead
+            .last_run_id
+            .as_ref()
+            .map(|run_id| db.latest_session_for_run(run_id))
+            .transpose()?
+            .flatten()
+            .and_then(|session| {
+                session
+                    .prompt_manifest_path
+                    .as_deref()
+                    .and_then(load_prompt_manifest)
+            });
+        let checkpoint = bead
+            .last_run_id
+            .as_ref()
+            .map(|run_id| latest_checkpoint_for_run(&bead.bead.id, run_id, db))
+            .transpose()?
+            .flatten();
+        let recovery_capsule = recovery_capsule_for_failed(
+            bead,
+            checkpoint.as_ref(),
+            prompt_manifest.as_ref(),
+        );
+
         failed.push(FailedBeadView {
             bead_id: bead.bead.id.clone(),
             title: bead.bead.title.clone(),
@@ -605,6 +691,7 @@ fn build_failed_beads(
             retry_after: bead.retry_after,
             dispatch,
             recovery_hint: recovery_hint(bead, config),
+            recovery_capsule,
             mirror_pending: mirror_pending_map.contains_key(&bead.bead.id),
         });
     }
@@ -727,11 +814,7 @@ pub(crate) fn conflicts_for_bead(
 }
 
 fn patterns_overlap(left: &str, right: &str) -> bool {
-    left == right
-        || left.starts_with(right.trim_end_matches('*'))
-        || right.starts_with(left.trim_end_matches('*'))
-        || left.contains("**") && right.starts_with(left.split("**").next().unwrap_or_default())
-        || right.contains("**") && left.starts_with(right.split("**").next().unwrap_or_default())
+    reservation_patterns_overlap(left, right)
 }
 
 fn compute_score_breakdown(
@@ -766,7 +849,8 @@ fn compute_score_breakdown(
     }
 
     if let Some(minutes) = ready_minutes.filter(|minutes| *minutes > 0) {
-        let bonus = minutes.min(i64::from(i32::MAX)) as i32 * config.scheduler.ready_age_bonus_per_min;
+        let bonus =
+            minutes.min(i64::from(i32::MAX)) as i32 * config.scheduler.ready_age_bonus_per_min;
         breakdown.push(ScoreComponentView {
             label: "ready_age".to_owned(),
             value: f64::from(bonus),
@@ -873,17 +957,74 @@ fn recovery_hint(bead: &GroveBeadRecord, config: &GroveConfig) -> Option<String>
             )
         }),
         GroveBeadStatus::Failed => {
-            Some("run `grove retry <bead-id>` after reviewing the last failure".to_owned())
+            Some("run `grove retry <bead-id>` after reviewing the recovery capsule".to_owned())
         }
         _ => None,
     }
+}
+
+fn latest_checkpoint_for_run(
+    bead_id: &BeadId,
+    run_id: &RunId,
+    db: &Database,
+) -> Result<Option<grove_types::CheckpointRecord>> {
+    let checkpoint = db.latest_checkpoint_for_bead(bead_id)?;
+    Ok(checkpoint.filter(|checkpoint| &checkpoint.run_id == run_id))
+}
+
+fn load_prompt_manifest(path: &str) -> Option<PromptManifest> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn recovery_capsule_for_checkpointed(
+    checkpoint: Option<&grove_types::CheckpointRecord>,
+    prompt_manifest: Option<&PromptManifest>,
+) -> Option<RecoveryCapsule> {
+    let checkpoint = checkpoint?;
+    RecoveryCapsule::from_parts(
+        RecoveryCapsuleOutcome::Checkpointed,
+        None,
+        None,
+        Some(checkpoint.progress.as_str()),
+        Some(checkpoint.next_step.as_str()),
+        prompt_manifest.map(|manifest| manifest.contract.as_str()),
+        prompt_manifest.and_then(|manifest| manifest.retry_delta_summary.as_deref()),
+        &[],
+    )
+}
+
+fn recovery_capsule_for_failed(
+    bead: &GroveBeadRecord,
+    checkpoint: Option<&grove_types::CheckpointRecord>,
+    prompt_manifest: Option<&PromptManifest>,
+) -> Option<RecoveryCapsule> {
+    let outcome = if bead.last_failure_class == Some(FailureClass::Interrupted) {
+        RecoveryCapsuleOutcome::Interrupted
+    } else {
+        RecoveryCapsuleOutcome::Failed
+    };
+
+    RecoveryCapsule::from_parts(
+        outcome,
+        bead.last_failure_class,
+        bead.last_failure_detail.as_deref(),
+        checkpoint.map(|checkpoint| checkpoint.progress.as_str()),
+        checkpoint.map(|checkpoint| checkpoint.next_step.as_str()),
+        prompt_manifest.map(|manifest| manifest.contract.as_str()),
+        prompt_manifest.and_then(|manifest| manifest.retry_delta_summary.as_deref()),
+        &[],
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use grove_br::BrDependencySnapshot;
-    use grove_bv::{BvCommand, BvGraphHealth, BvProjectCounts, BvProjectHealth, BvQuickRef, BvRecommendation, BvTriageMeta, BvTriageOutput, BvVelocitySummary};
+    use grove_bv::{
+        BvCommand, BvGraphHealth, BvProjectCounts, BvProjectHealth, BvQuickRef, BvRecommendation,
+        BvTriageMeta, BvTriageOutput, BvVelocitySummary,
+    };
     use grove_types::{BeadRef, CircuitState, RunId, Timestamp};
     use std::collections::{HashMap, HashSet};
     use std::error::Error;
@@ -953,7 +1094,10 @@ mod tests {
         let view = SuppressionReasonView::from_reason(&reason);
 
         assert_eq!(view.code, "reservation_conflict");
-        assert!(view.summary.contains("grove-held"));
+        assert_eq!(
+            view.summary,
+            "reservation conflict between grove-req (src/**) and grove-held (src/lib.rs)"
+        );
         assert_eq!(
             view.conflict
                 .as_ref()
@@ -964,24 +1108,16 @@ mod tests {
 
     #[test]
     fn ready_queue_orders_by_score_then_bead_id() -> TestResult {
-        let mut p1_with_bonus = sample_bead_with_priority(
-            "grove-a",
-            "open",
-            GroveBeadStatus::Ready,
-            BeadPriority::P1,
-        )?;
+        let mut p1_with_bonus =
+            sample_bead_with_priority("grove-a", "open", GroveBeadStatus::Ready, BeadPriority::P1)?;
         p1_with_bonus.bead.title = "priority bonus".to_owned();
 
         let mut p0 =
             sample_bead_with_priority("grove-b", "open", GroveBeadStatus::Ready, BeadPriority::P0)?;
         p0.bead.title = "top priority".to_owned();
 
-        let mut p1_plain = sample_bead_with_priority(
-            "grove-c",
-            "open",
-            GroveBeadStatus::Ready,
-            BeadPriority::P1,
-        )?;
+        let mut p1_plain =
+            sample_bead_with_priority("grove-c", "open", GroveBeadStatus::Ready, BeadPriority::P1)?;
         p1_plain.bead.title = "plain p1".to_owned();
 
         let ready_ids = HashSet::from([
@@ -1013,7 +1149,10 @@ mod tests {
         let p0_entry = &queue[0];
         assert!(p0_entry.score.is_some_and(|score| score >= 100.0));
         assert!(p0_entry.why.iter().any(|item| item == "P0 priority"));
-        assert!(p0_entry.why.iter().any(|item| item == "no reservation conflicts"));
+        assert!(p0_entry
+            .why
+            .iter()
+            .any(|item| item == "no reservation conflicts"));
         assert!(p0_entry
             .score_breakdown
             .iter()
@@ -1025,12 +1164,25 @@ mod tests {
             .score_breakdown
             .iter()
             .any(|component| component.label == "critical_path" && component.value == 20.0));
-        assert!(bonus_entry.why.iter().any(|item| item == "1 downstream bead"));
+        assert!(bonus_entry
+            .why
+            .iter()
+            .any(|item| item == "1 downstream bead"));
 
         let tied_queue = build_ready_queue(
             &[
-                sample_bead_with_priority("grove-z", "open", GroveBeadStatus::Ready, BeadPriority::P1)?,
-                sample_bead_with_priority("grove-y", "open", GroveBeadStatus::Ready, BeadPriority::P1)?,
+                sample_bead_with_priority(
+                    "grove-z",
+                    "open",
+                    GroveBeadStatus::Ready,
+                    BeadPriority::P1,
+                )?,
+                sample_bead_with_priority(
+                    "grove-y",
+                    "open",
+                    GroveBeadStatus::Ready,
+                    BeadPriority::P1,
+                )?,
             ],
             &HashSet::from([BeadId::new("grove-z"), BeadId::new("grove-y")]),
             &HashMap::new(),
@@ -1050,7 +1202,12 @@ mod tests {
 
     #[test]
     fn ready_queue_keeps_ready_but_suppressed_entries_with_conflict_penalty() -> TestResult {
-        let clean = sample_bead_with_priority("grove-clean", "open", GroveBeadStatus::Ready, BeadPriority::P1)?;
+        let clean = sample_bead_with_priority(
+            "grove-clean",
+            "open",
+            GroveBeadStatus::Ready,
+            BeadPriority::P1,
+        )?;
         let conflicted = sample_bead_with_priority(
             "grove-conflicted",
             "open",
@@ -1097,21 +1254,18 @@ mod tests {
         assert!(!conflicted_entry.dispatch.dispatchable_in_grove);
         assert_eq!(
             conflicted_entry.dispatch.summary(),
-            "reservation conflict with grove-held on crates/grove-kernel/src/*"
+            "reservation conflict between grove-conflicted (crates/grove-kernel/src/status_view.rs) and grove-held (crates/grove-kernel/src/*)"
         );
         assert!(conflicted_entry
             .dispatch
             .local_suppression_reasons
             .iter()
             .any(|reason| reason.code == "reservation_conflict"));
-        assert!(conflicted_entry
-            .score_breakdown
-            .iter()
-            .any(|component| {
-                component.label == "reservation_conflict_penalty"
-                    && component.value == -1000.0
-                    && component.note.as_deref() == Some("1 active conflict(s)")
-            }));
+        assert!(conflicted_entry.score_breakdown.iter().any(|component| {
+            component.label == "reservation_conflict_penalty"
+                && component.value == -1000.0
+                && component.note.as_deref() == Some("1 active conflict(s)")
+        }));
         assert!(conflicted_entry
             .score_breakdown
             .iter()
@@ -1125,10 +1279,233 @@ mod tests {
     }
 
     #[test]
+    fn checkpointed_beads_hide_stale_checkpoint_from_older_run() -> TestResult {
+        use grove_db::Database;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| std::io::Error::other("temp path was not valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        db.connection().execute(
+            "INSERT INTO bead_cache(\
+                bead_id, title, description, priority, issue_type, status, assignee,\
+                labels_json, parent_ids_json, dependency_ids_json, dependent_ids_json, raw_json, synced_at\
+            ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, '[]', '[]', '[]', '[]', '{}', ?6)",
+            rusqlite::params![
+                "grove-child",
+                "Child bead",
+                1,
+                "task",
+                "open",
+                "2026-03-16T09:00:00Z",
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO task_runs(\
+                id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id\
+            ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                "run-old",
+                "grove-child",
+                1,
+                "Checkpointed",
+                "2026-03-16T11:00:00Z",
+                "2026-03-16T11:10:00Z",
+                1,
+                1,
+                "chk-old",
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO task_runs(\
+                id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id\
+            ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, NULL, ?6, ?7, ?8)",
+            rusqlite::params![
+                "run-new",
+                "grove-child",
+                2,
+                "Checkpointed",
+                "2026-03-16T12:00:00Z",
+                1,
+                0,
+                Option::<String>::None,
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO bead_runtime(\
+                bead_id, grove_status, declared_paths_json, metadata_json, last_run_id, retry_after,\
+                last_failure_class, last_failure_detail, runtime_updated_at\
+            ) VALUES (?1, ?2, '[]', '{}', ?3, NULL, NULL, NULL, ?4)",
+            rusqlite::params![
+                "grove-child",
+                "Checkpointed",
+                "run-new",
+                "2026-03-16T12:05:00Z",
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO claude_sessions(\
+                id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, prompt_id, prompt_manifest_path, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path\
+            ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                "ses-old",
+                "run-old",
+                1,
+                "Checkpointed",
+                "2026-03-16T11:00:00Z",
+                "2026-03-16T11:09:00Z",
+                100,
+                25,
+                35,
+                0,
+                "Checkpoint",
+                ".grove/transcripts/grove-child/ses-old.jsonl",
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO checkpoints(\
+                id, bead_id, run_id, session_id, progress, next_step, payload_json, saved_at, resume_generation\
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                "chk-old",
+                "grove-child",
+                "run-old",
+                "ses-old",
+                "halfway there",
+                "resume older run",
+                "{\"progress\":\"halfway there\",\"next_step\":\"resume older run\",\"context\":{},\"open_questions\":[],\"claimed_paths\":[\"crates/grove-kernel/src/status_view.rs\"],\"confidence\":null}",
+                "2026-03-16T11:09:00Z",
+                1,
+            ],
+        )?;
+
+        let bead = GroveBeadRecord {
+            bead: BeadRef {
+                id: BeadId::new("grove-child"),
+                title: "Child bead".to_owned(),
+                description: None,
+                priority: BeadPriority::P1,
+                issue_type: "task".to_owned(),
+                br_status: "open".to_owned(),
+                assignee: None,
+                labels: Vec::new(),
+                created_at: parse_ts("2026-03-16T10:00:00Z")?,
+                updated_at: parse_ts("2026-03-16T12:05:00Z")?,
+            },
+            grove_status: GroveBeadStatus::Checkpointed,
+            declared_paths: Vec::new(),
+            metadata: Default::default(),
+            last_run_id: Some(RunId::new("run-new")),
+            retry_after: None,
+            last_failure_class: None,
+            last_failure_detail: None,
+            synced_at: parse_ts("2026-03-16T12:05:00Z")?,
+            runtime_updated_at: parse_ts("2026-03-16T12:05:00Z")?,
+        };
+
+        let checkpointed = build_checkpointed_beads(&[bead], &db, &HashMap::new())?;
+        assert_eq!(checkpointed.len(), 1);
+        assert_eq!(checkpointed[0].run_id.as_ref().map(RunId::as_str), Some("run-new"));
+        assert_eq!(checkpointed[0].checkpoint_id, None);
+        assert_eq!(checkpointed[0].progress, None);
+        assert_eq!(checkpointed[0].next_step, None);
+        assert!(checkpointed[0].claimed_paths.is_empty());
+        assert_eq!(checkpointed[0].saved_at, None);
+        Ok(())
+    }
+
+    #[test]
+    fn reservation_conflict_detection_handles_common_glob_and_file_cases() {
+        let reservations = vec![
+            ReservationRecord {
+                id: 1,
+                bead_id: BeadId::new("grove-file"),
+                run_id: Some(RunId::new("run-file")),
+                path_pattern: "crates/grove-db/src/lib.rs".to_owned(),
+                mode: ReservationMode::Exclusive,
+                reason: None,
+                expires_at: parse_ts("2099-03-16T12:30:00Z").expect("valid timestamp"),
+                released_at: None,
+            },
+            ReservationRecord {
+                id: 2,
+                bead_id: BeadId::new("grove-glob"),
+                run_id: None,
+                path_pattern: "crates/grove-db/src/*.rs".to_owned(),
+                mode: ReservationMode::Exclusive,
+                reason: None,
+                expires_at: parse_ts("2099-03-16T12:30:00Z").expect("valid timestamp"),
+                released_at: None,
+            },
+            ReservationRecord {
+                id: 3,
+                bead_id: BeadId::new("grove-tree"),
+                run_id: Some(RunId::new("run-tree")),
+                path_pattern: "crates/grove-db/src/**".to_owned(),
+                mode: ReservationMode::Exclusive,
+                reason: None,
+                expires_at: parse_ts("2099-03-16T12:30:00Z").expect("valid timestamp"),
+                released_at: None,
+            },
+            ReservationRecord {
+                id: 4,
+                bead_id: BeadId::new("grove-other"),
+                run_id: Some(RunId::new("run-other")),
+                path_pattern: "crates/grove-kernel/src/lib.rs".to_owned(),
+                mode: ReservationMode::Exclusive,
+                reason: None,
+                expires_at: parse_ts("2099-03-16T12:30:00Z").expect("valid timestamp"),
+                released_at: None,
+            },
+        ];
+
+        let conflicts = find_reservation_conflicts(&reservations);
+        assert_eq!(conflicts.len(), 6);
+
+        let file_conflict = conflicts_for_bead(&BeadId::new("grove-file"), &conflicts);
+        assert_eq!(file_conflict.len(), 2);
+        assert!(file_conflict.iter().any(|conflict| {
+            conflict.conflicting_bead.as_str() == "grove-glob"
+                && conflict.conflicting_run_id.is_none()
+                && conflict.held_pattern == "crates/grove-db/src/*.rs"
+        }));
+        assert!(file_conflict.iter().any(|conflict| {
+            conflict.conflicting_bead.as_str() == "grove-tree"
+                && conflict.conflicting_run_id.as_ref().map(RunId::as_str) == Some("run-tree")
+                && conflict.held_pattern == "crates/grove-db/src/**"
+        }));
+
+        let glob_conflict = conflicts_for_bead(&BeadId::new("grove-glob"), &conflicts);
+        assert_eq!(glob_conflict.len(), 2);
+        assert!(glob_conflict.iter().any(|conflict| {
+            conflict.conflicting_bead.as_str() == "grove-file"
+                && conflict.conflicting_run_id.as_ref().map(RunId::as_str) == Some("run-file")
+                && conflict.held_pattern == "crates/grove-db/src/lib.rs"
+        }));
+        assert!(glob_conflict.iter().any(|conflict| {
+            conflict.conflicting_bead.as_str() == "grove-tree"
+                && conflict.conflicting_run_id.as_ref().map(RunId::as_str) == Some("run-tree")
+                && conflict.held_pattern == "crates/grove-db/src/**"
+        }));
+
+        let other_conflict = conflicts_for_bead(&BeadId::new("grove-other"), &conflicts);
+        assert!(other_conflict.is_empty());
+    }
+
+    #[test]
     fn ready_queue_blends_bv_triage_and_ready_age_bonus() -> TestResult {
-        let bead = sample_bead_with_priority("grove-bv", "open", GroveBeadStatus::Ready, BeadPriority::P1)?;
+        let bead = sample_bead_with_priority(
+            "grove-bv",
+            "open",
+            GroveBeadStatus::Ready,
+            BeadPriority::P1,
+        )?;
         let ready_ids = HashSet::from([bead.bead.id.clone()]);
-        let triage = sample_triage_output(&bead.bead.id, 0.75, &["critical path bead", "top pagerank"])?;
+        let triage =
+            sample_triage_output(&bead.bead.id, 0.75, &["critical path bead", "top pagerank"])?;
 
         let queue = build_ready_queue(
             &[bead],
@@ -1213,7 +1590,11 @@ mod tests {
         }
     }
 
-    fn sample_triage_output(bead_id: &BeadId, score: f64, reasons: &[&str]) -> TestResult<BvTriageOutput> {
+    fn sample_triage_output(
+        bead_id: &BeadId,
+        score: f64,
+        reasons: &[&str],
+    ) -> TestResult<BvTriageOutput> {
         Ok(BvTriageOutput {
             generated_at: parse_ts("2026-03-16T12:00:00Z")?,
             data_hash: "hash".to_owned(),

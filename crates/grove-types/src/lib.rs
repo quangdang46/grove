@@ -34,7 +34,10 @@ pub use prompt::{
     PromptSegment, PromptSegmentKind, PromptTrimReason,
 };
 pub use reservation::{ReservationConflict, ReservationMode, ReservationRecord};
-pub use run::{FailureClass, RetryPolicy, RunStatus, TaskRunRecord};
+pub use run::{
+    FailureClass, LeaderLeaseRecord, RecoveryCapsule, RecoveryCapsuleOutcome, RetryPolicy,
+    RunStatus, TaskRunRecord,
+};
 pub use session::{
     CircuitBreakerState, CircuitState, ClaudeSessionRecord, ContextPressureLevel,
     IterationAnalysis, ProgressSignal, SessionOutcome, SessionStatus, SessionTerminalClass,

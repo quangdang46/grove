@@ -1,21 +1,391 @@
 pub mod inspect_view;
 pub mod status_view;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use grove_br::{BrClient, BrDependencySnapshot};
 use grove_bv::BvTriageOutput;
-use grove_config::GroveConfig;
-use grove_db::{Database, RecoveredReservation, ReservationAcquireOutcome, ReservationRequest};
-use grove_types::{
-    BeadId, CircuitState, GroveBeadRecord, GroveBeadStatus, ReservationConflict, ReservationMode,
-    ReservationRecord, RunId, Timestamp,
+use grove_config::{GroveConfig, DEFAULT_CHECKPOINTS_DIR_NAME, DEFAULT_GROVE_DIR_NAME};
+use grove_db::{
+    Database, HandoffWriteInput, InterruptedRunRecovery, LeaderLeaseAcquireInput,
+    RecoveredReservation, ReservationAcquireOutcome, ReservationRequest, RunFinishInput,
+    RunStartInput, SessionCheckpointInput,
 };
-use std::collections::BTreeMap;
+use grove_session::{
+    execute_single_task_session_with_hooks, ClaudeBackend, SessionLifecycleHooks,
+    SingleTaskSessionRequest, SingleTaskSessionResult,
+};
+use grove_types::{
+    BeadId, CheckpointId, CircuitState, FailureClass, GroveBeadRecord, GroveBeadStatus,
+    ReservationConflict, ReservationMode, ReservationRecord, RunId, RunStatus, SessionStatus,
+    Timestamp,
+};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 pub use inspect_view::BeadInspectView;
 pub use status_view::WorkspaceStatusView;
 
 pub const CRATE_PURPOSE: &str = "Core Grove runtime domain and service boundaries.";
+
+#[derive(Debug, Clone)]
+pub struct PersistedTaskRunOutcome {
+    pub run: grove_types::TaskRunRecord,
+    pub session: grove_types::SessionOutcome,
+    pub checkpoint: Option<grove_types::CheckpointRecord>,
+    pub handoff: Option<grove_types::HandoffRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct CheckpointFilePersistError {
+    path: PathBuf,
+    source: String,
+}
+
+impl std::fmt::Display for CheckpointFilePersistError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to persist checkpoint file {}: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for CheckpointFilePersistError {}
+
+pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
+    db: &mut Database,
+    backend: &B,
+    request: SingleTaskSessionRequest,
+    attempt_no: i32,
+) -> Result<PersistedTaskRunOutcome> {
+    let bead_id = request.bead_id.clone();
+    let run_id = request.run_id.clone();
+    let session_id = request.session_id.clone();
+    let checkpoint_root = request
+        .working_dir
+        .join(DEFAULT_GROVE_DIR_NAME)
+        .join(DEFAULT_CHECKPOINTS_DIR_NAME);
+    let started_at = chrono::Utc::now();
+
+    db.record_run_started(RunStartInput {
+        run_id: run_id.clone(),
+        bead_id: bead_id.clone(),
+        attempt_no,
+        started_at,
+    })?;
+
+    let mut hooks = DbSessionLifecycleHooks::new(
+        db,
+        bead_id.clone(),
+        run_id.clone(),
+        session_id,
+        PathBuf::from(checkpoint_root.as_std_path()),
+    );
+    let result = execute_single_task_session_with_hooks(backend, request, &mut hooks);
+
+    match result {
+        Ok(result) => {
+            let checkpoint = hooks.take_checkpoint();
+            let run = finalize_persisted_run(hooks.db_mut(), &bead_id, &result.outcome, None)?;
+            let handoff = persist_success_handoff(hooks.db_mut(), &bead_id, &result.outcome)?;
+            Ok(PersistedTaskRunOutcome {
+                run,
+                session: result.outcome,
+                checkpoint,
+                handoff,
+            })
+        }
+        Err(error) => {
+            if let Some(outcome) = hooks.latest_outcome() {
+                let _ = finalize_persisted_run(
+                    hooks.db_mut(),
+                    &bead_id,
+                    &outcome,
+                    Some(error.to_string()),
+                );
+            } else {
+                let _ = hooks.db_mut().record_run_finished(
+                    &bead_id,
+                    RunFinishInput {
+                        run_id,
+                        status: RunStatus::Failed,
+                        failure_class: Some(FailureClass::Unknown),
+                        failure_detail: Some(error.to_string()),
+                        ended_at: chrono::Utc::now(),
+                        retry_after: None,
+                    },
+                );
+            }
+            Err(error.into())
+        }
+    }
+}
+
+struct DbSessionLifecycleHooks<'a> {
+    db: &'a mut Database,
+    bead_id: BeadId,
+    run_id: RunId,
+    session_id: grove_types::SessionId,
+    checkpoint_root: PathBuf,
+    checkpoint: Option<grove_types::CheckpointRecord>,
+    latest_outcome: Option<grove_types::SessionOutcome>,
+}
+
+impl<'a> DbSessionLifecycleHooks<'a> {
+    fn new(
+        db: &'a mut Database,
+        bead_id: BeadId,
+        run_id: RunId,
+        session_id: grove_types::SessionId,
+        checkpoint_root: PathBuf,
+    ) -> Self {
+        Self {
+            db,
+            bead_id,
+            run_id,
+            session_id,
+            checkpoint_root,
+            checkpoint: None,
+            latest_outcome: None,
+        }
+    }
+
+    fn db_mut(&mut self) -> &mut Database {
+        self.db
+    }
+
+    fn take_checkpoint(&mut self) -> Option<grove_types::CheckpointRecord> {
+        self.checkpoint.take()
+    }
+
+    fn latest_outcome(&self) -> Option<grove_types::SessionOutcome> {
+        self.latest_outcome.clone()
+    }
+
+    fn checkpoint_path(&self, checkpoint_id: &CheckpointId) -> PathBuf {
+        self.checkpoint_root
+            .join(self.bead_id.as_str())
+            .join(format!("{}.json", checkpoint_id.as_str()))
+    }
+}
+
+fn persist_checkpoint_file(path: &Path, checkpoint: &grove_types::CheckpointRecord) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create checkpoint directory {}", parent.display()))?;
+    }
+
+    let encoded = serde_json::to_vec_pretty(checkpoint)
+        .with_context(|| format!("encode checkpoint JSON {}", path.display()))?;
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, encoded)
+        .with_context(|| format!("write checkpoint temp file {}", temp_path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "rename checkpoint temp file {} to {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
+    fn on_session_started(
+        &mut self,
+        session: &grove_types::ClaudeSessionRecord,
+    ) -> anyhow::Result<()> {
+        self.db.record_session_started(&self.bead_id, session)?;
+        Ok(())
+    }
+
+    fn on_session_finished(&mut self, result: &SingleTaskSessionResult) -> anyhow::Result<()> {
+        self.db
+            .record_session_finished(&self.bead_id, &result.outcome.session)?;
+
+        if let Some(payload) = result.protocol_state.latest_checkpoint.clone() {
+            let checkpoint_id = CheckpointId::new(format!(
+                "chk-{}-{}",
+                self.run_id.as_str(),
+                result.outcome.session.ordinal_in_run
+            ));
+            let checkpoint = self.db.record_checkpoint_saved(SessionCheckpointInput {
+                checkpoint_id: checkpoint_id.clone(),
+                bead_id: self.bead_id.clone(),
+                run_id: self.run_id.clone(),
+                session_id: self.session_id.clone(),
+                payload,
+                saved_at: result
+                    .outcome
+                    .session
+                    .ended_at
+                    .unwrap_or_else(chrono::Utc::now),
+                resume_generation: result.outcome.session.ordinal_in_run as u32,
+            })?;
+            let checkpoint_path = self.checkpoint_path(&checkpoint_id);
+            if let Err(error) = persist_checkpoint_file(&checkpoint_path, &checkpoint) {
+                self.latest_outcome = Some(result.outcome.clone());
+                return Err(CheckpointFilePersistError {
+                    path: checkpoint_path,
+                    source: error.to_string(),
+                }
+                .into());
+            }
+            self.checkpoint = Some(checkpoint);
+        }
+
+        self.latest_outcome = Some(result.outcome.clone());
+        Ok(())
+    }
+}
+
+fn finalize_persisted_run(
+    db: &mut Database,
+    bead_id: &BeadId,
+    outcome: &grove_types::SessionOutcome,
+    failure_detail_override: Option<String>,
+) -> Result<grove_types::TaskRunRecord> {
+    let ended_at = outcome.session.ended_at.unwrap_or_else(chrono::Utc::now);
+    let (status, failure_class, retry_after) = match outcome.session.status {
+        SessionStatus::Checkpointed => (RunStatus::Checkpointed, None, None),
+        SessionStatus::Completed => (RunStatus::Succeeded, None, None),
+        SessionStatus::TimedOut => (
+            RunStatus::WaitingToRetry,
+            Some(FailureClass::Timeout),
+            Some(ended_at),
+        ),
+        SessionStatus::RateLimited => (
+            RunStatus::WaitingToRetry,
+            Some(FailureClass::RateLimit),
+            Some(ended_at),
+        ),
+        SessionStatus::PermissionDenied => (
+            RunStatus::Failed,
+            Some(FailureClass::PermissionDenied),
+            None,
+        ),
+        SessionStatus::Crashed => (RunStatus::Failed, Some(FailureClass::ClaudeCrashed), None),
+        SessionStatus::UnknownFailure => (RunStatus::Failed, Some(FailureClass::Unknown), None),
+        SessionStatus::Starting | SessionStatus::Running => {
+            (RunStatus::Failed, Some(FailureClass::Unknown), None)
+        }
+    };
+
+    db.record_run_finished(
+        bead_id,
+        RunFinishInput {
+            run_id: outcome.session.run_id.clone(),
+            status,
+            failure_class,
+            failure_detail: failure_detail_override.or_else(|| {
+                outcome
+                    .session
+                    .stop_reason
+                    .map(|reason| format!("session ended with {:?}", reason))
+            }),
+            ended_at,
+            retry_after,
+        },
+    )
+}
+
+fn persist_success_handoff(
+    db: &mut Database,
+    bead_id: &BeadId,
+    outcome: &grove_types::SessionOutcome,
+) -> Result<Option<grove_types::HandoffRecord>> {
+    if outcome.session.status != SessionStatus::Completed {
+        return Ok(None);
+    }
+
+    let Some(summary) = outcome
+        .protocol_events
+        .iter()
+        .find_map(|event| match event {
+            grove_types::ProtocolEvent::Result { summary } => Some(summary.clone()),
+            _ => None,
+        })
+        .or_else(|| outcome.stdout_tail.last().cloned())
+    else {
+        return Ok(None);
+    };
+
+    let completed_at = outcome.session.ended_at.unwrap_or_else(chrono::Utc::now);
+    db.write_handoff(HandoffWriteInput {
+        bead_id: bead_id.clone(),
+        run_id: outcome.session.run_id.clone(),
+        summary,
+        artifacts: outcome
+            .protocol_events
+            .iter()
+            .find_map(|event| match event {
+                grove_types::ProtocolEvent::Artifacts { items } => Some(items.clone()),
+                _ => None,
+            })
+            .unwrap_or_default(),
+        lessons: outcome
+            .protocol_events
+            .iter()
+            .find_map(|event| match event {
+                grove_types::ProtocolEvent::Lessons { items } => Some(items.clone()),
+                _ => None,
+            })
+            .unwrap_or_default(),
+        decisions: outcome
+            .protocol_events
+            .iter()
+            .find_map(|event| match event {
+                grove_types::ProtocolEvent::Decisions { items } => Some(items.clone()),
+                _ => None,
+            })
+            .unwrap_or_default(),
+        warnings: outcome
+            .protocol_events
+            .iter()
+            .find_map(|event| match event {
+                grove_types::ProtocolEvent::Warnings { items } => Some(items.clone()),
+                _ => None,
+            })
+            .unwrap_or_default(),
+        completed_at,
+    })
+    .map(Some)
+}
+
+pub fn parent_handoff_summaries(
+    db: &Database,
+    bead_id: &BeadId,
+) -> Result<Vec<String>> {
+    db.parent_handoffs_for_bead(bead_id).map(|handoffs| {
+        handoffs
+            .into_iter()
+            .map(|handoff| {
+                let mut lines = vec![format!(
+                    "Parent {} (run {}) prepared this task: {}",
+                    handoff.bead_id, handoff.run_id, handoff.summary
+                )];
+                if !handoff.artifacts.is_empty() {
+                    lines.push(format!("Artifacts: {}", handoff.artifacts.join(", ")));
+                }
+                if !handoff.decisions.is_empty() {
+                    lines.push(format!("Decisions: {}", handoff.decisions.join(" | ")));
+                }
+                if !handoff.lessons.is_empty() {
+                    lines.push(format!("Lessons: {}", handoff.lessons.join(" | ")));
+                }
+                if !handoff.warnings.is_empty() {
+                    lines.push(format!("Warnings: {}", handoff.warnings.join(" | ")));
+                }
+                lines.join("\n")
+            })
+            .collect()
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct AcquireReservationInput {
@@ -65,7 +435,10 @@ impl ReservationManager {
         db.release_reservations_for_bead(bead_id, &now)
     }
 
-    pub fn reconcile(db: &mut Database, now: chrono::DateTime<chrono::Utc>) -> Result<ReservationReconcileReport> {
+    pub fn reconcile(
+        db: &mut Database,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ReservationReconcileReport> {
         let expired = db.expire_reservations(&now)?;
         let recovered = db.recover_stale_reservations(&now)?;
         Ok(ReservationReconcileReport { expired, recovered })
@@ -76,6 +449,119 @@ impl ReservationManager {
 pub struct ReservationReconcileReport {
     pub expired: Vec<ReservationRecord>,
     pub recovered: Vec<RecoveredReservation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LeaderLeaseConfig {
+    pub owner_label: String,
+    pub lease_ttl: chrono::Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct StartupRecoveryReport {
+    pub interrupted_runs: Vec<InterruptedRunRecovery>,
+    pub reservations: ReservationReconcileReport,
+}
+
+#[derive(Debug, Clone)]
+pub struct StartupCoordinatorState {
+    pub leader: grove_types::LeaderLeaseRecord,
+    pub recovery: StartupRecoveryReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaderLeaseAcquireError {
+    Contested { owner_label: String },
+}
+
+impl std::fmt::Display for LeaderLeaseAcquireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Contested { owner_label } => {
+                write!(f, "leader lease conflict: another leader is active (owner: {owner_label})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LeaderLeaseAcquireError {}
+
+#[derive(Debug, Clone)]
+pub struct LeaderLeaseManager;
+
+impl LeaderLeaseManager {
+    pub fn acquire(
+        db: &mut Database,
+        config: &LeaderLeaseConfig,
+        run_id: Option<&RunId>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> std::result::Result<grove_types::LeaderLeaseRecord, LeaderLeaseAcquireError> {
+        let expires_at = now + config.lease_ttl;
+        match db.acquire_leader_lease(LeaderLeaseAcquireInput {
+            owner_label: config.owner_label.clone(),
+            run_id: run_id.cloned(),
+            acquired_at: now,
+            expires_at,
+        }) {
+            Ok(Some(lease)) => Ok(lease),
+            Ok(None) => {
+                let owner_label = db
+                    .active_leader_lease(&now)
+                    .ok()
+                    .flatten()
+                    .map(|lease| lease.owner_label)
+                    .unwrap_or_else(|| "unknown".to_owned());
+                Err(LeaderLeaseAcquireError::Contested { owner_label })
+            }
+            Err(error) => Err(LeaderLeaseAcquireError::Contested {
+                owner_label: error.to_string(),
+            }),
+        }
+    }
+
+    pub fn heartbeat(
+        db: &mut Database,
+        config: &LeaderLeaseConfig,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<grove_types::LeaderLeaseRecord>> {
+        let expires_at = now + config.lease_ttl;
+        db.heartbeat_leader_lease(&config.owner_label, &now, &expires_at)
+    }
+
+    pub fn release(
+        db: &mut Database,
+        owner_label: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<grove_types::LeaderLeaseRecord>> {
+        db.release_leader_lease(owner_label, &now)
+    }
+}
+
+pub fn reconcile_startup_state(
+    db: &mut Database,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<StartupRecoveryReport> {
+    let interrupted_runs = db.reconcile_interrupted_runs(&now)?;
+    let reservations = ReservationManager::reconcile(db, now)?;
+    Ok(StartupRecoveryReport {
+        interrupted_runs,
+        reservations,
+    })
+}
+
+pub fn acquire_startup_coordinator(
+    db: &mut Database,
+    config: &LeaderLeaseConfig,
+    run_id: Option<&RunId>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> std::result::Result<StartupCoordinatorState, LeaderLeaseAcquireError> {
+    let leader = LeaderLeaseManager::acquire(db, config, run_id, now)?;
+    let recovery = reconcile_startup_state(db, now).map_err(|error| {
+        LeaderLeaseAcquireError::Contested {
+            owner_label: error.to_string(),
+        }
+    })?;
+    Ok(StartupCoordinatorState { leader, recovery })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,11 +686,12 @@ pub fn load_bead_inspect_view<C: BrClient>(
     db: &Database,
     br: &C,
     bead_id: &BeadId,
+    workspace_root: &str,
     config: &GroveConfig,
     triage: Option<&BvTriageOutput>,
 ) -> Result<Option<BeadInspectView>> {
     Ok(
-        inspect_view::load_inspect_snapshot(db, br, bead_id, config, triage)?
+        inspect_view::load_inspect_snapshot(db, br, bead_id, workspace_root, config, triage)?
             .map(|snapshot| snapshot.into_view()),
     )
 }
@@ -365,7 +852,7 @@ fn collect_local_suppressions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grove_types::{BeadId, BeadPriority, BeadRef, RunId};
+    use grove_types::{BeadId, BeadPriority, BeadRef, RunId, RunStatus};
     use std::error::Error;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -601,5 +1088,546 @@ mod tests {
             .iter()
             .map(LocalSuppressionReason::code)
             .collect()
+    }
+
+    fn insert_run_row(db: &Database, run_id: &str, bead_id: &str, status: &str) -> TestResult {
+        db.connection().execute(
+            "INSERT INTO task_runs(\
+                id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id\
+             ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, NULL, 0, 0, NULL)",
+            rusqlite::params![run_id, bead_id, 1, status, "2026-03-16T11:00:00Z"],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn leader_lease_manager_round_trips_acquire_heartbeat_and_release() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let config = LeaderLeaseConfig {
+            owner_label: "worker-a".to_owned(),
+            lease_ttl: chrono::Duration::seconds(30),
+        };
+        let acquired_at: Timestamp = "2026-03-16T12:00:00Z".parse()?;
+        let heartbeat_at: Timestamp = "2026-03-16T12:00:05Z".parse()?;
+        let release_at: Timestamp = "2026-03-16T12:00:10Z".parse()?;
+
+        let lease = LeaderLeaseManager::acquire(&mut db, &config, None, acquired_at)?;
+        assert_eq!(lease.owner_label, "worker-a");
+        assert_eq!(lease.acquired_at, acquired_at);
+        assert_eq!(lease.expires_at, "2026-03-16T12:00:30Z".parse::<Timestamp>()?);
+
+        let heartbeat = LeaderLeaseManager::heartbeat(&mut db, &config, heartbeat_at)?
+            .expect("heartbeat should refresh owned lease");
+        assert_eq!(heartbeat.heartbeat_at, heartbeat_at);
+        assert_eq!(
+            heartbeat.expires_at,
+            "2026-03-16T12:00:35Z".parse::<Timestamp>()?
+        );
+
+        let released = LeaderLeaseManager::release(&mut db, "worker-a", release_at)?
+            .expect("release should return the lease record");
+        assert_eq!(released.owner_label, "worker-a");
+        assert!(db.active_leader_lease(&release_at)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn leader_lease_manager_reports_contested_owner() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let first = LeaderLeaseConfig {
+            owner_label: "worker-a".to_owned(),
+            lease_ttl: chrono::Duration::seconds(30),
+        };
+        let second = LeaderLeaseConfig {
+            owner_label: "worker-b".to_owned(),
+            lease_ttl: chrono::Duration::seconds(30),
+        };
+        let now: Timestamp = "2026-03-16T12:00:00Z".parse()?;
+
+        LeaderLeaseManager::acquire(&mut db, &first, None, now)?;
+        let error = LeaderLeaseManager::acquire(&mut db, &second, None, now)
+            .expect_err("second owner should be rejected while first lease is active");
+
+        assert_eq!(
+            error,
+            LeaderLeaseAcquireError::Contested {
+                owner_label: "worker-a".to_owned(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_reconciliation_marks_active_runs_failed_and_releases_stale_reservations() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+        insert_bead_cache_row(&db, "grove-recover", "Recover bead")?;
+        insert_run_row(&db, "run-recover", "grove-recover", "Active")?;
+        db.connection().execute(
+            "INSERT INTO reservations(\
+                bead_id, run_id, path_pattern, exclusive, reason, expires_at, released_at\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            rusqlite::params![
+                "grove-recover",
+                "run-recover",
+                "crates/grove-kernel/src/lib.rs",
+                1,
+                "startup recovery test",
+                "2099-03-16T12:30:00Z",
+            ],
+        )?;
+
+        let now: Timestamp = "2026-03-16T12:05:00Z".parse()?;
+        let report = reconcile_startup_state(&mut db, now)?;
+
+        assert_eq!(report.interrupted_runs.len(), 1);
+        assert_eq!(report.interrupted_runs[0].bead_id.as_str(), "grove-recover");
+        assert_eq!(report.interrupted_runs[0].run.status, RunStatus::Failed);
+        assert_eq!(report.interrupted_runs[0].run.failure_class, Some(FailureClass::Interrupted));
+        assert_eq!(report.reservations.recovered.len(), 1);
+        assert_eq!(report.reservations.recovered[0].reservation.path_pattern, "crates/grove-kernel/src/lib.rs");
+        assert!(report.reservations.expired.is_empty());
+
+        let bead = db
+            .get_bead_record(&BeadId::new("grove-recover"))?
+            .expect("runtime bead should exist");
+        assert_eq!(bead.grove_status, GroveBeadStatus::Failed);
+        assert_eq!(bead.last_failure_class, Some(FailureClass::Interrupted));
+        assert!(db.list_active_reservations_at(&now)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn acquire_startup_coordinator_returns_leader_and_recovery_report() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+        insert_bead_cache_row(&db, "grove-startup", "Startup bead")?;
+        insert_run_row(&db, "run-startup", "grove-startup", "Active")?;
+
+        let config = LeaderLeaseConfig {
+            owner_label: "coordinator-1".to_owned(),
+            lease_ttl: chrono::Duration::seconds(45),
+        };
+        let now: Timestamp = "2026-03-16T12:00:00Z".parse()?;
+        let state = acquire_startup_coordinator(
+            &mut db,
+            &config,
+            Some(&RunId::new("run-startup")),
+            now,
+        )?;
+
+        assert_eq!(state.leader.owner_label, "coordinator-1");
+        assert_eq!(state.leader.run_id.as_ref().map(RunId::as_str), Some("run-startup"));
+        assert_eq!(state.recovery.interrupted_runs.len(), 1);
+        assert_eq!(state.recovery.interrupted_runs[0].run.id.as_str(), "run-startup");
+        assert!(state.recovery.reservations.recovered.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn write_fake_claude_script(path: &std::path::Path) -> TestResult {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = r#"#!/bin/sh
+printf '%b' "$STDOUT_SCRIPT"
+printf '%b' "$STDERR_SCRIPT" >&2
+exit "${EXIT_CODE:-0}"
+"#;
+        fs::write(path, script)?;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn insert_bead_cache_row(db: &Database, bead_id: &str, title: &str) -> TestResult {
+        db.connection().execute(
+            "INSERT INTO bead_cache(\
+                bead_id, title, description, priority, issue_type, status, assignee,\
+                labels_json, parent_ids_json, dependency_ids_json, dependent_ids_json, raw_json, synced_at\
+             ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, '[]', '[]', '[]', '[]', '{}', ?6)",
+            rusqlite::params![bead_id, title, 0, "task", "open", "2026-03-16T10:00:00Z"],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn sample_session_request(
+        workspace_dir: camino::Utf8PathBuf,
+    ) -> grove_session::SingleTaskSessionRequest {
+        grove_session::SingleTaskSessionRequest {
+            bead_id: BeadId::new("grove-life"),
+            run_id: RunId::new("run-life"),
+            session_id: grove_types::SessionId::new("ses-life"),
+            prompt_id: grove_types::PromptId::new("prompt-life"),
+            task_title: "Persist runtime lifecycle".to_owned(),
+            task_description: "Wire session lifecycle into the runtime DB.".to_owned(),
+            contract: grove_types::ExecutionContract::SingleTask,
+            model: "sonnet".to_owned(),
+            working_dir: workspace_dir,
+            transcript_path: camino::Utf8PathBuf::from(
+                ".grove/transcripts/grove-life/ses-life.jsonl",
+            ),
+            prompt_manifest_path: camino::Utf8PathBuf::from(".grove/prompts/prompt-life.json"),
+            timeout: std::time::Duration::from_secs(60),
+            exit_policy: grove_session::ExitPolicy::default(),
+            context_monitor: grove_session::ContextMonitor::new(0.7, 0.82, 0.9, 16_000),
+            reservation_hints: vec!["crates/grove-kernel/src/lib.rs".to_owned()],
+            parent_handoffs: vec!["Kernel should own runtime persistence glue.".to_owned()],
+            checkpoint: None,
+            previous_failure_class: None,
+            previous_outcome: None,
+            rescue_card: None,
+            retry_delta_summary: None,
+            token_budget: Some(2_000),
+            ordinal_in_run: 1,
+            env: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_runner_records_successful_run_and_session() -> TestResult {
+        use std::{fs, io};
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let workspace_dir = dir.path().join("workspace");
+        fs::create_dir_all(&workspace_dir)?;
+        let workspace_dir = camino::Utf8PathBuf::from_path_buf(workspace_dir)
+            .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| io::Error::other("db path must be valid UTF-8"))?;
+
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+        insert_bead_cache_row(&db, "grove-life", "Lifecycle bead")?;
+
+        let script_path = dir.path().join("fake-claude");
+        write_fake_claude_script(&script_path)?;
+        let backend =
+            grove_session::CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+        let mut request = sample_session_request(workspace_dir);
+        request.env = vec![
+            (
+                "STDOUT_SCRIPT".to_owned(),
+                concat!(
+                    "working through the task\n",
+                    "GROVE_RESULT: runtime persistence wired\n",
+                    "GROVE_ARTIFACTS: [\"crates/grove-kernel/src/lib.rs\"]\n",
+                    "GROVE_EXIT: true\n",
+                    "all tasks complete\n",
+                    "implementation complete\n"
+                )
+                .to_owned(),
+            ),
+            ("STDERR_SCRIPT".to_owned(), String::new()),
+            ("EXIT_CODE".to_owned(), "0".to_owned()),
+        ];
+
+        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1)?;
+
+        assert_eq!(persisted.run.status, RunStatus::Succeeded);
+        assert_eq!(persisted.session.session.status, SessionStatus::Completed);
+        assert!(persisted.checkpoint.is_none());
+        assert_eq!(
+            persisted.handoff.as_ref().map(|handoff| handoff.summary.as_str()),
+            Some("runtime persistence wired")
+        );
+        assert_eq!(
+            persisted
+                .handoff
+                .as_ref()
+                .map(|handoff| handoff.artifacts.clone()),
+            Some(vec!["crates/grove-kernel/src/lib.rs".to_owned()])
+        );
+        assert_eq!(
+            db.latest_session_for_run(&RunId::new("run-life"))?
+                .expect("session should persist")
+                .status,
+            SessionStatus::Completed
+        );
+        assert_eq!(
+            db.handoff_for_bead(&BeadId::new("grove-life"))?
+                .expect("handoff should persist")
+                .summary,
+            "runtime persistence wired"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_runner_records_checkpoint_and_checkpointed_run() -> TestResult {
+        use std::{fs, io};
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let workspace_dir = dir.path().join("workspace");
+        fs::create_dir_all(&workspace_dir)?;
+        let workspace_dir = camino::Utf8PathBuf::from_path_buf(workspace_dir)
+            .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| io::Error::other("db path must be valid UTF-8"))?;
+
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+        insert_bead_cache_row(&db, "grove-life", "Lifecycle bead")?;
+
+        let script_path = dir.path().join("fake-claude");
+        write_fake_claude_script(&script_path)?;
+        let backend =
+            grove_session::CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+        let mut request = sample_session_request(workspace_dir.clone());
+        request.env = vec![
+            (
+                "STDOUT_SCRIPT".to_owned(),
+                concat!(
+                    "GROVE_RESULT: checkpoint before rotation\n",
+                    "GROVE_EXIT: true\n",
+                    "all tasks complete\n",
+                    "implementation complete\n",
+                    "GROVE_CHECKPOINT: {\"progress\":\"halfway\",\"next_step\":\"finish wiring\",\"context\":{},\"open_questions\":[],\"claimed_paths\":[\"crates/grove-kernel/src/lib.rs\"]}\n"
+                )
+                .to_owned(),
+            ),
+            ("STDERR_SCRIPT".to_owned(), String::new()),
+            ("EXIT_CODE".to_owned(), "0".to_owned()),
+        ];
+
+        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1)?;
+
+        assert_eq!(persisted.run.status, RunStatus::Checkpointed);
+        assert_eq!(
+            persisted.session.session.status,
+            SessionStatus::Checkpointed
+        );
+        assert_eq!(
+            persisted.checkpoint.as_ref().map(|c| c.next_step.as_str()),
+            Some("finish wiring")
+        );
+        assert_eq!(
+            db.latest_checkpoint_for_bead(&BeadId::new("grove-life"))?
+                .expect("checkpoint should persist")
+                .next_step,
+            "finish wiring"
+        );
+        let checkpoint_path = workspace_dir
+            .as_std_path()
+            .join(".grove/checkpoints/grove-life/chk-run-life-1.json");
+        assert!(
+            checkpoint_path.exists(),
+            "checkpoint file should be written"
+        );
+        let checkpoint_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&checkpoint_path)?)?;
+        assert_eq!(checkpoint_json["id"], "chk-run-life-1");
+        assert_eq!(checkpoint_json["bead_id"], "grove-life");
+        assert_eq!(checkpoint_json["run_id"], "run-life");
+        assert_eq!(checkpoint_json["session_id"], "ses-life");
+        assert_eq!(checkpoint_json["next_step"], "finish wiring");
+        assert_eq!(checkpoint_json["resume_generation"], 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_file_write_failure_preserves_checkpointed_runtime_state() -> TestResult {
+        use std::{fs, io};
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let workspace_dir = dir.path().join("workspace");
+        fs::create_dir_all(&workspace_dir)?;
+        let checkpoints_parent = workspace_dir.join(".grove/checkpoints");
+        fs::create_dir_all(&checkpoints_parent)?;
+        fs::write(checkpoints_parent.join("grove-life"), b"occupied")?;
+        let workspace_dir = camino::Utf8PathBuf::from_path_buf(workspace_dir)
+            .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| io::Error::other("db path must be valid UTF-8"))?;
+
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+        insert_bead_cache_row(&db, "grove-life", "Lifecycle bead")?;
+
+        let script_path = dir.path().join("fake-claude");
+        write_fake_claude_script(&script_path)?;
+        let backend =
+            grove_session::CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+        let mut request = sample_session_request(workspace_dir.clone());
+        request.env = vec![
+            (
+                "STDOUT_SCRIPT".to_owned(),
+                concat!(
+                    "GROVE_RESULT: checkpoint before rotation\n",
+                    "GROVE_EXIT: true\n",
+                    "all tasks complete\n",
+                    "implementation complete\n",
+                    "GROVE_CHECKPOINT: {\"progress\":\"halfway\",\"next_step\":\"finish wiring\",\"context\":{},\"open_questions\":[],\"claimed_paths\":[\"crates/grove-kernel/src/lib.rs\"]}\n"
+                )
+                .to_owned(),
+            ),
+            ("STDERR_SCRIPT".to_owned(), String::new()),
+            ("EXIT_CODE".to_owned(), "0".to_owned()),
+        ];
+
+        let error = execute_persisted_single_task_session(&mut db, &backend, request, 1)
+            .expect_err("checkpoint file write should fail");
+        assert!(error
+            .to_string()
+            .contains("failed to persist checkpoint file"));
+
+        let bead = db
+            .get_bead_record(&BeadId::new("grove-life"))?
+            .expect("bead runtime should persist");
+        assert_eq!(bead.grove_status, GroveBeadStatus::Checkpointed);
+
+        let run = db
+            .list_task_runs_for_bead(&BeadId::new("grove-life"))?
+            .into_iter()
+            .next()
+            .expect("run should persist");
+        assert_eq!(run.status, RunStatus::Checkpointed);
+
+        let checkpoint = db
+            .latest_checkpoint_for_bead(&BeadId::new("grove-life"))?
+            .expect("checkpoint row should persist");
+        assert_eq!(checkpoint.next_step, "finish wiring");
+
+        let run = db
+            .list_task_runs_for_bead(&BeadId::new("grove-life"))?
+            .into_iter()
+            .next()
+            .expect("run should persist");
+        assert!(run
+            .failure_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("failed to persist checkpoint file")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_runner_records_rate_limit_as_waiting_to_retry() -> TestResult {
+        use std::{fs, io};
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let workspace_dir = dir.path().join("workspace");
+        fs::create_dir_all(&workspace_dir)?;
+        let workspace_dir = camino::Utf8PathBuf::from_path_buf(workspace_dir)
+            .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| io::Error::other("db path must be valid UTF-8"))?;
+
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+        insert_bead_cache_row(&db, "grove-life", "Lifecycle bead")?;
+
+        let script_path = dir.path().join("fake-claude");
+        write_fake_claude_script(&script_path)?;
+        let backend =
+            grove_session::CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+        let mut request = sample_session_request(workspace_dir);
+        request.env = vec![
+            (
+                "STDOUT_SCRIPT".to_owned(),
+                "rate limit exceeded by upstream\n".to_owned(),
+            ),
+            (
+                "STDERR_SCRIPT".to_owned(),
+                "ratelimit retry window still active\n".to_owned(),
+            ),
+            ("EXIT_CODE".to_owned(), "1".to_owned()),
+        ];
+
+        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1)?;
+
+        assert_eq!(persisted.run.status, RunStatus::WaitingToRetry);
+        assert_eq!(persisted.run.failure_class, Some(FailureClass::RateLimit));
+        assert_eq!(persisted.session.session.status, SessionStatus::RateLimited);
+        assert!(persisted.handoff.is_none());
+        assert_eq!(
+            db.get_bead_record(&BeadId::new("grove-life"))?
+                .expect("bead runtime should persist")
+                .retry_after,
+            persisted.run.ended_at
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parent_handoff_summaries_include_latest_parent_context() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        insert_bead_cache_row(&db, "grove-parent", "Parent bead")?;
+        insert_bead_cache_row(&db, "grove-child", "Child bead")?;
+
+        db.connection().execute(
+            "INSERT INTO task_runs(\
+                id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id\
+             ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, NULL)",
+            rusqlite::params![
+                "run-parent",
+                "grove-parent",
+                1,
+                "Succeeded",
+                "2026-03-16T11:00:00Z",
+                "2026-03-16T11:10:00Z",
+                1,
+                0,
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO bead_dependencies(parent_id, child_id, relation_type, synced_at) VALUES (?1, ?2, 'blocks', ?3)",
+            rusqlite::params!["grove-parent", "grove-child", "2026-03-16T11:11:00Z"],
+        )?;
+
+        db.write_handoff(HandoffWriteInput {
+            bead_id: BeadId::new("grove-parent"),
+            run_id: RunId::new("run-parent"),
+            summary: "parent finished the schema layer".to_owned(),
+            artifacts: vec!["crates/grove-db/src/lib.rs".to_owned()],
+            lessons: vec!["Validate schema writes before unblock".to_owned()],
+            decisions: vec!["Keep br as the dependency authority".to_owned()],
+            warnings: vec!["Mirror flow still pending".to_owned()],
+            completed_at: "2026-03-16T11:12:00Z".parse()?,
+        })?;
+
+        let summaries = parent_handoff_summaries(&db, &BeadId::new("grove-child"))?;
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].contains("Parent grove-parent (run run-parent) prepared this task: parent finished the schema layer"));
+        assert!(summaries[0].contains("Artifacts: crates/grove-db/src/lib.rs"));
+        assert!(summaries[0].contains("Decisions: Keep br as the dependency authority"));
+        assert!(summaries[0].contains("Lessons: Validate schema writes before unblock"));
+        assert!(summaries[0].contains("Warnings: Mirror flow still pending"));
+        Ok(())
     }
 }

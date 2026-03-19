@@ -10,12 +10,13 @@ use grove_br::BrClient;
 use grove_bv::BvTriageOutput;
 use grove_config::GroveConfig;
 use grove_db::Database;
-use std::fs;
 use grove_types::{
     BeadId, CheckpointRecord, ClaudeSessionRecord, EventLogRecord, GroveBeadRecord,
-    GroveBeadStatus, HandoffRecord, PlaybookBulletRecord, PromptManifest, RelevantSnippet,
-    RetrievalBundle, RunId, SessionOutcome, TaskRunRecord, Timestamp,
+    GroveBeadStatus, HandoffRecord, PlaybookBulletRecord, PromptManifest, RecoveryCapsule,
+    RecoveryCapsuleOutcome, RelevantSnippet, RetrievalBundle, RunId, SessionOutcome,
+    TaskRunRecord, Timestamp,
 };
+use std::fs;
 
 pub const QUERY_PURPOSE: &str =
     "Operator-facing inspect query models for grove inspect bead diagnostics.";
@@ -24,6 +25,7 @@ pub fn load_inspect_snapshot<C: BrClient>(
     db: &Database,
     br: &C,
     bead_id: &BeadId,
+    workspace_root: &str,
     config: &GroveConfig,
     triage: Option<&BvTriageOutput>,
 ) -> Result<Option<InspectSnapshot>> {
@@ -86,20 +88,36 @@ pub fn load_inspect_snapshot<C: BrClient>(
         bv_score: bv_context.as_ref().map(|context| context.score),
     });
     let runs = db.list_task_runs_for_bead(bead_id)?;
-    let latest_session = match runs.first() {
+    let latest_run = runs.first();
+    let latest_session = match latest_run {
         Some(run) => db.latest_session_for_run(&run.id)?.map(|session| {
             let prompt_manifest = session
                 .prompt_manifest_path
                 .as_deref()
-                .and_then(load_prompt_manifest);
+                .and_then(|path| load_prompt_manifest(workspace_root, path));
             SessionSummaryView::from_parts(session, None, prompt_manifest)
         }),
         None => None,
     };
-    let latest_checkpoint = db
-        .latest_checkpoint_for_bead(bead_id)?
-        .map(CheckpointSummaryView::from);
+    let latest_checkpoint = match (latest_run, db.latest_checkpoint_for_bead(bead_id)?) {
+        (Some(run), Some(checkpoint))
+            if run
+                .last_checkpoint_id
+                .as_ref()
+                .is_some_and(|checkpoint_id| checkpoint_id == &checkpoint.id) =>
+        {
+            Some(CheckpointSummaryView::from(checkpoint))
+        }
+        _ => None,
+    };
     let latest_handoff = db.handoff_for_bead(bead_id)?;
+    let latest_recovery_capsule = recovery_capsule_for_inspect(
+        &bead,
+        latest_run,
+        latest_checkpoint.as_ref(),
+        latest_session.as_ref().and_then(|session| session.prompt_provenance.as_ref()),
+        latest_handoff.as_ref(),
+    );
     let mirror_actions = db
         .list_event_logs_for_bead(bead_id)?
         .into_iter()
@@ -123,6 +141,7 @@ pub fn load_inspect_snapshot<C: BrClient>(
         runs,
         latest_session,
         latest_checkpoint,
+        latest_recovery_capsule,
         latest_handoff,
         mirror_actions,
         retrieval_bundle: None,
@@ -131,8 +150,13 @@ pub fn load_inspect_snapshot<C: BrClient>(
     }))
 }
 
-fn load_prompt_manifest(path: &str) -> Option<PromptManifest> {
-    let contents = fs::read_to_string(path).ok()?;
+fn load_prompt_manifest(workspace_root: &str, path: &str) -> Option<PromptManifest> {
+    let manifest_path = if std::path::Path::new(path).is_absolute() {
+        std::path::PathBuf::from(path)
+    } else {
+        std::path::Path::new(workspace_root).join(path)
+    };
+    let contents = fs::read_to_string(manifest_path).ok()?;
     serde_json::from_str(&contents).ok()
 }
 
@@ -162,12 +186,16 @@ fn inspect_score_breakdown(
         breakdown.push(ScoreComponentView {
             label: "critical_path".to_owned(),
             value: f64::from(config.scheduler.critical_path_bonus),
-            note: Some(format!("{} downstream bead(s)", dependency_snapshot.blocks.len())),
+            note: Some(format!(
+                "{} downstream bead(s)",
+                dependency_snapshot.blocks.len()
+            )),
         });
     }
 
     if let Some(minutes) = ready_minutes.filter(|minutes| *minutes > 0) {
-        let bonus = minutes.min(i64::from(i32::MAX)) as i32 * config.scheduler.ready_age_bonus_per_min;
+        let bonus =
+            minutes.min(i64::from(i32::MAX)) as i32 * config.scheduler.ready_age_bonus_per_min;
         breakdown.push(ScoreComponentView {
             label: "ready_age".to_owned(),
             value: f64::from(bonus),
@@ -228,7 +256,11 @@ fn inspect_dispatch_why(
 ) -> Vec<String> {
     let mut why = vec![format!("{:?} priority", bead.bead.priority)];
     if let Some(context) = bv_context {
-        why.push(format!("bv triage {:.2}: {}", context.score, context.summary()));
+        why.push(format!(
+            "bv triage {:.2}: {}",
+            context.score,
+            context.summary()
+        ));
     }
     if ready_in_br {
         why.push("ready in br".to_owned());
@@ -273,6 +305,7 @@ pub struct InspectSnapshot {
     pub runs: Vec<TaskRunRecord>,
     pub latest_session: Option<SessionSummaryView>,
     pub latest_checkpoint: Option<CheckpointSummaryView>,
+    pub latest_recovery_capsule: Option<RecoveryCapsuleView>,
     pub latest_handoff: Option<HandoffRecord>,
     pub mirror_actions: Vec<MirrorActionView>,
     pub retrieval_bundle: Option<RetrievalBundle>,
@@ -302,6 +335,7 @@ impl InspectSnapshot {
             run_history,
             latest_session: self.latest_session,
             latest_checkpoint: self.latest_checkpoint,
+            latest_recovery_capsule: self.latest_recovery_capsule,
             latest_handoff,
             mirror_actions: self.mirror_actions,
             retrieval_summary,
@@ -321,6 +355,7 @@ pub struct BeadInspectView {
     pub run_history: Vec<RunSummaryView>,
     pub latest_session: Option<SessionSummaryView>,
     pub latest_checkpoint: Option<CheckpointSummaryView>,
+    pub latest_recovery_capsule: Option<RecoveryCapsuleView>,
     pub latest_handoff: Option<HandoffSummaryView>,
     pub mirror_actions: Vec<MirrorActionView>,
     pub retrieval_summary: Option<RetrievalSummaryView>,
@@ -359,6 +394,7 @@ pub struct RunSummaryView {
     pub ended_at: Option<Timestamp>,
     pub session_count: i32,
     pub checkpoint_count: i32,
+    pub last_checkpoint_id: Option<String>,
 }
 
 impl From<TaskRunRecord> for RunSummaryView {
@@ -373,6 +409,7 @@ impl From<TaskRunRecord> for RunSummaryView {
             ended_at: run.ended_at,
             session_count: run.session_count,
             checkpoint_count: run.checkpoint_count,
+            last_checkpoint_id: run.last_checkpoint_id.map(|id| id.to_string()),
         }
     }
 }
@@ -381,6 +418,7 @@ impl From<TaskRunRecord> for RunSummaryView {
 pub struct SessionSummaryView {
     pub session_id: grove_types::SessionId,
     pub run_id: RunId,
+    pub ordinal_in_run: i32,
     pub status: String,
     pub started_at: Timestamp,
     pub ended_at: Option<Timestamp>,
@@ -390,6 +428,9 @@ pub struct SessionSummaryView {
     pub transcript_path: String,
     pub prompt_id: Option<String>,
     pub prompt_manifest_path: Option<String>,
+    pub prompt_bytes: i32,
+    pub estimated_input_tokens: i32,
+    pub estimated_output_tokens: i32,
     pub prompt_provenance: Option<PromptProvenanceView>,
     pub result_summary: Option<String>,
     pub completion_indicators: Option<u32>,
@@ -406,6 +447,7 @@ impl SessionSummaryView {
         Self {
             session_id: session.id,
             run_id: session.run_id,
+            ordinal_in_run: session.ordinal_in_run,
             status: format!("{:?}", session.status),
             started_at: session.started_at,
             ended_at: session.ended_at,
@@ -415,6 +457,9 @@ impl SessionSummaryView {
             transcript_path: session.transcript_path,
             prompt_id: session.prompt_id.as_ref().map(ToString::to_string),
             prompt_manifest_path: session.prompt_manifest_path,
+            prompt_bytes: session.prompt_bytes,
+            estimated_input_tokens: session.estimated_input_tokens,
+            estimated_output_tokens: session.estimated_output_tokens,
             prompt_provenance: prompt_manifest.map(PromptProvenanceView::from),
             result_summary: outcome.and_then(|outcome| {
                 outcome
@@ -448,6 +493,44 @@ pub struct PromptProvenanceView {
     pub trimmed: bool,
     pub retry_delta_summary: Option<String>,
     pub sections: Vec<PromptSectionView>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveryCapsuleView {
+    pub outcome: String,
+    pub summary: String,
+    pub strongest_evidence: Vec<String>,
+    pub likely_root_causes: Vec<String>,
+    pub risky_paths: Vec<String>,
+    pub do_not_repeat: Vec<String>,
+    pub next_attempt_contract: Option<String>,
+    pub retry_delta_summary: Option<String>,
+    pub checkpoint_progress: Option<String>,
+    pub checkpoint_next_step: Option<String>,
+    pub artifacts: Vec<String>,
+}
+
+impl From<RecoveryCapsule> for RecoveryCapsuleView {
+    fn from(capsule: RecoveryCapsule) -> Self {
+        Self {
+            outcome: match capsule.outcome {
+                RecoveryCapsuleOutcome::Failed => "failed",
+                RecoveryCapsuleOutcome::Interrupted => "interrupted",
+                RecoveryCapsuleOutcome::Checkpointed => "checkpointed",
+            }
+            .to_owned(),
+            summary: capsule.summary,
+            strongest_evidence: capsule.strongest_evidence,
+            likely_root_causes: capsule.likely_root_causes,
+            risky_paths: capsule.risky_paths,
+            do_not_repeat: capsule.do_not_repeat,
+            next_attempt_contract: capsule.next_attempt_contract,
+            retry_delta_summary: capsule.retry_delta_summary,
+            checkpoint_progress: capsule.checkpoint_progress,
+            checkpoint_next_step: capsule.checkpoint_next_step,
+            artifacts: capsule.artifacts,
+        }
+    }
 }
 
 impl From<PromptManifest> for PromptProvenanceView {
@@ -519,10 +602,16 @@ pub struct CheckpointSummaryView {
     pub next_step: String,
     pub saved_at: Timestamp,
     pub resume_generation: u32,
+    pub open_questions: Vec<String>,
+    pub claimed_paths: Vec<String>,
+    pub confidence: Option<f32>,
 }
 
 impl From<CheckpointRecord> for CheckpointSummaryView {
     fn from(checkpoint: CheckpointRecord) -> Self {
+        let payload =
+            serde_json::from_value::<grove_types::CheckpointPayload>(checkpoint.payload.clone())
+                .ok();
         Self {
             checkpoint_id: checkpoint.id.to_string(),
             run_id: checkpoint.run_id,
@@ -531,8 +620,49 @@ impl From<CheckpointRecord> for CheckpointSummaryView {
             next_step: checkpoint.next_step,
             saved_at: checkpoint.saved_at,
             resume_generation: checkpoint.resume_generation,
+            open_questions: payload
+                .as_ref()
+                .map(|payload| payload.open_questions.clone())
+                .unwrap_or_default(),
+            claimed_paths: payload
+                .as_ref()
+                .map(|payload| payload.claimed_paths.clone())
+                .unwrap_or_default(),
+            confidence: payload.and_then(|payload| payload.confidence),
         }
     }
+}
+
+fn recovery_capsule_for_inspect(
+    bead: &GroveBeadRecord,
+    latest_run: Option<&TaskRunRecord>,
+    latest_checkpoint: Option<&CheckpointSummaryView>,
+    prompt_provenance: Option<&PromptProvenanceView>,
+    latest_handoff: Option<&HandoffRecord>,
+) -> Option<RecoveryCapsuleView> {
+    let run = latest_run?;
+    let outcome = match bead.grove_status {
+        GroveBeadStatus::Checkpointed => RecoveryCapsuleOutcome::Checkpointed,
+        GroveBeadStatus::Failed | GroveBeadStatus::WaitingToRetry
+            if run.failure_class == Some(grove_types::FailureClass::Interrupted) =>
+        {
+            RecoveryCapsuleOutcome::Interrupted
+        }
+        GroveBeadStatus::Failed | GroveBeadStatus::WaitingToRetry => RecoveryCapsuleOutcome::Failed,
+        _ => return None,
+    };
+
+    RecoveryCapsule::from_parts(
+        outcome,
+        run.failure_class,
+        run.failure_detail.as_deref(),
+        latest_checkpoint.map(|checkpoint| checkpoint.progress.as_str()),
+        latest_checkpoint.map(|checkpoint| checkpoint.next_step.as_str()),
+        prompt_provenance.map(|prompt| prompt.contract.as_str()),
+        prompt_provenance.and_then(|prompt| prompt.retry_delta_summary.as_deref()),
+        latest_handoff.map(|handoff| handoff.artifacts.as_slice()).unwrap_or(&[]),
+    )
+    .map(RecoveryCapsuleView::from)
 }
 
 #[derive(Debug, Clone)]
@@ -751,6 +881,10 @@ mod tests {
         assert_eq!(view.explicit_exit, Some(true));
         assert_eq!(view.completion_indicators, Some(3));
         assert_eq!(view.prompt_id.as_deref(), Some("prompt-1"));
+        assert_eq!(view.ordinal_in_run, 1);
+        assert_eq!(view.prompt_bytes, 12);
+        assert_eq!(view.estimated_input_tokens, 34);
+        assert_eq!(view.estimated_output_tokens, 56);
         assert_eq!(
             view.prompt_manifest_path.as_deref(),
             Some(".grove/prompts/prompt-1.json")
@@ -862,6 +996,7 @@ mod tests {
                 detail: None,
                 created_at: parse_ts("2026-03-16T11:01:00Z")?,
             }],
+            latest_recovery_capsule: None,
             retrieval_bundle: Some(RetrievalBundle {
                 snippets: vec![RelevantSnippet {
                     conversation_id: 1,
@@ -1064,7 +1199,7 @@ mod tests {
                 "ses-child",
                 "halfway there",
                 "resume inspect loader",
-                "{\"claimed_paths\":[\"crates/grove-kernel/src/inspect_view.rs\"]}",
+                "{\"progress\":\"halfway there\",\"next_step\":\"resume inspect loader\",\"context\":{},\"open_questions\":[],\"claimed_paths\":[\"crates/grove-kernel/src/inspect_view.rs\"],\"confidence\":null}",
                 "2026-03-16T11:09:00Z",
                 2,
             ],
@@ -1131,6 +1266,9 @@ mod tests {
             &db,
             &br,
             &BeadId::new("grove-child"),
+            dir.path()
+                .to_str()
+                .ok_or_else(|| IoError::other("temp path was not valid UTF-8"))?,
             &GroveConfig::default(),
             None,
         )?
@@ -1148,10 +1286,27 @@ mod tests {
         assert_eq!(snapshot.runs.len(), 1);
         assert_eq!(
             snapshot
+                .runs
+                .first()
+                .and_then(|run| run.last_checkpoint_id.as_ref())
+                .map(|id| id.as_str()),
+            Some("chk-child")
+        );
+        assert_eq!(
+            snapshot
                 .latest_session
                 .as_ref()
                 .map(|session| session.session_id.as_str()),
             Some("ses-child")
+        );
+        assert_eq!(
+            snapshot.latest_session.as_ref().map(|session| (
+                session.ordinal_in_run,
+                session.prompt_bytes,
+                session.estimated_input_tokens,
+                session.estimated_output_tokens
+            )),
+            Some((1, 150, 40, 60))
         );
         assert_eq!(
             snapshot
@@ -1159,6 +1314,13 @@ mod tests {
                 .as_ref()
                 .map(|checkpoint| checkpoint.checkpoint_id.as_str()),
             Some("chk-child")
+        );
+        assert_eq!(
+            snapshot
+                .latest_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.claimed_paths.clone()),
+            Some(vec!["crates/grove-kernel/src/inspect_view.rs".to_owned()])
         );
         assert_eq!(
             snapshot
@@ -1181,6 +1343,305 @@ mod tests {
         assert!(snapshot.mirror_pending.is_some());
         assert!(snapshot.retrieval_bundle.is_none());
         assert!(snapshot.selected_playbook_bullets.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn load_inspect_snapshot_resolves_relative_prompt_manifest_from_workspace_root() -> TestResult {
+        let dir = tempdir()?;
+        let workspace_root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|_| IoError::other("temp path was not valid UTF-8"))?;
+        fs::create_dir_all(workspace_root.join(".grove/prompts"))?;
+        fs::write(
+            workspace_root.join(".grove/prompts/prompt-child.json"),
+            serde_json::to_string(&PromptManifest {
+                prompt_id: grove_types::PromptId::new("prompt-child"),
+                bead_id: BeadId::new("grove-child"),
+                run_id: RunId::new("run-child"),
+                session_id: Some(grove_types::SessionId::new("ses-child")),
+                contract: grove_types::ExecutionContract::Implement,
+                created_at: parse_ts("2026-03-16T11:00:00Z")?,
+                token_budget: Some(200),
+                estimated_tokens: 120,
+                prompt_bytes: 512,
+                trimmed: false,
+                retry_delta_summary: None,
+                retrieval_query: None,
+                retrieval_ranking_summary: Vec::new(),
+                sections: vec![grove_types::PromptManifestSection {
+                    ordinal: 1,
+                    kind: grove_types::PromptSegmentKind::Task,
+                    heading: "Task".to_owned(),
+                    included: true,
+                    estimated_tokens: 20,
+                    char_count: 80,
+                    trim_reason: None,
+                    provenance: grove_types::PromptSectionProvenance::default(),
+                    preview: "[TASK] fix inspect".to_owned(),
+                }],
+            })?,
+        )?;
+        let db_path = workspace_root.join("grove.db");
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        db.connection().execute(
+            "INSERT INTO bead_cache(\
+                bead_id, title, description, priority, issue_type, status, assignee,\
+                labels_json, parent_ids_json, dependency_ids_json, dependent_ids_json, raw_json, synced_at\
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, '[]', '[]', '[]', ?8, ?9)",
+            rusqlite::params![
+                "grove-child",
+                "Child bead",
+                "Investigate child",
+                1,
+                "task",
+                "open",
+                "[\"phase:1\"]",
+                "{}",
+                "2026-03-16T10:00:00Z",
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO task_runs(\
+                id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id\
+            ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, NULL, ?6, ?7, ?8)",
+            rusqlite::params![
+                "run-child",
+                "grove-child",
+                1,
+                "Active",
+                "2026-03-16T11:00:00Z",
+                1,
+                0,
+                Option::<String>::None,
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO bead_runtime(\
+                bead_id, grove_status, declared_paths_json, metadata_json, last_run_id, retry_after,\
+                last_failure_class, last_failure_detail, runtime_updated_at\
+            ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, ?6)",
+            rusqlite::params![
+                "grove-child",
+                "Running",
+                "[\"crates/grove-kernel/src/inspect_view.rs\"]",
+                "{}",
+                "run-child",
+                "2026-03-16T11:10:00Z",
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO claude_sessions(\
+                id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, prompt_id, prompt_manifest_path, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path\
+            ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                "ses-child",
+                "run-child",
+                1,
+                "Running",
+                "2026-03-16T11:00:00Z",
+                Option::<String>::None,
+                "prompt-child",
+                ".grove/prompts/prompt-child.json",
+                150,
+                40,
+                60,
+                Option::<i32>::None,
+                Option::<String>::None,
+                ".grove/transcripts/grove-child/ses-child.jsonl",
+            ],
+        )?;
+
+        let br = FakeBrClient::new(vec![bead_summary(
+            "grove-child",
+            "Child bead",
+            BeadPriority::P1,
+            "open",
+            vec![],
+            vec![],
+        )]);
+
+        let snapshot = load_inspect_snapshot(
+            &db,
+            &br,
+            &BeadId::new("grove-child"),
+            workspace_root.as_str(),
+            &GroveConfig::default(),
+            None,
+        )?
+        .ok_or_else(|| IoError::other("expected inspect snapshot"))?;
+
+        assert_eq!(
+            snapshot
+                .latest_session
+                .as_ref()
+                .and_then(|session| session.prompt_provenance.as_ref())
+                .map(|prompt| prompt.contract.as_str()),
+            Some("implement")
+        );
+        assert_eq!(
+            snapshot
+                .latest_session
+                .as_ref()
+                .and_then(|session| session.prompt_provenance.as_ref())
+                .map(|prompt| prompt.sections[0].preview.as_str()),
+            Some("[TASK] fix inspect")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_inspect_snapshot_hides_stale_checkpoint_from_older_run() -> TestResult {
+        let dir = tempdir()?;
+        let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| IoError::other("temp path was not valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        db.connection().execute(
+            "INSERT INTO bead_cache(\
+                bead_id, title, description, priority, issue_type, status, assignee,\
+                labels_json, parent_ids_json, dependency_ids_json, dependent_ids_json, raw_json, synced_at\
+            ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, '[]', '[]', '[]', '[]', '{}', ?6)",
+            rusqlite::params![
+                "grove-child",
+                "Child bead",
+                1,
+                "task",
+                "open",
+                "2026-03-16T09:00:00Z",
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO task_runs(\
+                id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id\
+            ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                "run-old",
+                "grove-child",
+                1,
+                "Checkpointed",
+                "2026-03-16T11:00:00Z",
+                "2026-03-16T11:10:00Z",
+                1,
+                1,
+                "chk-old",
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO task_runs(\
+                id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id\
+            ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                "run-new",
+                "grove-child",
+                2,
+                "Succeeded",
+                "2026-03-16T12:00:00Z",
+                "2026-03-16T12:10:00Z",
+                1,
+                0,
+                Option::<String>::None,
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO bead_runtime(\
+                bead_id, grove_status, declared_paths_json, metadata_json, last_run_id, retry_after,\
+                last_failure_class, last_failure_detail, runtime_updated_at\
+            ) VALUES (?1, ?2, '[]', '{}', ?3, NULL, NULL, NULL, ?4)",
+            rusqlite::params![
+                "grove-child",
+                "Succeeded",
+                "run-new",
+                "2026-03-16T12:10:00Z",
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO claude_sessions(\
+                id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, prompt_id, prompt_manifest_path, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path\
+            ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                "ses-new",
+                "run-new",
+                1,
+                "Completed",
+                "2026-03-16T12:00:00Z",
+                "2026-03-16T12:10:00Z",
+                120,
+                30,
+                45,
+                0,
+                "Exit",
+                ".grove/transcripts/grove-child/ses-new.jsonl",
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO claude_sessions(\
+                id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, prompt_id, prompt_manifest_path, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path\
+            ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                "ses-old",
+                "run-old",
+                1,
+                "Checkpointed",
+                "2026-03-16T11:00:00Z",
+                "2026-03-16T11:09:00Z",
+                100,
+                25,
+                35,
+                0,
+                "Checkpoint",
+                ".grove/transcripts/grove-child/ses-old.jsonl",
+            ],
+        )?;
+        db.connection().execute(
+            "INSERT INTO checkpoints(\
+                id, bead_id, run_id, session_id, progress, next_step, payload_json, saved_at, resume_generation\
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                "chk-old",
+                "grove-child",
+                "run-old",
+                "ses-old",
+                "halfway there",
+                "resume older run",
+                "{\"progress\":\"halfway there\",\"next_step\":\"resume older run\",\"context\":{},\"open_questions\":[],\"claimed_paths\":[\"crates/grove-kernel/src/inspect_view.rs\"],\"confidence\":null}",
+                "2026-03-16T11:09:00Z",
+                1,
+            ],
+        )?;
+
+        let br = FakeBrClient::new(vec![bead_summary(
+            "grove-child",
+            "Child bead",
+            BeadPriority::P1,
+            "open",
+            vec![],
+            vec![],
+        )]);
+
+        let snapshot = load_inspect_snapshot(
+            &db,
+            &br,
+            &BeadId::new("grove-child"),
+            dir.path()
+                .to_str()
+                .ok_or_else(|| IoError::other("temp path was not valid UTF-8"))?,
+            &GroveConfig::default(),
+            None,
+        )?
+        .ok_or_else(|| IoError::other("expected inspect snapshot"))?;
+
+        assert_eq!(snapshot.runs.len(), 2);
+        assert_eq!(
+            snapshot
+                .latest_session
+                .as_ref()
+                .map(|session| session.run_id.as_str()),
+            Some("run-new")
+        );
+        assert!(snapshot.latest_checkpoint.is_none());
         Ok(())
     }
 
@@ -1249,6 +1710,9 @@ mod tests {
             &db,
             &br,
             &BeadId::new("grove-blocked"),
+            dir.path()
+                .to_str()
+                .ok_or_else(|| IoError::other("temp path was not valid UTF-8"))?,
             &GroveConfig::default(),
             None,
         )?

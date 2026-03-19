@@ -169,7 +169,14 @@ fn handle_inspect(bead_id: &BeadId) -> Result<()> {
     let bv = CliBvClient::new("bv", loaded.paths.workspace_root().as_str());
     let triage = bv.triage().ok();
     let issue_detail = br.show(bead_id).ok();
-    let view = load_bead_inspect_view(&db, &br, bead_id, &loaded.config, triage.as_ref())
+    let view = load_bead_inspect_view(
+        &db,
+        &br,
+        bead_id,
+        loaded.paths.workspace_root().as_str(),
+        &loaded.config,
+        triage.as_ref(),
+    )
         .with_context(|| format!("load inspect view for {bead_id}"))?;
 
     if issue_detail.is_none() && view.is_none() {
@@ -213,6 +220,13 @@ fn open_runtime() -> Result<(LoadedConfig, Database, CliBrClient)> {
 
 fn current_workspace_root() -> Result<Utf8PathBuf> {
     let cwd = env::current_dir().context("read current working directory")?;
+    for candidate in cwd.ancestors() {
+        if candidate.join("grove.toml").is_file() {
+            return Utf8PathBuf::from_path_buf(candidate.to_path_buf()).map_err(|path| {
+                anyhow::anyhow!("working directory is not valid UTF-8: {}", path.display())
+            });
+        }
+    }
     Utf8PathBuf::from_path_buf(cwd)
         .map_err(|path| anyhow::anyhow!("working directory is not valid UTF-8: {}", path.display()))
 }
@@ -420,6 +434,9 @@ fn print_status_view(
             if let Some(recovery_hint) = bead.recovery_hint.as_deref() {
                 println!("  recovery: {recovery_hint}");
             }
+            if let Some(capsule) = bead.recovery_capsule.as_ref() {
+                println!("  capsule: {}", capsule.compact_summary());
+            }
             if bead.mirror_pending {
                 println!("  mirror pending: yes");
             }
@@ -432,7 +449,7 @@ fn print_status_view(
     } else {
         for conflict in &view.reservation_conflicts {
             println!(
-                "- {} requested {} but conflicts with {} holding {}",
+                "- {} ({}) overlaps {} ({})",
                 conflict.requested_by_bead,
                 conflict.requested_pattern,
                 conflict.conflicting_bead,
@@ -604,14 +621,34 @@ fn print_inspect_report(
                         println!("- why: {}", dispatch.why.join(", "));
                     }
                     if !dispatch.dispatch.local_suppression_reasons.is_empty() {
-                        let suppressions = dispatch
-                            .dispatch
-                            .local_suppression_reasons
-                            .iter()
-                            .map(|reason| reason.summary.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        println!("- suppressions: {suppressions}");
+                        println!("- suppressions:");
+                        for reason in &dispatch.dispatch.local_suppression_reasons {
+                            println!("  - {}", reason.summary);
+                            if let Some(conflict) = reason.conflict.as_ref() {
+                                println!(
+                                    "    overlaps {} ({}) ; conflicting run: {}",
+                                    conflict.conflicting_bead,
+                                    conflict.held_pattern,
+                                    display_option(conflict.conflicting_run_id.as_ref())
+                                );
+                            }
+                        }
+                    }
+                    if !dispatch.reservation_conflicts.is_empty() {
+                        println!("- reservation conflicts:");
+                        for conflict in &dispatch.reservation_conflicts {
+                            println!(
+                                "  - {} ({}) overlaps {} ({})",
+                                conflict.requested_by_bead,
+                                conflict.requested_pattern,
+                                conflict.conflicting_bead,
+                                conflict.held_pattern
+                            );
+                            println!(
+                                "    conflicting run: {}",
+                                display_option(conflict.conflicting_run_id.as_ref())
+                            );
+                        }
                     }
                 }
                 None => println!("- none"),
@@ -718,6 +755,46 @@ fn print_inspect_report(
                     println!("- next step: {}", checkpoint.next_step);
                     println!("- saved at: {}", checkpoint.saved_at);
                     println!("- resume generation: {}", checkpoint.resume_generation);
+                }
+                None => println!("- none"),
+            }
+
+            println!("\nRecovery capsule:");
+            match view.latest_recovery_capsule.as_ref() {
+                Some(capsule) => {
+                    println!("- outcome: {}", capsule.outcome);
+                    println!("- summary: {}", capsule.summary);
+                    println!(
+                        "- next attempt contract: {}",
+                        display_option(capsule.next_attempt_contract.as_deref())
+                    );
+                    println!(
+                        "- retry delta summary: {}",
+                        display_option(capsule.retry_delta_summary.as_deref())
+                    );
+                    println!(
+                        "- checkpoint progress: {}",
+                        display_option(capsule.checkpoint_progress.as_deref())
+                    );
+                    println!(
+                        "- checkpoint next step: {}",
+                        display_option(capsule.checkpoint_next_step.as_deref())
+                    );
+                    if !capsule.strongest_evidence.is_empty() {
+                        println!("- strongest evidence: {}", capsule.strongest_evidence.join(" | "));
+                    }
+                    if !capsule.likely_root_causes.is_empty() {
+                        println!("- likely root causes: {}", capsule.likely_root_causes.join(" | "));
+                    }
+                    if !capsule.risky_paths.is_empty() {
+                        println!("- risky paths: {}", capsule.risky_paths.join(" | "));
+                    }
+                    if !capsule.do_not_repeat.is_empty() {
+                        println!("- do not repeat: {}", capsule.do_not_repeat.join(" | "));
+                    }
+                    if !capsule.artifacts.is_empty() {
+                        println!("- artifacts: {}", capsule.artifacts.join(", "));
+                    }
                 }
                 None => println!("- none"),
             }
