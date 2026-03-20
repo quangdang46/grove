@@ -5,6 +5,7 @@ pub mod archive;
 pub mod lesson_ingest;
 pub mod scoring;
 pub mod diary;
+pub mod reactions;
 
 use anyhow::{Context, Result};
 use grove_br::{BrClient, BrDependencySnapshot};
