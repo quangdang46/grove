@@ -1,0 +1,146 @@
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use rusqlite::{params, OptionalExtension, Row};
+use grove_types::{
+    BeadId, RunId, SessionId, SourceId,
+    archive::{
+        ConversationRecord, MessageRecord, MessageRole, RelevantSnippet, RetrievalBundle,
+        SnippetRecord, SourceRecord,
+    },
+};
+
+use crate::{Database, timestamp_string, parse_json};
+
+impl Database {
+    pub fn insert_source_record(&mut self, record: &SourceRecord) -> Result<()> {
+        self.with_tx(|tx| {
+            tx.execute(
+                "INSERT OR IGNORE INTO archive_sources(id, source_path, origin_host, metadata_json) 
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    record.id.as_str(),
+                    record.source_path.as_str(),
+                    record.origin_host.as_deref(),
+                    serde_json::to_string(&record.metadata_json)?,
+                ],
+            )?;
+            Ok(())
+        })
+        .with_context(|| format!("insert source record {}", record.id.as_str()))
+    }
+
+    pub fn insert_conversation_record(&mut self, record: &ConversationRecord) -> Result<i64> {
+        self.with_tx(|tx| {
+            tx.execute(
+                "INSERT INTO archive_conversations(
+                    bead_id, run_id, session_id, workspace, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json, source_id, origin_host
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    record.bead_id.as_ref().map(|id| id.as_str()),
+                    record.run_id.as_ref().map(|id| id.as_str()),
+                    record.session_id.as_str(),
+                    record.workspace.as_ref().map(|w| w.as_str()),
+                    record.title.as_deref(),
+                    record.source_path.as_str(),
+                    record.started_at.as_ref().map(timestamp_string),
+                    record.ended_at.as_ref().map(timestamp_string),
+                    record.approx_tokens,
+                    serde_json::to_string(&record.metadata_json)?,
+                    record.source_id.as_str(),
+                    record.origin_host.as_deref(),
+                ],
+            )?;
+            let conversation_id = tx.last_insert_rowid();
+
+            for message in &record.messages {
+                tx.execute(
+                    "INSERT INTO archive_messages(
+                        conversation_id, idx, role, author, created_at, content, extra_json
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        conversation_id,
+                        message.idx,
+                        match message.role {
+                            MessageRole::User => "user",
+                            MessageRole::Agent => "agent",
+                            MessageRole::Tool => "tool",
+                            MessageRole::System => "system",
+                            MessageRole::Other(ref s) => s.as_str(),
+                        },
+                        message.author.as_deref(),
+                        message.created_at.as_ref().map(timestamp_string),
+                        message.content,
+                        serde_json::to_string(&message.extra_json)?,
+                    ],
+                )?;
+                let message_id = tx.last_insert_rowid();
+
+                for snippet in &message.snippets {
+                    tx.execute(
+                        "INSERT INTO archive_snippets(
+                            message_id, file_path, start_line, end_line, language, snippet_text
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            message_id,
+                            snippet.file_path.as_ref().map(|p| p.as_str()),
+                            snippet.start_line,
+                            snippet.end_line,
+                            snippet.language.as_deref(),
+                            snippet.snippet_text.as_deref(),
+                        ],
+                    )?;
+                }
+            }
+            Ok(conversation_id)
+        })
+        .with_context(|| format!("insert conversation {}", record.session_id.as_str()))
+    }
+
+    /// Primary lexical search powered by FTS5
+    pub fn search_archive_fts(&self, query_text: &str, limit: usize) -> Result<RetrievalBundle> {
+        let mut stmt = self.connection().prepare(
+            "SELECT
+                m.id AS message_id,
+                m.conversation_id,
+                c.source_path,
+                snippet(archive_fts, 3, '<b>', '</b>', '...', 16) AS highlighted,
+                bm25(archive_fts) AS score
+             FROM archive_fts fts
+             JOIN archive_messages m ON fts.rowid = m.id
+             JOIN archive_conversations c ON m.conversation_id = c.id
+             WHERE archive_fts MATCH ?1
+             ORDER BY score ASC
+             LIMIT ?2"
+        )?;
+
+        let mut snippets = Vec::new();
+        let mut conversations = std::collections::HashSet::new();
+
+        let rows = stmt.query_map(params![query_text, limit as i64], |row| {
+            let conversation_id: i64 = row.get(1)?;
+            let score: f64 = row.get(4)?;
+            // BM25 is usually negative in SQLite FTS5 (more negative = better)
+            let score_f32 = -score as f32;
+
+            Ok(RelevantSnippet {
+                message_id: row.get(0)?,
+                conversation_id,
+                file_path: row.get::<_, Option<String>>(2)?.map(camino::Utf8PathBuf::from),
+                snippet: row.get(3)?,
+                score: score_f32,
+            })
+        })?;
+
+        for row in rows {
+            let snippet = row?;
+            conversations.insert(snippet.conversation_id);
+            snippets.push(snippet);
+        }
+
+        Ok(RetrievalBundle {
+            snippets,
+            conversations: conversations.into_iter().collect(),
+        })
+    }
+}

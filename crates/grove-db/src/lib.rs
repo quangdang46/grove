@@ -16,6 +16,7 @@ use grove_types::{
 };
 
 mod ops;
+mod archive;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde_json::Value;
@@ -169,6 +170,16 @@ const MIGRATION_MANIFEST: &[Migration<'_>] = &[
         version: 5,
         name: "0005_operational_schema.sql",
         sql: include_str!("../migrations/0005_operational_schema.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "0006_observability.sql",
+        sql: include_str!("../migrations/0006_observability.sql"),
+    },
+    Migration {
+        version: 7,
+        name: "0007_archive_fts.sql",
+        sql: include_str!("../migrations/0007_archive_fts.sql"),
     },
 ];
 
