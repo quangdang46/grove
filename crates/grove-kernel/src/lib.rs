@@ -26,7 +26,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub use dispatch::{DispatchExitReason, DispatchLoopConfig, DispatchLoopOutcome, run_dispatch_loop};
+pub use dispatch::{
+    DispatchExitReason, DispatchLoopConfig, DispatchLoopOutcome, ShutdownSignal, run_dispatch_loop,
+};
 pub use inspect_view::BeadInspectView;
 pub use status_view::WorkspaceStatusView;
 

@@ -46,9 +46,9 @@ pub use reaction::{
 };
 pub use reservation::{ReservationConflict, ReservationMode, ReservationRecord};
 pub use run::{
-    AgentActivity, AutonomousAction, EscalationPolicy, EscalationTier, FailureClass,
-    LeaderLeaseRecord, MirrorOutboxRecord, MirrorStatus, RecoveryCapsule, RecoveryCapsuleOutcome,
-    RetryPolicy, RunStatus, TaskRunRecord,
+    AgentActivity, AutonomousAction, CoordinatorStopReason, EscalationPolicy, EscalationTier,
+    FailureClass, LeaderLeaseRecord, MirrorOutboxRecord, MirrorStatus, MutationStrategy,
+    RecoveryCapsule, RecoveryCapsuleOutcome, RetryPolicy, RunStatus, TaskRunRecord,
 };
 pub use session::{
     CircuitBreakerState, CircuitState, ClaudeSessionRecord, ContextPressureLevel,

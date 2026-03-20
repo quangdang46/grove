@@ -9,11 +9,11 @@ use grove_config::{
 };
 use grove_db::Database;
 use grove_kernel::{
-    BeadInspectView, LeaderLeaseConfig, LeaderLeaseManager, StartupRecoveryReport,
+    BeadInspectView, LeaderLeaseConfig, LeaderLeaseManager, ShutdownSignal, StartupRecoveryReport,
     WorkspaceStatusView, acquire_startup_coordinator, load_bead_inspect_view,
     load_workspace_status_view, run_dispatch_loop, DispatchLoopConfig,
 };
-use grove_types::{BeadId, BeadPriority, LeaderLeaseRecord};
+use grove_types::{BeadId, BeadPriority, GroveBeadStatus, LeaderLeaseRecord};
 use std::{cmp, env, fs};
 
 #[derive(Parser)]
@@ -29,8 +29,8 @@ enum Command {
     Init,
     Status,
     Inspect { bead_id: String },
-    Log,
-    Retry,
+    Log { bead_id: String },
+    Retry { bead_id: String },
     Run,
 }
 
@@ -41,14 +41,9 @@ fn main() -> Result<()> {
         Some(Command::Init) => handle_init(),
         Some(Command::Status) => handle_status(),
         Some(Command::Inspect { bead_id }) => handle_inspect(&BeadId::new(bead_id)),
+        Some(Command::Log { bead_id }) => handle_log(&BeadId::new(bead_id)),
+        Some(Command::Retry { bead_id }) => handle_retry(&BeadId::new(bead_id)),
         Some(Command::Run) => handle_run(),
-        Some(command) => {
-            println!(
-                "{} is not implemented yet in the Phase 1 CLI surface.",
-                command_name(&command)
-            );
-            Ok(())
-        }
         None => {
             println!("Use `grove --help` to see available commands.");
             Ok(())
@@ -212,11 +207,18 @@ fn handle_run() -> Result<()> {
     startup_result?;
     println!("Startup recovery checks complete. Beginning dispatch loop.");
 
+    // Create and register shutdown signal for graceful Ctrl-C handling.
+    let shutdown_signal = ShutdownSignal::new();
+    shutdown_signal
+        .register_ctrlc()
+        .context("register shutdown handler")?;
+
     let backend = grove_session::CliClaudeBackend::new(loaded.config.runtime.claude_bin.clone());
     let loop_config = DispatchLoopConfig {
         max_total_runs: None,
         max_poll_cycles: None,
         working_dir: loaded.paths.workspace_root().to_owned(),
+        shutdown_signal,
     };
 
     let outcome = run_dispatch_loop(
@@ -229,6 +231,7 @@ fn handle_run() -> Result<()> {
     )?;
 
     println!("Dispatch loop exited: {}", outcome.exit_reason);
+    println!("Stop reason: {}", outcome.stop_reason);
     println!("Total runs dispatched: {}", outcome.dispatched_count);
     println!("Total poll cycles: {}", outcome.poll_cycles);
 
@@ -238,6 +241,173 @@ fn handle_run() -> Result<()> {
             .context("release leader lease after dispatch loop")?;
 
     print_run_startup_report(&loaded, &release_result);
+    Ok(())
+}
+
+fn handle_log(bead_id: &BeadId) -> Result<()> {
+    let (_loaded, db, _br) = open_runtime()?;
+
+    // Find the latest run for this bead.
+    let runs = db
+        .list_task_runs_for_bead(bead_id)
+        .with_context(|| format!("list runs for {}", bead_id.as_str()))?;
+
+    if runs.is_empty() {
+        println!("No runs found for bead {}.", bead_id.as_str());
+        return Ok(());
+    }
+
+    let latest_run = &runs[0];
+    println!("Bead: {}", bead_id.as_str());
+    println!(
+        "Run: {} (attempt {}, status: {:?})",
+        latest_run.id.as_str(),
+        latest_run.attempt_no,
+        latest_run.status
+    );
+    println!("Started: {}", latest_run.started_at);
+    println!(
+        "Ended: {}",
+        display_option(latest_run.ended_at.as_ref())
+    );
+    if let Some(failure_class) = latest_run.failure_class {
+        println!("Failure class: {:?}", failure_class);
+    }
+    if let Some(detail) = latest_run.failure_detail.as_deref() {
+        println!("Failure detail: {detail}");
+    }
+    println!(
+        "Sessions: {} | Checkpoints: {}",
+        latest_run.session_count, latest_run.checkpoint_count
+    );
+
+    // Show event log entries for this run.
+    let events = db
+        .list_events_for_run(&latest_run.id)
+        .with_context(|| format!("list events for run {}", latest_run.id.as_str()))?;
+
+    if events.is_empty() {
+        println!("\nNo events recorded for this run.");
+    } else {
+        println!("\nEvent log ({} events):", events.len());
+        for event in &events {
+            let session_label = event
+                .session_id
+                .as_ref()
+                .map(|sid| format!(" ses:{}", sid.as_str()))
+                .unwrap_or_default();
+            println!(
+                "  [{:?}]{} at {}",
+                event.kind, session_label, event.created_at
+            );
+            if event.payload != serde_json::Value::Null {
+                if let Ok(pretty) = serde_json::to_string(&event.payload) {
+                    println!("    {pretty}");
+                }
+            }
+        }
+    }
+
+    // Show latest session transcript path.
+    if let Ok(Some(session)) = db.latest_session_for_run(&latest_run.id) {
+        println!("\nLatest session: {}", session.id.as_str());
+        println!("  status: {:?}", session.status);
+        println!("  transcript: {}", session.transcript_path);
+        println!(
+            "  stop reason: {}",
+            display_option(session.stop_reason.as_ref())
+        );
+
+        // Try to read transcript file content if it exists.
+        let transcript_path = std::path::Path::new(&session.transcript_path);
+        if transcript_path.exists() {
+            println!("\nTranscript tail:");
+            match fs::read_to_string(transcript_path) {
+                Ok(content) => {
+                    let lines: Vec<&str> = content.lines().collect();
+                    let start = lines.len().saturating_sub(20);
+                    for line in &lines[start..] {
+                        println!("  {line}");
+                    }
+                }
+                Err(error) => {
+                    println!("  (could not read transcript: {error})");
+                }
+            }
+        } else {
+            println!("  (transcript file not found at {})", session.transcript_path);
+        }
+    }
+
+    // Show latest checkpoint if present.
+    if let Ok(Some(checkpoint)) = db.latest_checkpoint_for_bead(bead_id) {
+        println!("\nLatest checkpoint:");
+        println!("  progress: {}", checkpoint.progress);
+        println!("  next step: {}", checkpoint.next_step);
+        println!("  saved at: {}", checkpoint.saved_at);
+        println!("  resume generation: {}", checkpoint.resume_generation);
+    }
+
+    // Show recovery capsule if present.
+    if let Ok(Some(capsule_event)) = db.latest_recovery_capsule_for_bead(bead_id) {
+        println!("\nRecovery capsule:");
+        println!("  outcome: {:?}", capsule_event.capsule.outcome);
+        println!("  summary: {}", capsule_event.capsule.summary);
+        if !capsule_event.capsule.likely_root_causes.is_empty() {
+            println!(
+                "  root causes: {}",
+                capsule_event.capsule.likely_root_causes.join(" | ")
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_retry(bead_id: &BeadId) -> Result<()> {
+    let (_loaded, mut db, br) = open_runtime()?;
+
+    // Check current bead status.
+    let bead = db
+        .get_bead_record(bead_id)
+        .with_context(|| format!("load bead record for {}", bead_id.as_str()))?
+        .ok_or_else(|| anyhow!("bead {} not found in local cache", bead_id.as_str()))?;
+
+    // Only allow retry for Failed or Checkpointed beads.
+    match bead.grove_status {
+        GroveBeadStatus::Failed | GroveBeadStatus::Checkpointed => {}
+        other => {
+            bail!(
+                "bead {} has grove status {:?}, can only retry Failed or Checkpointed beads",
+                bead_id.as_str(),
+                other
+            );
+        }
+    }
+
+    // Check br still reports this bead as ready (or at least open).
+    let br_ready = br.ready().unwrap_or_default();
+    let is_ready_in_br = br_ready.iter().any(|s| &s.id == bead_id);
+
+    if !is_ready_in_br {
+        println!(
+            "Warning: bead {} is not reported as ready by br. Proceeding with local retry anyway.",
+            bead_id.as_str()
+        );
+    }
+
+    // Clear retry backoff and reset to Ready status.
+    let now = chrono::Utc::now();
+    db.reset_bead_for_retry(bead_id, &now)
+        .with_context(|| format!("reset bead {} for retry", bead_id.as_str()))?;
+
+    println!("Bead {} reset to Ready for retry.", bead_id.as_str());
+    println!("Previous status: {:?}", bead.grove_status);
+    if let Some(failure_class) = bead.last_failure_class {
+        println!("Previous failure: {:?}", failure_class);
+    }
+    println!("\nThe bead will be dispatched in the next `grove run` cycle.");
+
     Ok(())
 }
 
@@ -1043,8 +1213,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Init => "init",
         Command::Status => "status",
         Command::Inspect { .. } => "inspect",
-        Command::Log => "log",
-        Command::Retry => "retry",
+        Command::Log { .. } => "log",
+        Command::Retry { .. } => "retry",
         Command::Run => "run",
     }
 }

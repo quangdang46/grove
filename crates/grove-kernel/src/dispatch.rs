@@ -11,11 +11,63 @@ use grove_session::{
     ClaudeBackend, ContextMonitor, ExitPolicy, SingleTaskSessionRequest,
 };
 use grove_types::{
-    BeadId, CircuitState, ExecutionContract, GroveBeadRecord, GroveBeadStatus, PromptId,
-    ReservationMode, RunId, SessionId, Timestamp,
+    BeadId, CircuitState, CoordinatorStopReason, ExecutionContract, GroveBeadRecord,
+    GroveBeadStatus, PromptId, ReservationMode, RunId, SessionId, Timestamp,
 };
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Thread-safe shutdown signal for the coordinator.
+///
+/// Set from a signal handler (SIGINT/SIGTERM/Ctrl-C) and polled each
+/// dispatch cycle. This enables graceful shutdown: the loop stops
+/// dispatching new work, persists pending state, and releases the
+/// leader lease.
+#[derive(Debug, Clone)]
+pub struct ShutdownSignal {
+    flag: Arc<AtomicBool>,
+}
+
+impl ShutdownSignal {
+    /// Create a new shutdown signal (not triggered).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Trigger the shutdown signal.
+    pub fn trigger(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Check whether shutdown has been requested.
+    #[must_use]
+    pub fn is_triggered(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Register this signal with the ctrlc handler.
+    /// Returns an error if the handler cannot be set.
+    pub fn register_ctrlc(&self) -> Result<()> {
+        let flag = self.flag.clone();
+        ctrlc::set_handler(move || {
+            flag.store(true, Ordering::SeqCst);
+            eprintln!("\ngrove: shutdown signal received, stopping after current dispatch...");
+        })
+        .context("register Ctrl-C handler")?;
+        Ok(())
+    }
+}
+
+impl Default for ShutdownSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Outcome of a single dispatch loop run.
 #[derive(Debug, Clone)]
@@ -26,6 +78,8 @@ pub struct DispatchLoopOutcome {
     pub poll_cycles: u32,
     /// Reason the dispatch loop terminated.
     pub exit_reason: DispatchExitReason,
+    /// Durable stop reason for post-mortem analysis.
+    pub stop_reason: CoordinatorStopReason,
 }
 
 /// Why the dispatch loop stopped.
@@ -39,6 +93,8 @@ pub enum DispatchExitReason {
     LeaderContested,
     /// The configured max poll cycles were exceeded.
     MaxPollCycles { limit: u32 },
+    /// Shutdown signal received (SIGINT/SIGTERM/Ctrl-C).
+    ShutdownRequested,
 }
 
 impl std::fmt::Display for DispatchExitReason {
@@ -48,6 +104,21 @@ impl std::fmt::Display for DispatchExitReason {
             Self::MaxRunsReached => write!(f, "reached max total runs"),
             Self::LeaderContested => write!(f, "leader lease contested"),
             Self::MaxPollCycles { limit } => write!(f, "exceeded max poll cycles ({limit})"),
+            Self::ShutdownRequested => write!(f, "shutdown signal received"),
+        }
+    }
+}
+
+impl DispatchExitReason {
+    /// Convert to a durable `CoordinatorStopReason`.
+    #[must_use]
+    pub fn to_stop_reason(&self) -> CoordinatorStopReason {
+        match self {
+            Self::QueueEmpty => CoordinatorStopReason::QueueEmpty,
+            Self::MaxRunsReached => CoordinatorStopReason::MaxRunsReached,
+            Self::LeaderContested => CoordinatorStopReason::LeaderContested,
+            Self::MaxPollCycles { .. } => CoordinatorStopReason::MaxPollCycles,
+            Self::ShutdownRequested => CoordinatorStopReason::UserStopped,
         }
     }
 }
@@ -61,6 +132,8 @@ pub struct DispatchLoopConfig {
     pub max_poll_cycles: Option<u32>,
     /// Working directory for session execution.
     pub working_dir: camino::Utf8PathBuf,
+    /// Shutdown signal for graceful termination.
+    pub shutdown_signal: ShutdownSignal,
 }
 
 /// Score a single bead for dispatch priority using the same logic as `status_view`.
@@ -255,13 +328,27 @@ pub fn run_dispatch_loop<B: ClaudeBackend, C: BrClient>(
     loop {
         poll_cycles += 1;
 
+        // Check shutdown signal before anything else.
+        if loop_config.shutdown_signal.is_triggered() {
+            eprintln!("grove dispatch: shutdown signal detected, exiting gracefully");
+            let exit_reason = DispatchExitReason::ShutdownRequested;
+            return Ok(DispatchLoopOutcome {
+                dispatched_count,
+                poll_cycles,
+                exit_reason: exit_reason.clone(),
+                stop_reason: exit_reason.to_stop_reason(),
+            });
+        }
+
         // Check max poll cycles.
         if let Some(limit) = loop_config.max_poll_cycles {
             if poll_cycles > limit {
+                let exit_reason = DispatchExitReason::MaxPollCycles { limit };
                 return Ok(DispatchLoopOutcome {
                     dispatched_count,
                     poll_cycles,
-                    exit_reason: DispatchExitReason::MaxPollCycles { limit },
+                    exit_reason: exit_reason.clone(),
+                    stop_reason: exit_reason.to_stop_reason(),
                 });
             }
         }
@@ -269,10 +356,12 @@ pub fn run_dispatch_loop<B: ClaudeBackend, C: BrClient>(
         // Check max total runs.
         if let Some(max_runs) = loop_config.max_total_runs {
             if dispatched_count >= max_runs {
+                let exit_reason = DispatchExitReason::MaxRunsReached;
                 return Ok(DispatchLoopOutcome {
                     dispatched_count,
                     poll_cycles,
-                    exit_reason: DispatchExitReason::MaxRunsReached,
+                    exit_reason: exit_reason.clone(),
+                    stop_reason: exit_reason.to_stop_reason(),
                 });
             }
         }
@@ -282,10 +371,12 @@ pub fn run_dispatch_loop<B: ClaudeBackend, C: BrClient>(
         match LeaderLeaseManager::heartbeat(db, lease_config, now)? {
             Some(_) => {}
             None => {
+                let exit_reason = DispatchExitReason::LeaderContested;
                 return Ok(DispatchLoopOutcome {
                     dispatched_count,
                     poll_cycles,
-                    exit_reason: DispatchExitReason::LeaderContested,
+                    exit_reason: exit_reason.clone(),
+                    stop_reason: exit_reason.to_stop_reason(),
                 });
             }
         }
@@ -317,10 +408,12 @@ pub fn run_dispatch_loop<B: ClaudeBackend, C: BrClient>(
             consecutive_empty_polls += 1;
             // After 3 consecutive empty polls, exit.
             if consecutive_empty_polls >= 3 {
+                let exit_reason = DispatchExitReason::QueueEmpty;
                 return Ok(DispatchLoopOutcome {
                     dispatched_count,
                     poll_cycles,
-                    exit_reason: DispatchExitReason::QueueEmpty,
+                    exit_reason: exit_reason.clone(),
+                    stop_reason: exit_reason.to_stop_reason(),
                 });
             }
             std::thread::sleep(poll_sleep);
@@ -346,10 +439,12 @@ pub fn run_dispatch_loop<B: ClaudeBackend, C: BrClient>(
             // br says beads are ready but none pass local dispatch eligibility.
             consecutive_empty_polls += 1;
             if consecutive_empty_polls >= 3 {
+                let exit_reason = DispatchExitReason::QueueEmpty;
                 return Ok(DispatchLoopOutcome {
                     dispatched_count,
                     poll_cycles,
-                    exit_reason: DispatchExitReason::QueueEmpty,
+                    exit_reason: exit_reason.clone(),
+                    stop_reason: exit_reason.to_stop_reason(),
                 });
             }
             std::thread::sleep(poll_sleep);

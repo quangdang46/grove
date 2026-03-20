@@ -1409,6 +1409,121 @@ impl Database {
             .collect()
     }
 
+    pub fn reset_bead_for_retry(
+        &mut self,
+        bead_id: &BeadId,
+        now: &chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .context("begin reset bead for retry transaction")?;
+        
+        tx.execute(
+            "UPDATE bead_runtime \
+             SET grove_status = ?2, retry_after = NULL, runtime_updated_at = ?3 \
+             WHERE bead_id = ?1",
+            params![
+                bead_id.as_str(),
+                encode_grove_status(GroveBeadStatus::Ready),
+                timestamp_string(now)
+            ],
+        )
+        .with_context(|| format!("update bead_runtime for retry {}", bead_id.as_str()))?;
+
+        insert_event_log_tx(
+            &tx,
+            EventKind::RecoveryActionTaken,
+            Some(bead_id),
+            None,
+            None,
+            &serde_json::json!({"action": "retry_reset"}),
+            now,
+        )?;
+
+        tx.commit().context("commit reset bead for retry transaction")?;
+        Ok(())
+    }
+
+    pub fn list_events_for_run(&self, run_id: &RunId) -> Result<Vec<EventLogRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, kind, bead_id, run_id, session_id, payload_json, created_at \
+                 FROM event_log \
+                 WHERE run_id = ?1 \
+                 ORDER BY id ASC",
+            )
+            .context("prepare run event log list query")?;
+
+        let rows = stmt
+            .query_map([run_id.as_str()], raw_event_log_row)
+            .with_context(|| format!("query event log for run {}", run_id.as_str()))?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect run event log rows")?
+            .into_iter()
+            .map(raw_event_log_into_record)
+            .collect()
+    }
+
+    pub fn latest_session_for_run(&self, run_id: &RunId) -> Result<Option<ClaudeSessionRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, prompt_id, prompt_manifest_path, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path \
+                 FROM claude_sessions \
+                 WHERE run_id = ?1 \
+                 ORDER BY started_at DESC LIMIT 1",
+            )
+            .context("prepare latest session query")?;
+
+        let row = stmt
+            .query_row([run_id.as_str()], raw_session_row)
+            .optional()
+            .context("query latest session")?;
+
+        row.map(raw_session_into_record).transpose()
+    }
+
+    pub fn latest_checkpoint_for_bead(&self, bead_id: &BeadId) -> Result<Option<CheckpointRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, bead_id, run_id, session_id, progress, next_step, payload_json, saved_at, resume_generation \
+                 FROM checkpoints \
+                 WHERE bead_id = ?1 \
+                 ORDER BY saved_at DESC LIMIT 1",
+            )
+            .context("prepare latest checkpoint query")?;
+
+        let row = stmt
+            .query_row([bead_id.as_str()], raw_checkpoint_row)
+            .optional()
+            .context("query latest checkpoint")?;
+
+        row.map(raw_checkpoint_into_record).transpose()
+    }
+
+    pub fn handoff_for_bead(&self, bead_id: &BeadId) -> Result<Option<HandoffRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bead_id, run_id, summary, artifacts_json, lessons_json, decisions_json, warnings_json, completed_at \
+                 FROM handoffs \
+                 WHERE bead_id = ?1 \
+                 ORDER BY completed_at DESC LIMIT 1",
+            )
+            .context("prepare latest handoff query")?;
+
+        let row = stmt
+            .query_row([bead_id.as_str()], raw_handoff_row)
+            .optional()
+            .context("query latest handoff")?;
+
+        row.map(raw_handoff_into_record).transpose()
+    }
+
     pub fn acquire_reservations(
         &mut self,
         bead_id: &BeadId,

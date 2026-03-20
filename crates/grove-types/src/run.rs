@@ -120,6 +120,117 @@ impl Default for EscalationPolicy {
     }
 }
 
+/// Why the coordinator stopped — persisted for post-mortem analysis.
+///
+/// This distinguishes user-triggered stops from crashes, timeouts, and
+/// routine queue exhaustion so that `grove status` / `grove inspect`
+/// can explain what happened after shutdown or restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CoordinatorStopReason {
+    /// User explicitly stopped via SIGINT/SIGTERM/Ctrl-C.
+    UserStopped,
+    /// Coordinator was interrupted by external signal during dispatch.
+    Interrupted,
+    /// No more dispatchable beads remain.
+    QueueEmpty,
+    /// Reached the maximum number of total dispatches.
+    MaxRunsReached,
+    /// Leader lease was contested/lost.
+    LeaderContested,
+    /// Exceeded the configured max poll cycles.
+    MaxPollCycles,
+    /// An unexpected error forced the coordinator to exit.
+    InternalError,
+}
+
+impl CoordinatorStopReason {
+    /// Human-readable label for status displays.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UserStopped => "user_stopped",
+            Self::Interrupted => "interrupted",
+            Self::QueueEmpty => "queue_empty",
+            Self::MaxRunsReached => "max_runs_reached",
+            Self::LeaderContested => "leader_contested",
+            Self::MaxPollCycles => "max_poll_cycles",
+            Self::InternalError => "internal_error",
+        }
+    }
+
+    /// Whether this reason represents a user-initiated stop.
+    #[must_use]
+    pub const fn is_user_initiated(self) -> bool {
+        matches!(self, Self::UserStopped)
+    }
+
+    /// Whether this is a clean stop (vs. crash or error).
+    #[must_use]
+    pub const fn is_clean(self) -> bool {
+        matches!(
+            self,
+            Self::UserStopped | Self::QueueEmpty | Self::MaxRunsReached | Self::MaxPollCycles
+        )
+    }
+}
+
+impl std::fmt::Display for CoordinatorStopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UserStopped => write!(f, "user stopped (signal received)"),
+            Self::Interrupted => write!(f, "interrupted during dispatch"),
+            Self::QueueEmpty => write!(f, "no dispatchable beads remain"),
+            Self::MaxRunsReached => write!(f, "reached max total runs"),
+            Self::LeaderContested => write!(f, "leader lease contested"),
+            Self::MaxPollCycles => write!(f, "exceeded max poll cycles"),
+            Self::InternalError => write!(f, "internal error"),
+        }
+    }
+}
+
+/// Mutation strategies for progressive escalation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MutationStrategy {
+    /// Narrow the claimed paths to reduce scope.
+    NarrowClaimedPaths,
+    /// Use a different archive snippet for context.
+    DifferentArchiveSnippet,
+    /// Provide an alternative framing for the bead contract.
+    AlternativeBeadContract,
+    /// Reduce the context window budget.
+    ReduceContextWindow,
+    /// Switch to a different model.
+    SwitchModel,
+}
+
+impl MutationStrategy {
+    /// Human-readable label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NarrowClaimedPaths => "narrow_claimed_paths",
+            Self::DifferentArchiveSnippet => "different_archive_snippet",
+            Self::AlternativeBeadContract => "alternative_bead_contract",
+            Self::ReduceContextWindow => "reduce_context_window",
+            Self::SwitchModel => "switch_model",
+        }
+    }
+}
+
+impl EscalationTier {
+    /// Get the default mutation strategy for this tier.
+    #[must_use]
+    pub fn default_mutation(&self) -> Option<MutationStrategy> {
+        match self {
+            Self::FirstAttempt => None,
+            Self::SecondAttempt => None, // inject rescue prompt (not a mutation)
+            Self::ThirdAttempt => Some(MutationStrategy::NarrowClaimedPaths),
+            Self::FinalAttempt => Some(MutationStrategy::SwitchModel),
+            Self::GiveUp => None, // create recovery capsule
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunStatus {
     Active,
