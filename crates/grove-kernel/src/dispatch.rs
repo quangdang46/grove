@@ -286,6 +286,28 @@ fn apply_reaction_side_effects(
         let _ = db.update_run_escalation_tier(&ctx.bead_id, &ctx.run_id, reaction_eval.new_tier, &now);
     }
 
+    if let Some(outcome) = outcome {
+        if matches!(
+            outcome.run.status,
+            grove_types::RunStatus::Succeeded | grove_types::RunStatus::Checkpointed
+        ) {
+            let _ = db.update_run_escalation_tier(
+                &ctx.bead_id,
+                &ctx.run_id,
+                grove_types::EscalationTier::FirstAttempt,
+                &now,
+            );
+            let _ = db.write_event_log(
+                grove_types::EventKind::EscalationTierReset,
+                Some(&ctx.bead_id),
+                Some(&ctx.run_id),
+                Some(&ctx.session_id),
+                &serde_json::json!({"reset_to": "FirstAttempt"}),
+                &now,
+            );
+        }
+    }
+
     for record in reaction_eval.records {
         let _ = db.write_event_log(
             grove_types::EventKind::ReactionInvoked,
@@ -369,8 +391,26 @@ fn apply_reaction_side_effects(
             }
             grove_types::ReactionAction::ForceCheckpoint
             | grove_types::ReactionAction::EnqueueMirrorRetry
-            | grove_types::ReactionAction::InjectRescue { .. }
-            | grove_types::ReactionAction::GiveUp => {}
+            | grove_types::ReactionAction::InjectRescue { .. } => {}
+            grove_types::ReactionAction::GiveUp => {
+                if let Some(capsule) = grove_types::RecoveryCapsule::from_parts(
+                    grove_types::RecoveryCapsuleOutcome::Failed,
+                    failure_class,
+                    failure_detail.as_deref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    &[],
+                ) {
+                    let _ = db.write_recovery_capsule(grove_db::RecoveryCapsuleWriteInput {
+                        bead_id: ctx.bead_id.clone(),
+                        run_id: ctx.run_id.clone(),
+                        capsule,
+                        created_at: now,
+                    });
+                }
+            }
         }
     }
 }
@@ -1349,6 +1389,7 @@ mod tests {
 
         let run_id = RunId::new("run-grove-mirror-1");
         db.record_run_started(grove_db::RunStartInput {
+            escalation_tier: grove_types::EscalationTier::FirstAttempt,
             bead_id: bead.id.clone(),
             run_id: run_id.clone(),
             attempt_no: 1,
@@ -1438,6 +1479,7 @@ mod tests {
 
         let run1 = RunId::new("run-grove-streak-1");
         db.record_run_started(grove_db::RunStartInput {
+            escalation_tier: grove_types::EscalationTier::FirstAttempt,
             bead_id: bead.id.clone(),
             run_id: run1.clone(),
             attempt_no: 1,
@@ -1458,6 +1500,7 @@ mod tests {
 
         let run2 = RunId::new("run-grove-streak-2");
         db.record_run_started(grove_db::RunStartInput {
+            escalation_tier: grove_types::EscalationTier::FirstAttempt,
             bead_id: bead.id.clone(),
             run_id: run2.clone(),
             attempt_no: 2,
@@ -1498,6 +1541,7 @@ mod tests {
 
         let run_id = RunId::new("run-grove-open-circuit-1");
         db.record_run_started(grove_db::RunStartInput {
+            escalation_tier: grove_types::EscalationTier::FirstAttempt,
             bead_id: bead.id.clone(),
             run_id: run_id.clone(),
             attempt_no: 1,
@@ -1566,6 +1610,7 @@ mod tests {
 
         let run_id = RunId::new("run-grove-error-path-1");
         db.record_run_started(grove_db::RunStartInput {
+            escalation_tier: grove_types::EscalationTier::FirstAttempt,
             bead_id: bead.id.clone(),
             run_id: run_id.clone(),
             attempt_no: 1,

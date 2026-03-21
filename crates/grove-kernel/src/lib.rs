@@ -87,6 +87,7 @@ pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
         bead_id: bead_id.clone(),
         attempt_no,
         started_at,
+        escalation_tier: grove_types::EscalationTier::FirstAttempt,
     })?;
 
     let mut hooks = DbSessionLifecycleHooks::new(

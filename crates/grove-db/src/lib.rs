@@ -58,6 +58,7 @@ pub struct RunStartInput {
     pub bead_id: BeadId,
     pub attempt_no: i32,
     pub started_at: chrono::DateTime<Utc>,
+    pub escalation_tier: grove_types::EscalationTier,
 }
 
 #[derive(Debug, Clone)]
@@ -552,7 +553,7 @@ impl Database {
                 timestamp_string(&input.started_at),
                 encode_agent_activity(grove_types::AgentActivity::Active),
                 timestamp_string(&input.started_at),
-                encode_escalation_tier(grove_types::EscalationTier::FirstAttempt),
+                encode_escalation_tier(input.escalation_tier),
             ],
         )
         .with_context(|| format!("insert task run {}", input.run_id.as_str()))?;
@@ -3079,6 +3080,7 @@ fn encode_event_kind(kind: EventKind) -> &'static str {
         EventKind::BrMirrorFailed => "BrMirrorFailed",
         EventKind::ReactionInvoked => "ReactionInvoked",
         EventKind::EscalationTierChanged => "EscalationTierChanged",
+        EventKind::EscalationTierReset => "EscalationTierReset",
         EventKind::ActivityStateChanged => "ActivityStateChanged",
         EventKind::RecoveryCapsuleCreated => "RecoveryCapsuleCreated",
     }
@@ -3515,6 +3517,7 @@ fn parse_event_kind(text: &str) -> Result<EventKind> {
         "brmirrorfailed" => Ok(EventKind::BrMirrorFailed),
         "reactioninvoked" => Ok(EventKind::ReactionInvoked),
         "escalationtierchanged" => Ok(EventKind::EscalationTierChanged),
+            "escalationtierreset" => Ok(EventKind::EscalationTierReset),
         "activitystatechanged" => Ok(EventKind::ActivityStateChanged),
         "recoverycapsulecreated" => Ok(EventKind::RecoveryCapsuleCreated),
         _ => bail!("unsupported event kind {text}"),
@@ -3840,6 +3843,7 @@ mod tests {
         let started_at: Timestamp = "2026-03-16T11:00:00Z".parse()?;
         let ended_at: Timestamp = "2026-03-16T11:10:00Z".parse()?;
         let run = db.record_run_started(RunStartInput {
+            escalation_tier: grove_types::EscalationTier::FirstAttempt,
             run_id: RunId::new("run-breaker"),
             bead_id: BeadId::new("grove-breaker"),
             attempt_no: 1,
@@ -4110,6 +4114,7 @@ mod tests {
 
         let started_at: Timestamp = "2026-03-16T11:00:00Z".parse()?;
         let run = db.record_run_started(RunStartInput {
+            escalation_tier: grove_types::EscalationTier::FirstAttempt,
             run_id: RunId::new("run-life"),
             bead_id: BeadId::new("grove-life"),
             attempt_no: 1,
@@ -4248,18 +4253,21 @@ mod tests {
 
         let started_at: Timestamp = "2026-03-16T12:00:00Z".parse()?;
         db.record_run_started(RunStartInput {
+            escalation_tier: grove_types::EscalationTier::FirstAttempt,
             run_id: RunId::new("run-a"),
             bead_id: BeadId::new("grove-a"),
             attempt_no: 1,
             started_at,
         })?;
         db.record_run_started(RunStartInput {
+            escalation_tier: grove_types::EscalationTier::FirstAttempt,
             run_id: RunId::new("run-b"),
             bead_id: BeadId::new("grove-b"),
             attempt_no: 1,
             started_at,
         })?;
         db.record_run_started(RunStartInput {
+            escalation_tier: grove_types::EscalationTier::FirstAttempt,
             run_id: RunId::new("run-a-2"),
             bead_id: BeadId::new("grove-a"),
             attempt_no: 2,

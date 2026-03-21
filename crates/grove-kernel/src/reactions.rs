@@ -392,6 +392,7 @@ mod tests {
             run_id: run_id.clone(),
             attempt_no: 1,
             started_at: chrono::Utc::now(),
+            escalation_tier: grove_types::EscalationTier::FirstAttempt,
         })
         .unwrap();
 

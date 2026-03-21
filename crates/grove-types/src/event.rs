@@ -37,6 +37,7 @@ pub enum EventKind {
     // New event kinds for observability
     ReactionInvoked,
     EscalationTierChanged,
+    EscalationTierReset,
     ActivityStateChanged,
     RecoveryCapsuleCreated,
 }
