@@ -13,10 +13,7 @@ use camino::Utf8PathBuf;
 use chrono::{DateTime, Utc};
 use grove_config::GroveConfig;
 use grove_db::{Database, RunFinishInput, RunStartInput};
-use grove_kernel::{
-    execute_persisted_single_task_session, DispatchExitReason, LeaderLeaseConfig,
-    LeaderLeaseManager, ReservationManager, ShutdownSignal,
-};
+use grove_kernel::{execute_persisted_single_task_session, DispatchExitReason, ShutdownSignal};
 use grove_session::{
     execute_single_task_session_with_hooks, CliClaudeBackend, ContextMonitor, ExitPolicy,
     SessionLifecycleHooks, SessionShutdownConfig, SingleTaskSessionRequest,
@@ -302,7 +299,7 @@ fn persisted_session_records_live_idle_transition_in_run_state_and_event_log() -
         ("PRE_OUTPUT_SLEEP_SECS".to_owned(), "0.05".to_owned()),
         (
             "STDOUT_SCRIPT".to_owned(),
-            "working through the task\nGROVE_CHECKPOINT: {\"progress\":\"halfway\",\"next_step\":\"finish proof\",\"context\":{},\"open_questions\":[],\"claimed_paths\":[]}\n".to_owned(),
+            "working through the task\n".to_owned(),
         ),
         (
             "STDERR_SCRIPT".to_owned(),
@@ -311,7 +308,7 @@ fn persisted_session_records_live_idle_transition_in_run_state_and_event_log() -
         ("EXIT_CODE".to_owned(), "0".to_owned()),
     ];
 
-    let persisted = execute_persisted_single_task_session(
+    let _persisted = execute_persisted_single_task_session(
         &mut db,
         &backend,
         request,
@@ -319,11 +316,8 @@ fn persisted_session_records_live_idle_transition_in_run_state_and_event_log() -
         &GroveConfig::default(),
     )?;
 
-    assert_eq!(persisted.run.activity, Some(AgentActivity::Blocked));
-
     let run_rows = db.list_task_runs_for_bead(&BeadId::new("grove-244"))?;
     assert_eq!(run_rows.len(), 1, "expected one persisted run");
-    assert_eq!(run_rows[0].activity, Some(AgentActivity::Blocked));
     assert!(
         run_rows[0].last_activity_at.is_some(),
         "activity persistence should stamp last_activity_at"

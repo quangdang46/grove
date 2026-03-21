@@ -732,7 +732,69 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 
 ---
 
+## Release Readiness Criteria
 
+This section defines what "safe enough to leave unattended" means for Grove. Future work is judged against these criteria, not just feature count.
+
+### The Core Promise
+
+Grove's product promise is not merely that Claude can run tasks — it is that Grove orchestrates sessions **durably**, **explainably**, and **recoverably**, so an operator can leave it running and return to completed work (or legible failures) rather than wasted state.
+
+### Must-Have Operational Traits
+
+| Trait | What It Means | Evidence |
+|-------|--------------|----------|
+| **Durable runtime state** | All run/session/checkpoint state survives process restart | `grove run` resumes interrupted work; `grove status` shows correct state |
+| **Visible dispatch reasoning** | Each dispatch decision is auditable: why this bead, why now | `grove inspect <bead>` shows scoring, reservations, conflict checks |
+| **Mirror-pending visibility** | Completed work is safe from temporary `br` outages | `grove status` shows `mirror-pending` beads separately from succeeded/failed |
+| **Recovery capsules** | Failed/interrupted runs carry explainable recovery guidance | `grove log <bead>` shows capsule with root cause, next step, no-repeat signals |
+| **Config provenance** | Running config is snapshotted and inspectable | `.grove/config.snapshot.json` exists; `grove inspect` shows effective config |
+| **Integrity checks** | Grove validates its own state before orchestrating | `grove doctor` passes; `grove init` recovers from missing state |
+| **Searchable transcripts** | Past sessions are findable by keyword | Archive FTS5 search returns relevant snippets for task context |
+
+### Phase Acceptance Evidence Map
+
+Each phase has an acceptance task that backs these traits with tests:
+
+| Trait | Acceptance Task | Status |
+|-------|----------------|--------|
+| Durable runtime state | `grove-1j9.7.10` (Phase 3) | Closed — 9 tests covering run lifecycle, checkpoint persistence, recovery |
+| Visible dispatch reasoning | `grove-1j9.7.10` (Phase 3) | Closed — dispatch reason in event log, inspect surfaces scoring |
+| Mirror-pending visibility | `grove-1j9.7.10` (Phase 3) | Closed — mirror outbox, retry, and visibility tested |
+| Recovery capsules | `grove-1j9.7.7` (Phase 3) | Closed — capsule creation, persistence, and retrieval implemented |
+| Config provenance | `grove-1j9.7.9` (Phase 3) | Closed — config snapshot on each run, inspectable |
+| Integrity checks | `grove-1j9.7.10` (Phase 3) | Closed — coordinator lifecycle, shutdown reason, event durability |
+| Searchable transcripts | `grove-1j9.8.6` (Phase 4) | Closed — FTS5 ingest, search, and retrieval tested |
+| Lesson/playbook memory | `grove-1j9.9.6` (Phase 5) | Closed — scoring, promotion, curation, diary feedback tested |
+| Curation explainability | `grove-1j9.10.5` (Phase 6) | Closed — anti-pattern inversion, dedup, decision log tested |
+
+### Gaps That Would Block an Unattended Release
+
+The following gaps would prevent an operator from trusting Grove unattended. They are not blocking today because the base behavior (run, recover, inspect) is covered, but they represent the next hardening frontier:
+
+| Gap | Severity | Description |
+|-----|----------|-------------|
+| Real Claude session end-to-end validation | HIGH | All session tests use fake backends. A real `claude -p` round-trip has not been exercised in the test suite. |
+| Leader lease race between concurrent `grove run` | MEDIUM | If two processes call `grove run` simultaneously, one should fail fast with `LeaderContested`. This is implemented but not tested under concurrent invocation. |
+| Archive incremental ingest from live sessions | MEDIUM | Transcript files are written but not ingested into the FTS5 archive automatically. The archive is populated by `cass` ingest, not Grove itself. |
+| Playbook lesson extraction from LLM | MEDIUM | `GROVE_LESSONS` are captured in handoffs but playbook bullets must currently be manually curated. LLM-assisted lesson extraction is not yet wired. |
+| Graceful shutdown under load | LOW | Shutdown is tested with `ShutdownSignal` unit tests but not under active session execution with bounded concurrency. |
+
+### What "Release Ready" Means Today
+
+Today, Grove is release-ready for **developer-mode unattended use** — a developer who wants to define a bead graph, run `grove run`, and trust that:
+- Completed beads are closed in `br` (or mirror-pending if `br` is down)
+- Failed/interrupted beads have recovery capsules for the next session
+- The operator can inspect any bead's dispatch reasoning, event history, and current state
+- `grove status` gives an honest picture of what's running, pending, succeeded, failed, and mirror-pending
+
+It is **not yet** release-ready for **operator-mode unattended use** — where a non-developer operator leaves Grove running on a server with no developer oversight, expecting it to handle all failure modes gracefully without human intervention. That requires the HIGH-severity gaps above to be addressed.
+
+### How to Use These Criteria
+
+When prioritizing hardening work, start from the HIGH-severity gaps. When evaluating whether a PR makes Grove more or less trustworthy for unattended use, check against the traits above. When writing new features, ensure they either add a new trait or strengthen an existing one — not just add commands that exist without durability.
+
+---
 
 ## Note on Built-in TODO Functionality
 
