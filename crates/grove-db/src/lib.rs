@@ -9,10 +9,11 @@ use grove_br::{
 };
 use grove_types::{
     BeadId, BeadPriority, BeadRef, CheckpointId, CheckpointPayload, CheckpointRecord,
-    ClaudeSessionRecord, EventKind, EventLogRecord, FailureClass, GroveBeadRecord, GroveBeadStatus,
-    HandoffRecord, LeaderLeaseRecord, MirrorOutboxRecord, MirrorStatus, PromptId, RecoveryCapsule,
-    RecoveryCapsuleOutcome, ReservationConflict, ReservationMode, ReservationRecord, RunId,
-    RunStatus, SessionId, SessionStatus, StopReason, TaskRunRecord, Timestamp,
+    CircuitBreakerState, ClaudeSessionRecord, EventKind, EventLogRecord, FailureClass,
+    GroveBeadRecord, GroveBeadStatus, HandoffRecord, LeaderLeaseRecord, MirrorOutboxRecord,
+    MirrorStatus, PromptId, RecoveryCapsule, RecoveryCapsuleOutcome, ReservationConflict,
+    ReservationMode, ReservationRecord, RunId, RunStatus, SessionId, SessionStatus, StopReason,
+    TaskRunRecord, Timestamp,
 };
 
 mod ops;
@@ -67,6 +68,7 @@ pub struct RunFinishInput {
     pub failure_detail: Option<String>,
     pub ended_at: chrono::DateTime<Utc>,
     pub retry_after: Option<chrono::DateTime<Utc>>,
+    pub circuit_breaker_state: Option<CircuitBreakerState>,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +200,11 @@ const MIGRATION_MANIFEST: &[Migration<'_>] = &[
         name: "0010_activity_state.sql",
         sql: include_str!("../migrations/0010_activity_state.sql"),
     },
+    Migration {
+        version: 11,
+        name: "0011_circuit_breaker_state.sql",
+        sql: include_str!("../migrations/0011_circuit_breaker_state.sql"),
+    },
 ];
 
 #[derive(Debug)]
@@ -237,6 +244,7 @@ struct RawBeadRecordRow {
     retry_after: Option<String>,
     last_failure_class: Option<String>,
     last_failure_detail: Option<String>,
+    circuit_breaker_json: Option<String>,
     runtime_updated_at: Option<String>,
 }
 
@@ -418,7 +426,7 @@ impl Database {
                 "SELECT c.bead_id, c.title, c.description, c.priority, c.issue_type, c.status, c.assignee, \
                     c.labels_json, c.raw_json, c.synced_at, r.grove_status, r.declared_paths_json, \
                     r.metadata_json, r.last_run_id, r.retry_after, r.last_failure_class, \
-                    r.last_failure_detail, r.runtime_updated_at \
+                    r.last_failure_detail, r.circuit_breaker_json, r.runtime_updated_at \
                  FROM bead_cache c \
                  LEFT JOIN bead_runtime r ON r.bead_id = c.bead_id \
                  ORDER BY c.priority ASC, c.bead_id ASC",
@@ -446,7 +454,7 @@ impl Database {
                 "SELECT c.bead_id, c.title, c.description, c.priority, c.issue_type, c.status, c.assignee, \
                     c.labels_json, c.raw_json, c.synced_at, r.grove_status, r.declared_paths_json, \
                     r.metadata_json, r.last_run_id, r.retry_after, r.last_failure_class, \
-                    r.last_failure_detail, r.runtime_updated_at \
+                    r.last_failure_detail, r.circuit_breaker_json, r.runtime_updated_at \
                  FROM bead_cache c \
                  LEFT JOIN bead_runtime r ON r.bead_id = c.bead_id \
                  WHERE c.bead_id = ?1",
@@ -557,6 +565,7 @@ impl Database {
             Some(None),
             Some(None),
             Some(None),
+            None,
             &input.started_at,
         )?;
         insert_event_log_tx(
@@ -632,6 +641,7 @@ impl Database {
             None,
             Some(None),
             Some(None),
+            None,
             &session.started_at,
         )?;
         insert_event_log_tx(
@@ -717,6 +727,7 @@ impl Database {
             Some(None),
             Some(failure_class),
             Some(failure_detail.clone()),
+            None,
             &session.ended_at.unwrap_or_else(Utc::now),
         )?;
         insert_event_log_tx(
@@ -779,6 +790,7 @@ impl Database {
             Some(None),
             Some(None),
             Some(None),
+            None,
             &input.saved_at,
         )?;
         insert_event_log_tx(
@@ -850,6 +862,7 @@ impl Database {
             Some(input.retry_after),
             Some(input.failure_class),
             Some(input.failure_detail.clone()),
+            Some(input.circuit_breaker_state.clone()),
             &input.ended_at,
         )?;
         let event_kind = match input.status {
@@ -1220,7 +1233,6 @@ impl Database {
                     encode_failure_class(FailureClass::Interrupted),
                     failure_detail,
                     timestamp_string(now),
-                    timestamp_string(now),
                 ],
             )
             .with_context(|| format!("mark interrupted run {}", run.id.as_str()))?;
@@ -1234,6 +1246,7 @@ impl Database {
                 Some(None),
                 Some(Some(FailureClass::Interrupted)),
                 Some(Some(failure_detail.to_owned())),
+                None,
                 now,
             )?;
 
@@ -1533,7 +1546,7 @@ impl Database {
         
         tx.execute(
             "UPDATE bead_runtime \
-             SET grove_status = ?2, retry_after = NULL, runtime_updated_at = ?3 \
+             SET grove_status = ?2, retry_after = NULL, circuit_breaker_json = NULL, runtime_updated_at = ?3 \
              WHERE bead_id = ?1",
             params![
                 bead_id.as_str(),
@@ -2343,8 +2356,8 @@ impl BeadCacheStore for Database {
             .execute(
                 "INSERT INTO bead_runtime(\
                     bead_id, grove_status, declared_paths_json, metadata_json, last_run_id, retry_after,\
-                    last_failure_class, last_failure_detail, runtime_updated_at\
-                 ) VALUES (?1, ?2, '[]', '{}', NULL, NULL, NULL, NULL, ?3) \
+                    last_failure_class, last_failure_detail, circuit_breaker_json, runtime_updated_at\
+                 ) VALUES (?1, ?2, '[]', '{}', NULL, NULL, NULL, NULL, NULL, ?3) \
                  ON CONFLICT(bead_id) DO UPDATE SET \
                     grove_status = excluded.grove_status, \
                     runtime_updated_at = excluded.runtime_updated_at",
@@ -2410,7 +2423,8 @@ fn raw_bead_record_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawBeadRecor
         retry_after: row.get(14)?,
         last_failure_class: row.get(15)?,
         last_failure_detail: row.get(16)?,
-        runtime_updated_at: row.get(17)?,
+        circuit_breaker_json: row.get(17)?,
+        runtime_updated_at: row.get(18)?,
     })
 }
 
@@ -2567,6 +2581,11 @@ fn raw_bead_record_into_record(row: RawBeadRecordRow) -> Result<GroveBeadRecord>
             .map(parse_failure_class)
             .transpose()?,
         last_failure_detail: row.last_failure_detail,
+        circuit_breaker_state: row
+            .circuit_breaker_json
+            .as_deref()
+            .map(|text| parse_json(text, "circuit breaker state"))
+            .transpose()?,
         synced_at,
         runtime_updated_at,
     })
@@ -2975,7 +2994,7 @@ fn set_declared_paths_tx(
     tx.execute(
         "INSERT INTO bead_runtime(\
             bead_id, grove_status, declared_paths_json, metadata_json, last_run_id, retry_after,\
-            last_failure_class, last_failure_detail, runtime_updated_at\
+            last_failure_class, last_failure_detail, circuit_breaker_json, runtime_updated_at\
          ) VALUES (\
             ?1, COALESCE((SELECT grove_status FROM bead_runtime WHERE bead_id = ?1), 'Idle'), ?2,\
             COALESCE((SELECT metadata_json FROM bead_runtime WHERE bead_id = ?1), '{}'),\
@@ -2983,6 +3002,7 @@ fn set_declared_paths_tx(
             COALESCE((SELECT retry_after FROM bead_runtime WHERE bead_id = ?1), NULL),\
             COALESCE((SELECT last_failure_class FROM bead_runtime WHERE bead_id = ?1), NULL),\
             COALESCE((SELECT last_failure_detail FROM bead_runtime WHERE bead_id = ?1), NULL),\
+            COALESCE((SELECT circuit_breaker_json FROM bead_runtime WHERE bead_id = ?1), NULL),\
             ?4\
          )\
          ON CONFLICT(bead_id) DO UPDATE SET \
@@ -3115,6 +3135,7 @@ fn upsert_bead_runtime_tx(
     retry_after: Option<Option<chrono::DateTime<Utc>>>,
     last_failure_class: Option<Option<FailureClass>>,
     last_failure_detail: Option<Option<String>>,
+    circuit_breaker_state: Option<Option<CircuitBreakerState>>,
     runtime_updated_at: &chrono::DateTime<Utc>,
 ) -> Result<()> {
     let declared_paths_json = declared_paths
@@ -3124,15 +3145,20 @@ fn upsert_bead_runtime_tx(
     let retry_after = retry_after.flatten().map(|value| timestamp_string(&value));
     let last_failure_class = last_failure_class.flatten().map(encode_failure_class);
     let last_failure_detail = last_failure_detail.flatten();
+    let circuit_breaker_json = circuit_breaker_state
+        .flatten()
+        .map(|state| serde_json::to_string(&state).context("serialize circuit breaker state"))
+        .transpose()?;
     let runtime_updated_at = timestamp_string(runtime_updated_at);
 
     tx.execute(
         "INSERT INTO bead_runtime(\
             bead_id, grove_status, declared_paths_json, metadata_json, last_run_id, retry_after,\
-            last_failure_class, last_failure_detail, runtime_updated_at\
+            last_failure_class, last_failure_detail, circuit_breaker_json, runtime_updated_at\
          ) VALUES (\
             ?1, ?2, COALESCE(?3, (SELECT declared_paths_json FROM bead_runtime WHERE bead_id = ?1), '[]'),\
-            COALESCE((SELECT metadata_json FROM bead_runtime WHERE bead_id = ?1), '{}'), ?4, ?5, ?6, ?7, ?8\
+            COALESCE((SELECT metadata_json FROM bead_runtime WHERE bead_id = ?1), '{}'), ?4, ?5, ?6, ?7,\
+            COALESCE(?8, (SELECT circuit_breaker_json FROM bead_runtime WHERE bead_id = ?1), NULL), ?9\
          ) \
          ON CONFLICT(bead_id) DO UPDATE SET \
             grove_status = COALESCE(excluded.grove_status, bead_runtime.grove_status),\
@@ -3141,6 +3167,7 @@ fn upsert_bead_runtime_tx(
             retry_after = excluded.retry_after,\
             last_failure_class = excluded.last_failure_class,\
             last_failure_detail = excluded.last_failure_detail,\
+            circuit_breaker_json = excluded.circuit_breaker_json,\
             runtime_updated_at = excluded.runtime_updated_at",
         params![
             bead_id.as_str(),
@@ -3150,6 +3177,7 @@ fn upsert_bead_runtime_tx(
             retry_after,
             last_failure_class,
             last_failure_detail,
+            circuit_breaker_json,
             runtime_updated_at,
         ],
     )
@@ -3511,9 +3539,10 @@ mod tests {
         BrIssueSummary, BrVersion, sync_bead_cache,
     };
     use grove_types::{
-        BeadId, BeadPriority, CheckpointId, CheckpointPayload, ClaudeSessionRecord, EventKind,
-        FailureClass, HandoffRecord, PromptId, RecoveryCapsuleOutcome, ReservationMode, RunId,
-        RunStatus, SessionId, SessionStatus, StopReason, Timestamp,
+        BeadId, BeadPriority, CheckpointId, CheckpointPayload, CircuitBreakerState,
+        ClaudeSessionRecord, EventKind, FailureClass, HandoffRecord, PromptId,
+        RecoveryCapsuleOutcome, ReservationMode, RunId, RunStatus, SessionId, SessionStatus,
+        StopReason, Timestamp,
     };
     use rusqlite::OptionalExtension;
     use serde_json::json;
@@ -3549,7 +3578,7 @@ mod tests {
         db.migrate()?;
 
         let migrations = db.applied_migrations()?;
-        assert_eq!(migrations.len(), 9);
+        assert_eq!(migrations.len(), 11);
         assert_eq!(
             migrations[0],
             MigrationState {
@@ -3611,6 +3640,20 @@ mod tests {
             MigrationState {
                 version: 9,
                 name: "0009_playbook.sql".into(),
+            }
+        );
+        assert_eq!(
+            migrations[9],
+            MigrationState {
+                version: 10,
+                name: "0010_activity_state.sql".into(),
+            }
+        );
+        assert_eq!(
+            migrations[10],
+            MigrationState {
+                version: 11,
+                name: "0011_circuit_breaker_state.sql".into(),
             }
         );
         Ok(())
@@ -3779,8 +3822,57 @@ mod tests {
         assert_eq!(record.grove_status, GroveBeadStatus::Idle);
         assert!(record.declared_paths.is_empty());
         assert_eq!(record.metadata, json!({}));
+        assert!(record.circuit_breaker_state.is_none());
         assert_eq!(record.bead.created_at, record.synced_at);
         assert_eq!(record.bead.updated_at, record.bead.created_at);
+        Ok(())
+    }
+
+    #[test]
+    fn bead_record_round_trips_circuit_breaker_state() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| anyhow::anyhow!("temp path was not valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        insert_bead_cache_row(&db, "grove-breaker", "Breaker bead")?;
+        let started_at: Timestamp = "2026-03-16T11:00:00Z".parse()?;
+        let ended_at: Timestamp = "2026-03-16T11:10:00Z".parse()?;
+        let run = db.record_run_started(RunStartInput {
+            run_id: RunId::new("run-breaker"),
+            bead_id: BeadId::new("grove-breaker"),
+            attempt_no: 1,
+            started_at,
+        })?;
+        assert_eq!(run.status, RunStatus::Active);
+
+        let breaker = CircuitBreakerState {
+            state: grove_types::CircuitState::Open,
+            no_progress_count: 3,
+            same_error_count: 0,
+            permission_denial_count: 0,
+            last_error_fingerprint: Some("same-error".to_owned()),
+            opened_at: Some(ended_at),
+        };
+
+        db.record_run_finished(
+            &BeadId::new("grove-breaker"),
+            RunFinishInput {
+                run_id: RunId::new("run-breaker"),
+                status: RunStatus::Failed,
+                failure_class: Some(FailureClass::NoProgress),
+                failure_detail: Some("stuck".to_owned()),
+                ended_at,
+                retry_after: None,
+                circuit_breaker_state: Some(breaker.clone()),
+            },
+        )?;
+
+        let bead = db
+            .get_bead_record(&BeadId::new("grove-breaker"))?
+            .expect("breaker bead should persist");
+        assert_eq!(bead.circuit_breaker_state, Some(breaker));
         Ok(())
     }
 
@@ -4096,6 +4188,7 @@ mod tests {
                 failure_detail: None,
                 ended_at: "2026-03-16T11:07:00Z".parse()?,
                 retry_after: None,
+                circuit_breaker_state: None,
             },
         )?;
         assert_eq!(finished_run.status, RunStatus::Checkpointed);

@@ -8,6 +8,7 @@
 
 use camino::Utf8PathBuf;
 use chrono::{DateTime, Utc};
+use grove_config::GroveConfig;
 use grove_db::Database;
 use grove_kernel::{
     DispatchExitReason, LeaderLeaseConfig, LeaderLeaseManager, ReservationManager, ShutdownSignal,
@@ -283,7 +284,7 @@ fn persisted_session_records_live_idle_transition_in_run_state_and_event_log() -
         ("EXIT_CODE".to_owned(), "0".to_owned()),
     ];
 
-    let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1)?;
+    let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1, &GroveConfig::default())?;
 
     assert_eq!(persisted.run.activity, Some(AgentActivity::Blocked));
 

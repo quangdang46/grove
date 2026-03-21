@@ -18,12 +18,12 @@ use grove_db::{
 };
 use grove_session::{
     ClaudeBackend, SessionLifecycleHooks, SingleTaskSessionRequest, SingleTaskSessionResult,
-    execute_single_task_session_with_hooks,
+    execute_single_task_session_with_hooks, update_circuit_breaker,
 };
 use grove_types::{
-    AgentActivity, BeadId, CheckpointId, CircuitState, FailureClass, GroveBeadRecord,
-    GroveBeadStatus, ReservationConflict, ReservationMode, ReservationRecord, RunId, RunStatus,
-    SessionStatus, Timestamp,
+    AgentActivity, BeadId, CheckpointId, CircuitBreakerState, CircuitState, FailureClass,
+    GroveBeadRecord, GroveBeadStatus, ReservationConflict, ReservationMode, ReservationRecord,
+    RunId, RunStatus, SessionStatus, Timestamp,
 };
 use std::{
     collections::BTreeMap,
@@ -71,6 +71,7 @@ pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
     backend: &B,
     request: SingleTaskSessionRequest,
     attempt_no: i32,
+    config: &GroveConfig,
 ) -> Result<PersistedTaskRunOutcome> {
     let bead_id = request.bead_id.clone();
     let run_id = request.run_id.clone();
@@ -100,7 +101,7 @@ pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
     match result {
         Ok(result) => {
             let checkpoint = hooks.take_checkpoint();
-            let run = finalize_persisted_run(hooks.db_mut(), &bead_id, &result.outcome, None)?;
+            let run = finalize_persisted_run(hooks.db_mut(), &bead_id, &result.outcome, None, config)?;
             let handoff = persist_success_handoff(hooks.db_mut(), &bead_id, &result.outcome)?;
             Ok(PersistedTaskRunOutcome {
                 run,
@@ -116,6 +117,7 @@ pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
                     &bead_id,
                     &outcome,
                     Some(error.to_string()),
+                    config,
                 );
             } else {
                 let _ = hooks.db_mut().record_run_finished(
@@ -127,6 +129,7 @@ pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
                         failure_detail: Some(error.to_string()),
                         ended_at: chrono::Utc::now(),
                         retry_after: None,
+                        circuit_breaker_state: None,
                     },
                 );
             }
@@ -347,6 +350,7 @@ fn finalize_persisted_run(
     bead_id: &BeadId,
     outcome: &grove_types::SessionOutcome,
     failure_detail_override: Option<String>,
+    config: &GroveConfig,
 ) -> Result<grove_types::TaskRunRecord> {
     let ended_at = outcome.session.ended_at.unwrap_or_else(chrono::Utc::now);
     let forced_kill = outcome.session.stop_reason == Some(grove_types::StopReason::Kill);
@@ -383,6 +387,19 @@ fn finalize_persisted_run(
             .stop_reason
             .map(|reason| format!("session ended with {:?}", reason))
     });
+    let prior_breaker = db
+        .get_bead_record(bead_id)?
+        .and_then(|record| record.circuit_breaker_state)
+        .unwrap_or_default();
+    let circuit_breaker_state = update_circuit_breaker(
+        prior_breaker,
+        &outcome.analysis,
+        ended_at,
+        config.circuit_breaker.no_progress_threshold,
+        config.circuit_breaker.same_error_threshold,
+        config.circuit_breaker.permission_denial_threshold,
+        config.circuit_breaker.cooldown_minutes,
+    );
 
     let run = db.record_run_finished(
         bead_id,
@@ -393,6 +410,7 @@ fn finalize_persisted_run(
             failure_detail: failure_detail.clone(),
             ended_at,
             retry_after,
+            circuit_breaker_state: Some(circuit_breaker_state),
         },
     )?;
 
@@ -973,6 +991,14 @@ pub fn is_non_executable_issue_type(issue_type: &str) -> bool {
     )
 }
 
+#[must_use]
+pub fn circuit_state_for_bead(bead: &GroveBeadRecord) -> CircuitState {
+    bead.circuit_breaker_state
+        .as_ref()
+        .map(|state| state.state)
+        .unwrap_or(CircuitState::Closed)
+}
+
 fn collect_local_suppressions(
     bead: &GroveBeadRecord,
     context: &DispatchEligibilityContext,
@@ -1033,7 +1059,7 @@ fn collect_local_suppressions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grove_types::{BeadId, BeadPriority, BeadRef, RunId, RunStatus};
+    use grove_types::{BeadId, BeadPriority, BeadRef, CircuitBreakerState, CircuitState, RunId, RunStatus};
     use std::error::Error;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1258,9 +1284,25 @@ mod tests {
             retry_after: retry_after.map(str::parse).transpose()?,
             last_failure_class: None,
             last_failure_detail: None,
+            circuit_breaker_state: None,
             synced_at: updated_at,
             runtime_updated_at: updated_at,
         })
+    }
+
+    #[test]
+    fn circuit_state_for_bead_uses_persisted_breaker_snapshot() -> TestResult {
+        let mut bead = sample_bead(GroveBeadStatus::Ready, "task", &[], None, None)?;
+        bead.circuit_breaker_state = Some(CircuitBreakerState {
+            state: CircuitState::Open,
+            no_progress_count: 3,
+            same_error_count: 0,
+            permission_denial_count: 0,
+            last_error_fingerprint: Some("same-error".to_owned()),
+            opened_at: Some("2026-03-16T12:00:00Z".parse()?),
+        });
+        assert_eq!(circuit_state_for_bead(&bead), CircuitState::Open);
+        Ok(())
     }
 
     fn suppression_codes(eligibility: &DispatchEligibility) -> Vec<&'static str> {
@@ -1568,7 +1610,7 @@ exit "${EXIT_CODE:-0}"
             ("EXIT_CODE".to_owned(), "0".to_owned()),
         ];
 
-        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1)?;
+        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1, &GroveConfig::default())?;
 
         assert_eq!(persisted.run.status, RunStatus::Succeeded);
         assert_eq!(persisted.session.session.status, SessionStatus::Completed);
@@ -1642,7 +1684,7 @@ exit "${EXIT_CODE:-0}"
             ("EXIT_CODE".to_owned(), "0".to_owned()),
         ];
 
-        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1)?;
+        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1, &GroveConfig::default())?;
 
         assert_eq!(persisted.run.status, RunStatus::Checkpointed);
         assert_eq!(
@@ -1720,8 +1762,14 @@ exit "${EXIT_CODE:-0}"
             ("EXIT_CODE".to_owned(), "0".to_owned()),
         ];
 
-        let error = execute_persisted_single_task_session(&mut db, &backend, request, 1)
-            .expect_err("checkpoint file write should fail");
+        let error = execute_persisted_single_task_session(
+            &mut db,
+            &backend,
+            request,
+            1,
+            &GroveConfig::default(),
+        )
+        .expect_err("checkpoint file write should fail");
         assert!(
             error
                 .to_string()
@@ -1794,7 +1842,7 @@ exit "${EXIT_CODE:-0}"
             ("EXIT_CODE".to_owned(), "1".to_owned()),
         ];
 
-        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1)?;
+        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1, &GroveConfig::default())?;
 
         assert_eq!(persisted.run.status, RunStatus::WaitingToRetry);
         assert_eq!(persisted.run.failure_class, Some(FailureClass::RateLimit));

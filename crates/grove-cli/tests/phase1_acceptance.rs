@@ -1026,6 +1026,7 @@ fn bv_augments_br_does_not_replace_authority() -> TestResult {
         retry_after: None,
         last_failure_class: None,
         last_failure_detail: None,
+        circuit_breaker_state: None,
         synced_at: bead.updated_at,
         runtime_updated_at: bead.updated_at,
     };
@@ -1080,6 +1081,7 @@ fn bv_unavailable_degrades_gracefully() -> TestResult {
         retry_after: None,
         last_failure_class: None,
         last_failure_detail: None,
+        circuit_breaker_state: None,
         synced_at: bead.updated_at,
         runtime_updated_at: bead.updated_at,
     };
@@ -1156,6 +1158,7 @@ fn sample_bead_record(
         retry_after: None,
         last_failure_class: None,
         last_failure_detail: None,
+        circuit_breaker_state: None,
         synced_at: now,
         runtime_updated_at: now,
     }
@@ -1187,6 +1190,7 @@ fn sample_bead_with_retry(
         retry_after,
         last_failure_class: None,
         last_failure_detail: None,
+        circuit_breaker_state: None,
         synced_at: now,
         runtime_updated_at: now,
     }

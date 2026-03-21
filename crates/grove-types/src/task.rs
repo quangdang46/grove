@@ -1,4 +1,4 @@
-use crate::{BeadId, BeadPriority, RunId, Timestamp};
+use crate::{BeadId, BeadPriority, CircuitBreakerState, RunId, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -37,6 +37,7 @@ pub struct GroveBeadRecord {
     pub retry_after: Option<Timestamp>,
     pub last_failure_class: Option<crate::FailureClass>,
     pub last_failure_detail: Option<String>,
+    pub circuit_breaker_state: Option<CircuitBreakerState>,
     pub synced_at: Timestamp,
     pub runtime_updated_at: Timestamp,
 }
@@ -50,6 +51,7 @@ pub struct BeadRuntimePatch {
     pub retry_after: Option<Option<Timestamp>>,
     pub last_failure_class: Option<Option<crate::FailureClass>>,
     pub last_failure_detail: Option<Option<String>>,
+    pub circuit_breaker_state: Option<Option<CircuitBreakerState>>,
 }
 
 impl GroveBeadRecord {

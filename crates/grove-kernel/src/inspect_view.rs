@@ -54,7 +54,7 @@ pub fn load_inspect_snapshot<C: BrClient>(
         &bead,
         &DispatchEligibilityContext {
             ready_in_br,
-            circuit_state: grove_types::CircuitState::Closed,
+            circuit_state: crate::circuit_state_for_bead(&bead),
             reservation_conflicts: bead_conflicts.clone(),
             now,
         },
@@ -1946,6 +1946,7 @@ mod tests {
             retry_after: None,
             last_failure_class: None,
             last_failure_detail: None,
+            circuit_breaker_state: None,
             synced_at: updated_at,
             runtime_updated_at: updated_at,
         })

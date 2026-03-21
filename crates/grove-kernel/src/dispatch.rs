@@ -11,8 +11,8 @@ use grove_session::{
     ClaudeBackend, ContextMonitor, ExitPolicy, SessionShutdownConfig, SingleTaskSessionRequest,
 };
 use grove_types::{
-    BeadId, CircuitState, CoordinatorStopReason, ExecutionContract, GroveBeadRecord,
-    GroveBeadStatus, PromptId, ReservationMode, RunId, SessionId, Timestamp,
+    BeadId, CoordinatorStopReason, ExecutionContract, GroveBeadRecord, GroveBeadStatus,
+    PromptId, ReservationMode, RunId, SessionId, Timestamp,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -206,19 +206,6 @@ fn consecutive_failures_from_history(
     streak.max(1)
 }
 
-fn inferred_circuit_state_reduced(
-    failure_class: Option<grove_types::FailureClass>,
-) -> grove_types::CircuitState {
-    if matches!(
-        failure_class,
-        Some(grove_types::FailureClass::NoProgress | grove_types::FailureClass::CircuitOpen)
-    ) {
-        grove_types::CircuitState::Open
-    } else {
-        grove_types::CircuitState::Closed
-    }
-}
-
 fn apply_reaction_side_effects(
     db: &mut Database,
     config: &GroveConfig,
@@ -260,6 +247,7 @@ fn apply_reaction_side_effects(
             )
         };
 
+    let bead_record = db.get_bead_record(&ctx.bead_id).ok().flatten();
     let run_history = db.list_task_runs_for_bead(&ctx.bead_id).ok();
     let existing_tier = run_history
         .as_ref()
@@ -281,7 +269,10 @@ fn apply_reaction_side_effects(
         failure_detail: failure_detail.clone(),
         escalation_tier: existing_tier,
         consecutive_failures,
-        circuit_state: inferred_circuit_state_reduced(failure_class),
+        circuit_state: bead_record
+            .as_ref()
+            .map(crate::circuit_state_for_bead)
+            .unwrap_or(grove_types::CircuitState::Closed),
         context_pressure_pct,
         mirror_failed,
     };
@@ -370,6 +361,9 @@ fn apply_reaction_side_effects(
                         failure_detail: failure_detail.clone(),
                         ended_at: now,
                         retry_after: Some(retry_after),
+                        circuit_breaker_state: bead_record
+                            .as_ref()
+                            .and_then(|record| record.circuit_breaker_state.clone()),
                     },
                 );
             }
@@ -427,7 +421,7 @@ fn select_best_candidate_excluding<'a>(
                         bead,
                         &DispatchEligibilityContext {
                             ready_in_br: ready_ids.contains(&bead.bead.id),
-                            circuit_state: CircuitState::Closed,
+                            circuit_state: crate::circuit_state_for_bead(bead),
                             reservation_conflicts: Vec::new(),
                             now,
                         },
@@ -603,6 +597,7 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
     lease_config: &LeaderLeaseConfig,
     loop_config: &DispatchLoopConfig,
 ) -> Result<DispatchLoopOutcome> {
+    let config = config.clone();
     let mut dispatched_count: u32 = 0;
     let mut poll_cycles: u32 = 0;
     let mut consecutive_empty_polls: u32 = 0;
@@ -623,7 +618,7 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
 
             match result {
                 Ok(outcome) => {
-                    apply_reaction_side_effects(db, config, &ctx, Some(&outcome), None, false);
+                    apply_reaction_side_effects(db, &config, &ctx, Some(&outcome), None, false);
                     if outcome.session.session.stop_reason == Some(grove_types::StopReason::Kill) {
                         let _ = db.write_event_log(
                             grove_types::EventKind::CoordinatorStopped,
@@ -677,7 +672,7 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                                     );
                                     apply_reaction_side_effects(
                                         db,
-                                        config,
+                                        &config,
                                         &ctx,
                                         Some(&outcome),
                                         Some(&error.to_string()),
@@ -689,7 +684,7 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                     }
                 }
                 Err(error) => {
-                    apply_reaction_side_effects(db, config, &ctx, None, Some(&error), false);
+                    apply_reaction_side_effects(db, &config, &ctx, None, Some(&error), false);
                     eprintln!(
                         "grove dispatch: {} failed: {error}",
                         ctx.bead_id.as_str()
@@ -763,7 +758,7 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
             }
         }
 
-        if let Err(error) = process_mirror_outbox(db, br, config) {
+        if let Err(error) = process_mirror_outbox(db, br, &config) {
             eprintln!("grove mirror: failed to process outbox: {error:#}");
         }
 
@@ -816,7 +811,7 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
         let mut launched_any = false;
 
         for _ in 0..available_slots {
-            let Some(bead) = select_best_candidate_excluding(&beads, &ready_ids, &excluded_ids, config, now) else {
+            let Some(bead) = select_best_candidate_excluding(&beads, &ready_ids, &excluded_ids, &config, now) else {
                 break;
             };
 
@@ -867,7 +862,7 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                 .unwrap_or_default();
             let mut request = build_session_request(
                 bead,
-                config,
+                &config,
                 &loop_config.working_dir,
                 &run_id,
                 &session_id,
@@ -953,6 +948,7 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
             let worker_backend = backend.clone();
             let worker_tx = completed_tx.clone();
             let worker_ctx_for_thread = worker_ctx.clone();
+            let worker_config = config.clone();
             let handle = std::thread::spawn(move || {
                 let result = (|| -> Result<PersistedTaskRunOutcome, String> {
                     let mut worker_db = Database::open(&worker_db_path)
@@ -963,6 +959,7 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                         &worker_backend,
                         request,
                         attempt_no,
+                        &worker_config,
                     )
                     .map_err(|error| error.to_string())
                 })();
@@ -990,7 +987,8 @@ mod tests {
     use grove_br::{BeadCacheStore, BrCapability, BrDependencySnapshot, BrError, BrIssueDetail, BrIssueSummary, BrVersion};
     use grove_session::CliClaudeBackend;
     use grove_types::{
-        BeadId, BeadPriority, BeadRef, GroveBeadRecord, GroveBeadStatus, Timestamp,
+        BeadId, BeadPriority, BeadRef, CircuitBreakerState, CircuitState, GroveBeadRecord,
+        GroveBeadStatus, Timestamp,
     };
     use std::collections::HashSet;
     use std::error::Error;
@@ -1025,6 +1023,7 @@ mod tests {
             retry_after: None,
             last_failure_class: None,
             last_failure_detail: None,
+            circuit_breaker_state: None,
             synced_at: updated_at,
             runtime_updated_at: updated_at,
         })
@@ -1388,6 +1387,44 @@ mod tests {
     }
 
     #[test]
+    fn circuit_state_for_bead_uses_persisted_breaker_snapshot() -> TestResult {
+        let bead = GroveBeadRecord {
+            bead: BeadRef {
+                id: BeadId::new("grove-breaker"),
+                title: "breaker bead".into(),
+                description: None,
+                priority: BeadPriority::P1,
+                issue_type: "task".into(),
+                br_status: "open".into(),
+                assignee: None,
+                labels: Vec::new(),
+                created_at: "2026-03-16T10:00:00Z".parse()?,
+                updated_at: "2026-03-16T11:00:00Z".parse()?,
+            },
+            grove_status: GroveBeadStatus::Failed,
+            declared_paths: Vec::new(),
+            metadata: Default::default(),
+            last_run_id: None,
+            retry_after: None,
+            last_failure_class: Some(grove_types::FailureClass::NoProgress),
+            last_failure_detail: Some("still stuck".into()),
+            circuit_breaker_state: Some(CircuitBreakerState {
+                state: CircuitState::Open,
+                no_progress_count: 3,
+                same_error_count: 0,
+                permission_denial_count: 0,
+                last_error_fingerprint: Some("same-error".into()),
+                opened_at: Some("2026-03-16T11:00:00Z".parse()?),
+            }),
+            synced_at: "2026-03-16T11:00:00Z".parse()?,
+            runtime_updated_at: "2026-03-16T11:00:00Z".parse()?,
+        };
+
+        assert_eq!(crate::circuit_state_for_bead(&bead), CircuitState::Open);
+        Ok(())
+    }
+
+    #[test]
     fn consecutive_failures_comes_from_durable_run_history() -> TestResult {
         let dir = tempdir()?;
         let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
@@ -1415,6 +1452,7 @@ mod tests {
                 failure_detail: Some("first failure".into()),
                 ended_at: chrono::Utc::now(),
                 retry_after: None,
+                circuit_breaker_state: None,
             },
         )?;
 
@@ -1434,6 +1472,7 @@ mod tests {
                 failure_detail: Some("second failure".into()),
                 ended_at: chrono::Utc::now(),
                 retry_after: None,
+                circuit_breaker_state: None,
             },
         )?;
 
@@ -1442,6 +1481,74 @@ mod tests {
             consecutive_failures_from_history(Some(&runs), &run2, grove_types::RunStatus::WaitingToRetry),
             2
         );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_reaction_side_effects_uses_persisted_open_circuit_state() -> TestResult {
+        let dir = tempdir()?;
+        let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let bead = bead_summary("grove-open-circuit", BeadPriority::P1)?;
+        db.upsert_bead_cache(&bead)?;
+        db.set_grove_status(&bead.id, GroveBeadStatus::Running)?;
+
+        let run_id = RunId::new("run-grove-open-circuit-1");
+        db.record_run_started(grove_db::RunStartInput {
+            bead_id: bead.id.clone(),
+            run_id: run_id.clone(),
+            attempt_no: 1,
+            started_at: chrono::Utc::now(),
+        })?;
+        db.record_run_finished(
+            &bead.id,
+            grove_db::RunFinishInput {
+                run_id: run_id.clone(),
+                status: grove_types::RunStatus::Failed,
+                failure_class: Some(grove_types::FailureClass::Unknown),
+                failure_detail: Some("stalled".into()),
+                ended_at: chrono::Utc::now(),
+                retry_after: None,
+                circuit_breaker_state: Some(CircuitBreakerState {
+                    state: CircuitState::Open,
+                    no_progress_count: 3,
+                    same_error_count: 0,
+                    permission_denial_count: 0,
+                    last_error_fingerprint: Some("same-error".into()),
+                    opened_at: Some("2026-03-16T12:00:00Z".parse()?),
+                }),
+            },
+        )?;
+
+        let config = GroveConfig {
+            reactions: grove_config::ReactionConfig {
+                rules: vec![grove_types::ReactionRule {
+                    trigger: grove_types::ReactionTrigger::CircuitOpen,
+                    action: grove_types::ReactionAction::ScheduleBackoff { base_secs: 30 },
+                    enabled: true,
+                    max_attempts: 1,
+                    escalate_to: None,
+                }],
+            },
+            ..GroveConfig::default()
+        };
+        let ctx = DispatchedWorkerContext {
+            bead_id: bead.id.clone(),
+            run_id: run_id.clone(),
+            session_id: SessionId::new("ses-grove-open-circuit-1"),
+        };
+
+        apply_reaction_side_effects(&mut db, &config, &ctx, None, Some("stalled"), false);
+
+        let event_logs = db.list_event_logs_for_bead(&bead.id)?;
+        let reaction_count = event_logs
+            .iter()
+            .filter(|event| event.kind == grove_types::EventKind::ReactionInvoked)
+            .count();
+        assert_eq!(reaction_count, 1);
         Ok(())
     }
 

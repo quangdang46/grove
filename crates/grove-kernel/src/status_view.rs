@@ -510,7 +510,7 @@ fn build_ready_queue(
                 bead,
                 &DispatchEligibilityContext {
                     ready_in_br: ready_ids.contains(&bead.bead.id),
-                    circuit_state: grove_types::CircuitState::Closed,
+                    circuit_state: crate::circuit_state_for_bead(bead),
                     reservation_conflicts: conflicts.clone(),
                     now,
                 },
@@ -687,7 +687,7 @@ fn build_failed_beads(
             bead,
             &DispatchEligibilityContext {
                 ready_in_br: ready_ids.contains(&bead.bead.id),
-                circuit_state: grove_types::CircuitState::Closed,
+                circuit_state: crate::circuit_state_for_bead(bead),
                 reservation_conflicts: conflicts,
                 now,
             },
@@ -1073,8 +1073,8 @@ mod tests {
         BvTriageMeta, BvTriageOutput, BvVelocitySummary,
     };
     use grove_types::{
-        BeadRef, CircuitState, HandoffRecord, MirrorStatus, RecoveryCapsule,
-        RecoveryCapsuleOutcome, RunId, Timestamp,
+        BeadRef, CircuitBreakerState, CircuitState, HandoffRecord, MirrorStatus,
+        RecoveryCapsule, RecoveryCapsuleOutcome, RunId, Timestamp,
     };
     use std::collections::{HashMap, HashSet};
     use std::error::Error;
@@ -1138,6 +1138,35 @@ mod tests {
         assert_eq!(grove_counts[0].status, "Ready");
         assert_eq!(grove_counts[1].status, "Running");
         assert_eq!(grove_counts[2].status, "Succeeded");
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_explanation_uses_persisted_open_circuit_state() -> TestResult {
+        let mut bead = sample_bead("grove-circuit", "open", GroveBeadStatus::Ready)?;
+        bead.circuit_breaker_state = Some(CircuitBreakerState {
+            state: CircuitState::Open,
+            no_progress_count: 3,
+            same_error_count: 0,
+            permission_denial_count: 0,
+            last_error_fingerprint: Some("same-error".to_owned()),
+            opened_at: Some(parse_ts("2026-03-16T12:00:00Z")?),
+        });
+        let eligibility = crate::evaluate_dispatch_eligibility(
+            &bead,
+            &crate::DispatchEligibilityContext {
+                ready_in_br: true,
+                circuit_state: crate::circuit_state_for_bead(&bead),
+                reservation_conflicts: Vec::new(),
+                now: parse_ts("2026-03-16T12:00:00Z")?,
+            },
+        );
+
+        let view = DispatchExplanationView::from_eligibility(&eligibility);
+
+        assert!(!view.dispatchable_in_grove);
+        assert_eq!(view.summary(), "circuit breaker is open");
+        assert_eq!(view.local_suppression_reasons[0].code, "circuit_open");
         Ok(())
     }
 
@@ -1504,6 +1533,7 @@ mod tests {
             retry_after: None,
             last_failure_class: None,
             last_failure_detail: None,
+            circuit_breaker_state: None,
             synced_at: parse_ts("2026-03-16T12:05:00Z")?,
             runtime_updated_at: parse_ts("2026-03-16T12:05:00Z")?,
         };
@@ -1687,6 +1717,7 @@ mod tests {
             retry_after,
             last_failure_class: None,
             last_failure_detail: None,
+            circuit_breaker_state: None,
             synced_at: updated_at,
             runtime_updated_at: updated_at,
         })
