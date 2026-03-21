@@ -385,6 +385,7 @@ name = "grove-config"
 version = "0.1.0"
 dependencies = [
  "camino",
+ "grove-types",
  "serde",
  "tempfile",
  "thiserror",

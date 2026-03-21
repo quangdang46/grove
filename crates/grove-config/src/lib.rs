@@ -15,7 +15,7 @@ pub use loader::{
 };
 pub use model::{
     CheckpointConfig, CircuitBreakerConfig, ExitPolicyConfig, GroveConfig, LoggingConfig,
-    MemoryConfig, ReservationConfig, RuntimeConfig, SafetyConfig, SchedulerConfig,
+    MemoryConfig, ReactionConfig, ReservationConfig, RuntimeConfig, SafetyConfig, SchedulerConfig,
 };
 pub use paths::GrovePaths;
 pub use validate::validate_config;
@@ -46,6 +46,7 @@ pub const CRATE_PURPOSE: &str = "Configuration loading, validation, and path own
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+    use grove_types::{ReactionAction, ReactionTrigger};
     use std::{collections::HashMap, error::Error, fs, io::Error as IoError};
     use tempfile::tempdir;
 
@@ -70,6 +71,42 @@ mod tests {
         )?;
         assert_eq!(loaded.config.scheduler.shutdown_grace_period_ms, 2500);
         Ok(())
+    }
+
+    #[test]
+    fn env_override_sets_reaction_rules() -> TestResult {
+        let loaded = load_with_text(
+            "",
+            &HashMap::from([(
+                String::from("GROVE_REACTIONS__RULES"),
+                String::from(r#"[{ trigger = "MirrorFailed", action = "EnqueueMirrorRetry", enabled = true, max_attempts = 7 }]"#),
+            )]),
+        )?;
+        assert_eq!(loaded.config.reactions.rules.len(), 1);
+        assert!(matches!(
+            loaded.config.reactions.rules[0].trigger,
+            ReactionTrigger::MirrorFailed
+        ));
+        assert!(matches!(
+            loaded.config.reactions.rules[0].action,
+            ReactionAction::EnqueueMirrorRetry
+        ));
+        assert_eq!(loaded.config.reactions.rules[0].max_attempts, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn env_override_rejects_invalid_reaction_rules() {
+        let err = load_with_text(
+            "",
+            &HashMap::from([(
+                String::from("GROVE_REACTIONS__RULES"),
+                String::from(r#"[{ trigger = "NoProgress", action = { RetryWithMutation = { strategy = "NotARealStrategy" } }, enabled = true, max_attempts = 1 }]"#),
+            )]),
+        )
+        .err()
+        .expect("expected validation error");
+        assert!(matches!(err, ConfigError::Validation { field, .. } if field == "GROVE_REACTIONS__RULES"));
     }
 
     #[test]
@@ -158,6 +195,7 @@ persist_jsonl = false
         assert_eq!(loaded.config.scheduler.shutdown_grace_period_ms, 1500);
         assert_eq!(loaded.config.checkpoint.max_context_bytes, 32000);
         assert_eq!(loaded.config.memory.transcript_dir, ".grove/tlog");
+        assert_eq!(loaded.config.reactions.rules.len(), 6);
         assert_eq!(loaded.config.logging.level, "debug");
         Ok(())
     }

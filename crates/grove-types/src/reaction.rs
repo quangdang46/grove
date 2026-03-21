@@ -107,7 +107,7 @@ pub struct ReactionContextSnapshot {
 }
 
 /// A rule that maps a trigger to an autonomous action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReactionRule {
     /// The trigger that invokes this reaction.
     pub trigger: ReactionTrigger,

@@ -1,4 +1,5 @@
 use crate::defaults::{DEFAULT_DB_PATH, DEFAULT_TRANSCRIPT_DIR};
+use grove_types::{ReactionRule, default_reactions};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -11,6 +12,7 @@ pub struct GroveConfig {
     pub circuit_breaker: CircuitBreakerConfig,
     pub memory: MemoryConfig,
     pub reservations: ReservationConfig,
+    pub reactions: ReactionConfig,
     pub safety: SafetyConfig,
     pub logging: LoggingConfig,
 }
@@ -163,6 +165,20 @@ impl Default for ReservationConfig {
         Self {
             enabled: true,
             default_ttl_minutes: 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReactionConfig {
+    pub rules: Vec<ReactionRule>,
+}
+
+impl Default for ReactionConfig {
+    fn default() -> Self {
+        Self {
+            rules: default_reactions(),
         }
     }
 }

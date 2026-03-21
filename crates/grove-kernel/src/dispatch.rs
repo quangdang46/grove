@@ -162,54 +162,137 @@ struct InFlightWorker {
     handle: JoinHandle<()>,
 }
 
+fn consecutive_failures_from_history(
+    run_history: Option<&[grove_types::TaskRunRecord]>,
+    current_run_id: &RunId,
+    current_status: grove_types::RunStatus,
+) -> u32 {
+    if !matches!(
+        current_status,
+        grove_types::RunStatus::Failed | grove_types::RunStatus::WaitingToRetry
+    ) {
+        return 0;
+    }
+
+    let Some(run_history) = run_history else {
+        return 1;
+    };
+
+    let Some(current_attempt_no) = run_history
+        .iter()
+        .find(|run| run.id == *current_run_id)
+        .map(|run| run.attempt_no)
+    else {
+        return 1;
+    };
+
+    let mut attempts: Vec<_> = run_history.iter().collect();
+    attempts.sort_by_key(|run| run.attempt_no);
+
+    let mut streak = 0;
+    for run in attempts.into_iter().rev() {
+        if run.attempt_no > current_attempt_no {
+            continue;
+        }
+        if !matches!(
+            run.status,
+            grove_types::RunStatus::Failed | grove_types::RunStatus::WaitingToRetry
+        ) {
+            break;
+        }
+        streak += 1;
+    }
+
+    streak.max(1)
+}
+
+fn inferred_circuit_state_reduced(
+    failure_class: Option<grove_types::FailureClass>,
+) -> grove_types::CircuitState {
+    if matches!(
+        failure_class,
+        Some(grove_types::FailureClass::NoProgress | grove_types::FailureClass::CircuitOpen)
+    ) {
+        grove_types::CircuitState::Open
+    } else {
+        grove_types::CircuitState::Closed
+    }
+}
+
 fn apply_reaction_side_effects(
     db: &mut Database,
     config: &GroveConfig,
     ctx: &DispatchedWorkerContext,
     outcome: Option<&PersistedTaskRunOutcome>,
     error_detail: Option<&str>,
+    mirror_failed: bool,
 ) {
-    let Some(run) = outcome.map(|outcome| &outcome.run) else {
-        return;
-    };
+    let (run_status, failure_class, failure_detail, escalation_tier, context_pressure_pct, inferred_activity) =
+        if let Some(outcome) = outcome {
+            let run = &outcome.run;
+            let failure_detail = run.failure_detail.clone().or_else(|| error_detail.map(str::to_owned));
+            (
+                run.status,
+                run.failure_class,
+                failure_detail,
+                run.escalation_tier,
+                outcome.session.context_pressure_pct,
+                crate::reactions::infer_agent_activity(&outcome.session, run.status),
+            )
+        } else {
+            let failure_class = if mirror_failed {
+                Some(grove_types::FailureClass::BrMirrorFailed)
+            } else {
+                Some(grove_types::FailureClass::Unknown)
+            };
+            let run_status = grove_types::RunStatus::Failed;
+            (
+                run_status,
+                failure_class,
+                error_detail.map(str::to_owned),
+                grove_types::EscalationTier::FirstAttempt,
+                None,
+                match failure_class {
+                    Some(grove_types::FailureClass::PermissionDenied) => grove_types::AgentActivity::Blocked,
+                    Some(grove_types::FailureClass::NoProgress) => grove_types::AgentActivity::Idle,
+                    _ => grove_types::AgentActivity::Exited,
+                },
+            )
+        };
 
-    let inferred_activity = outcome
-        .map(|outcome| crate::reactions::infer_agent_activity(&outcome.session, run.status))
-        .unwrap_or_else(|| match run.failure_class {
-            Some(grove_types::FailureClass::PermissionDenied) => grove_types::AgentActivity::Blocked,
-            Some(grove_types::FailureClass::Interrupted | grove_types::FailureClass::ClaudeCrashed) => grove_types::AgentActivity::Exited,
-            Some(grove_types::FailureClass::NoProgress) => grove_types::AgentActivity::Idle,
-            _ if matches!(run.status, grove_types::RunStatus::Succeeded | grove_types::RunStatus::Checkpointed) => grove_types::AgentActivity::Ready,
-            _ => grove_types::AgentActivity::Exited,
-        });
+    let run_history = db.list_task_runs_for_bead(&ctx.bead_id).ok();
+    let existing_tier = run_history
+        .as_ref()
+        .and_then(|runs| runs.iter().find(|run| run.id == ctx.run_id))
+        .map(|run| run.escalation_tier)
+        .unwrap_or(escalation_tier);
+    let consecutive_failures = consecutive_failures_from_history(
+        run_history.as_deref(),
+        &ctx.run_id,
+        run_status,
+    );
 
     let trigger_ctx = crate::reactions::TriggerContext {
         bead_id: ctx.bead_id.clone(),
         run_id: ctx.run_id.clone(),
-        run_status: run.status,
+        run_status,
         activity: inferred_activity,
-        failure_class: run.failure_class,
-        failure_detail: run.failure_detail.clone().or_else(|| error_detail.map(str::to_owned)),
-        escalation_tier: run.escalation_tier,
-        consecutive_failures: if matches!(run.status, grove_types::RunStatus::Failed | grove_types::RunStatus::WaitingToRetry) {
-            3
-        } else {
-            0
-        },
-        circuit_state: if run.failure_class == Some(grove_types::FailureClass::NoProgress) {
-            grove_types::CircuitState::Open
-        } else {
-            grove_types::CircuitState::Closed
-        },
-        context_pressure_pct: outcome.and_then(|outcome| outcome.session.context_pressure_pct),
+        failure_class,
+        failure_detail: failure_detail.clone(),
+        escalation_tier: existing_tier,
+        consecutive_failures,
+        circuit_state: inferred_circuit_state_reduced(failure_class),
+        context_pressure_pct,
+        mirror_failed,
     };
 
     let rules = crate::reactions::load_reaction_rules(config);
     let reaction_eval = crate::reactions::evaluate_reactions(db, &trigger_ctx, &rules);
+    let now = chrono::Utc::now();
 
-    let _ = db.update_run_activity(&ctx.bead_id, &ctx.run_id, inferred_activity, &chrono::Utc::now());
-    if reaction_eval.new_tier != run.escalation_tier {
-        let _ = db.update_run_escalation_tier(&ctx.bead_id, &ctx.run_id, reaction_eval.new_tier, &chrono::Utc::now());
+    let _ = db.update_run_activity(&ctx.bead_id, &ctx.run_id, inferred_activity, &now);
+    if reaction_eval.new_tier != existing_tier {
+        let _ = db.update_run_escalation_tier(&ctx.bead_id, &ctx.run_id, reaction_eval.new_tier, &now);
     }
 
     for record in reaction_eval.records {
@@ -217,24 +300,24 @@ fn apply_reaction_side_effects(
             grove_types::EventKind::ReactionInvoked,
             Some(&ctx.bead_id),
             Some(&ctx.run_id),
-            Some(&ctx.session_id),
+            outcome.map(|_| &ctx.session_id),
             &serde_json::to_value(&record).unwrap_or_else(|_| serde_json::json!({})),
-            &chrono::Utc::now(),
+            &now,
         );
 
-        if let grove_types::ReactionAction::RetryWithMutation { .. } = record.action {
-            if let Some(session_outcome) = outcome.map(|outcome| &outcome.session) {
+        match &record.action {
+            grove_types::ReactionAction::RetryWithMutation { .. } => {
                 let plan = grove_session::plan_retry_mutation(
-                    run.failure_class.unwrap_or(grove_types::FailureClass::Unknown),
-                    Some(session_outcome),
+                    failure_class.unwrap_or(grove_types::FailureClass::Unknown),
+                    outcome.map(|outcome| &outcome.session),
                 );
                 let _ = db.write_recovery_capsule(grove_db::RecoveryCapsuleWriteInput {
                     bead_id: ctx.bead_id.clone(),
                     run_id: ctx.run_id.clone(),
                     capsule: grove_types::RecoveryCapsule::from_parts(
                         grove_types::RecoveryCapsuleOutcome::Failed,
-                        run.failure_class,
-                        run.failure_detail.as_deref(),
+                        failure_class,
+                        failure_detail.as_deref(),
                         None,
                         None,
                         Some(plan.next_contract.as_str()),
@@ -254,9 +337,46 @@ fn apply_reaction_side_effects(
                         checkpoint_next_step: None,
                         artifacts: Vec::new(),
                     }),
-                    created_at: chrono::Utc::now(),
+                    created_at: now,
                 });
             }
+            grove_types::ReactionAction::CreateRecoveryCapsule { outcome: capsule_outcome } => {
+                if let Some(capsule) = grove_types::RecoveryCapsule::from_parts(
+                    *capsule_outcome,
+                    failure_class,
+                    failure_detail.as_deref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    &[],
+                ) {
+                    let _ = db.write_recovery_capsule(grove_db::RecoveryCapsuleWriteInput {
+                        bead_id: ctx.bead_id.clone(),
+                        run_id: ctx.run_id.clone(),
+                        capsule,
+                        created_at: now,
+                    });
+                }
+            }
+            grove_types::ReactionAction::ScheduleBackoff { base_secs } => {
+                let retry_after = now + chrono::Duration::seconds(*base_secs as i64);
+                let _ = db.record_run_finished(
+                    &ctx.bead_id,
+                    grove_db::RunFinishInput {
+                        run_id: ctx.run_id.clone(),
+                        status: grove_types::RunStatus::WaitingToRetry,
+                        failure_class,
+                        failure_detail: failure_detail.clone(),
+                        ended_at: now,
+                        retry_after: Some(retry_after),
+                    },
+                );
+            }
+            grove_types::ReactionAction::ForceCheckpoint
+            | grove_types::ReactionAction::EnqueueMirrorRetry
+            | grove_types::ReactionAction::InjectRescue { .. }
+            | grove_types::ReactionAction::GiveUp => {}
         }
     }
 }
@@ -394,7 +514,7 @@ fn build_session_request(
 }
 
 /// Process unresolved mirror outbox entries, attempting to sync them to br.
-pub fn process_mirror_outbox<C: BrClient>(db: &mut Database, br: &C) -> Result<()> {
+pub fn process_mirror_outbox<C: BrClient>(db: &mut Database, br: &C, config: &GroveConfig) -> Result<()> {
     // Attempt up to 5 at a time to avoid stalling the dispatch loop indefinitely.
     let pending = db.list_pending_mirror_operations(5)
         .context("list pending mirror operations")?;
@@ -413,7 +533,7 @@ pub fn process_mirror_outbox<C: BrClient>(db: &mut Database, br: &C) -> Result<(
                 );
             }
             Err(error) => {
-                let attempt = record.attempt_count + 1;
+                let attempt = (record.attempt_count + 1) as u32;
                 // Backoff: 1m, 2m, 4m, 8m... up to 60m max.
                 let backoff_mins = (1i64 << (attempt.min(6) - 1)).min(60);
                 let next_retry = chrono::Utc::now() + chrono::Duration::minutes(backoff_mins);
@@ -425,7 +545,36 @@ pub fn process_mirror_outbox<C: BrClient>(db: &mut Database, br: &C) -> Result<(
                     &error_msg,
                     Some(&next_retry),
                 ).context("record mirror failure")?;
-                
+
+                let trigger_ctx = crate::reactions::TriggerContext {
+                    bead_id: record.bead_id.clone(),
+                    run_id: record.run_id.clone(),
+                    run_status: grove_types::RunStatus::Failed,
+                    activity: grove_types::AgentActivity::Blocked,
+                    failure_class: Some(grove_types::FailureClass::BrMirrorFailed),
+                    failure_detail: Some(error_msg.clone()),
+                    escalation_tier: grove_types::EscalationTier::SecondAttempt,
+                    consecutive_failures: attempt,
+                    circuit_state: grove_types::CircuitState::Closed,
+                    context_pressure_pct: None,
+                    mirror_failed: true,
+                };
+                let reaction_eval = crate::reactions::evaluate_reactions(
+                    db,
+                    &trigger_ctx,
+                    &crate::reactions::load_reaction_rules(config),
+                );
+                for record in reaction_eval.records {
+                    let _ = db.write_event_log(
+                        grove_types::EventKind::ReactionInvoked,
+                        Some(&trigger_ctx.bead_id),
+                        Some(&trigger_ctx.run_id),
+                        None,
+                        &serde_json::to_value(&record).unwrap_or_else(|_| serde_json::json!({})),
+                        &chrono::Utc::now(),
+                    );
+                }
+
                 eprintln!(
                     "grove mirror: failed to sync outbox entry for {} (attempt {}): {} (will retry after {})",
                     record.bead_id.as_str(),
@@ -474,7 +623,7 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
 
             match result {
                 Ok(outcome) => {
-                    apply_reaction_side_effects(db, config, &ctx, Some(&outcome), None);
+                    apply_reaction_side_effects(db, config, &ctx, Some(&outcome), None, false);
                     if outcome.session.session.stop_reason == Some(grove_types::StopReason::Kill) {
                         let _ = db.write_event_log(
                             grove_types::EventKind::CoordinatorStopped,
@@ -526,13 +675,21 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                                         handoff,
                                         true,
                                     );
+                                    apply_reaction_side_effects(
+                                        db,
+                                        config,
+                                        &ctx,
+                                        Some(&outcome),
+                                        Some(&error.to_string()),
+                                        true,
+                                    );
                                 }
                             }
                         }
                     }
                 }
                 Err(error) => {
-                    apply_reaction_side_effects(db, config, &ctx, None, Some(&error));
+                    apply_reaction_side_effects(db, config, &ctx, None, Some(&error), false);
                     eprintln!(
                         "grove dispatch: {} failed: {error}",
                         ctx.bead_id.as_str()
@@ -606,7 +763,7 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
             }
         }
 
-        if let Err(error) = process_mirror_outbox(db, br) {
+        if let Err(error) = process_mirror_outbox(db, br, config) {
             eprintln!("grove mirror: failed to process outbox: {error:#}");
         }
 
@@ -837,6 +994,7 @@ mod tests {
     };
     use std::collections::HashSet;
     use std::error::Error;
+    use tempfile::tempdir;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -896,6 +1054,7 @@ mod tests {
     struct TestBrClient {
         ready: Vec<BrIssueSummary>,
         open: Vec<BrIssueSummary>,
+        fail_mirror: bool,
     }
 
     impl BrClient for TestBrClient {
@@ -956,11 +1115,20 @@ mod tests {
 
         fn mirror_handoff(
             &self,
-            _id: &BeadId,
+            id: &BeadId,
             _handoff: &grove_types::HandoffRecord,
             _close_bead: bool,
         ) -> Result<(), BrError> {
-            Ok(())
+            if self.fail_mirror {
+                Err(BrError::CommandFailed {
+                    command: "mirror_handoff".to_owned(),
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr: format!("failed to mirror {}", id.as_str()),
+                })
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1094,6 +1262,7 @@ mod tests {
                 bead_summary("grove-a", BeadPriority::P0)?,
                 bead_summary("grove-b", BeadPriority::P1)?,
             ],
+            fail_mirror: false,
         };
         let mut config = GroveConfig::default();
         config.scheduler.max_parallel = 2;
@@ -1164,6 +1333,199 @@ mod tests {
         assert!(
             (score_ready - score_retrying - f64::from(config.scheduler.retry_penalty)).abs() < 0.01
         );
+        Ok(())
+    }
+
+    #[test]
+    fn process_mirror_outbox_logs_reaction_for_mirror_failure() -> TestResult {
+        let dir = tempdir()?;
+        let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let bead = bead_summary("grove-mirror", BeadPriority::P1)?;
+        db.upsert_bead_cache(&bead)?;
+        db.set_grove_status(&bead.id, GroveBeadStatus::Succeeded)?;
+
+        let run_id = RunId::new("run-grove-mirror-1");
+        db.record_run_started(grove_db::RunStartInput {
+            bead_id: bead.id.clone(),
+            run_id: run_id.clone(),
+            attempt_no: 1,
+            started_at: chrono::Utc::now(),
+        })?;
+
+        let handoff = grove_types::HandoffRecord {
+            bead_id: bead.id.clone(),
+            run_id: run_id.clone(),
+            summary: "mirror me".into(),
+            artifacts: Vec::new(),
+            lessons: Vec::new(),
+            decisions: Vec::new(),
+            warnings: Vec::new(),
+            completed_at: chrono::Utc::now(),
+        };
+        db.enqueue_mirror_outbox(&bead.id, &run_id, &handoff, true)?;
+
+        let br = TestBrClient {
+            ready: Vec::new(),
+            open: vec![bead],
+            fail_mirror: true,
+        };
+        let config = GroveConfig::default();
+        process_mirror_outbox(&mut db, &br, &config)?;
+
+        let event_logs = db.list_event_logs_for_bead(&BeadId::new("grove-mirror"))?;
+        let reaction = event_logs
+            .iter()
+            .find(|event| event.kind == grove_types::EventKind::ReactionInvoked)
+            .ok_or_else(|| std::io::Error::other("expected reaction event"))?;
+        let payload = reaction.payload.to_string();
+        assert!(payload.contains("MirrorFailed"));
+        assert!(payload.contains("EnqueueMirrorRetry"));
+        Ok(())
+    }
+
+    #[test]
+    fn consecutive_failures_comes_from_durable_run_history() -> TestResult {
+        let dir = tempdir()?;
+        let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let bead = bead_summary("grove-streak", BeadPriority::P1)?;
+        db.upsert_bead_cache(&bead)?;
+        db.set_grove_status(&bead.id, GroveBeadStatus::Running)?;
+
+        let run1 = RunId::new("run-grove-streak-1");
+        db.record_run_started(grove_db::RunStartInput {
+            bead_id: bead.id.clone(),
+            run_id: run1.clone(),
+            attempt_no: 1,
+            started_at: chrono::Utc::now(),
+        })?;
+        db.record_run_finished(
+            &bead.id,
+            grove_db::RunFinishInput {
+                run_id: run1,
+                status: grove_types::RunStatus::WaitingToRetry,
+                failure_class: Some(grove_types::FailureClass::NoProgress),
+                failure_detail: Some("first failure".into()),
+                ended_at: chrono::Utc::now(),
+                retry_after: None,
+            },
+        )?;
+
+        let run2 = RunId::new("run-grove-streak-2");
+        db.record_run_started(grove_db::RunStartInput {
+            bead_id: bead.id.clone(),
+            run_id: run2.clone(),
+            attempt_no: 2,
+            started_at: chrono::Utc::now(),
+        })?;
+        db.record_run_finished(
+            &bead.id,
+            grove_db::RunFinishInput {
+                run_id: run2.clone(),
+                status: grove_types::RunStatus::WaitingToRetry,
+                failure_class: Some(grove_types::FailureClass::NoProgress),
+                failure_detail: Some("second failure".into()),
+                ended_at: chrono::Utc::now(),
+                retry_after: None,
+            },
+        )?;
+
+        let runs = db.list_task_runs_for_bead(&bead.id)?;
+        assert_eq!(
+            consecutive_failures_from_history(Some(&runs), &run2, grove_types::RunStatus::WaitingToRetry),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_reaction_side_effects_records_backoff_and_capsule_without_outcome() -> TestResult {
+        let dir = tempdir()?;
+        let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let bead = bead_summary("grove-error-path", BeadPriority::P1)?;
+        db.upsert_bead_cache(&bead)?;
+        db.set_grove_status(&bead.id, GroveBeadStatus::Running)?;
+
+        let run_id = RunId::new("run-grove-error-path-1");
+        db.record_run_started(grove_db::RunStartInput {
+            bead_id: bead.id.clone(),
+            run_id: run_id.clone(),
+            attempt_no: 1,
+            started_at: chrono::Utc::now(),
+        })?;
+
+        let config = GroveConfig {
+            reactions: grove_config::ReactionConfig {
+                rules: vec![
+                    grove_types::ReactionRule {
+                        trigger: grove_types::ReactionTrigger::MirrorFailed,
+                        action: grove_types::ReactionAction::ScheduleBackoff { base_secs: 30 },
+                        enabled: true,
+                        max_attempts: 1,
+                        escalate_to: None,
+                    },
+                    grove_types::ReactionRule {
+                        trigger: grove_types::ReactionTrigger::MirrorFailed,
+                        action: grove_types::ReactionAction::CreateRecoveryCapsule {
+                            outcome: grove_types::RecoveryCapsuleOutcome::Failed,
+                        },
+                        enabled: true,
+                        max_attempts: 1,
+                        escalate_to: None,
+                    },
+                ],
+            },
+            ..GroveConfig::default()
+        };
+
+        let ctx = DispatchedWorkerContext {
+            bead_id: bead.id.clone(),
+            run_id: run_id.clone(),
+            session_id: SessionId::new("ses-grove-error-path-1"),
+        };
+        apply_reaction_side_effects(
+            &mut db,
+            &config,
+            &ctx,
+            None,
+            Some("mirror sync failed"),
+            true,
+        );
+
+        let runs = db.list_task_runs_for_bead(&bead.id)?;
+        let run = runs
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .ok_or_else(|| std::io::Error::other("expected task run"))?;
+        assert_eq!(run.status, grove_types::RunStatus::WaitingToRetry);
+
+        let event_logs = db.list_event_logs_for_bead(&bead.id)?;
+        let reaction_count = event_logs
+            .iter()
+            .filter(|event| event.kind == grove_types::EventKind::ReactionInvoked)
+            .count();
+        assert_eq!(reaction_count, 2);
+
+        let capsule = db
+            .latest_recovery_capsule_for_bead(&bead.id)?
+            .ok_or_else(|| std::io::Error::other("expected recovery capsule"))?;
+        assert_eq!(capsule.capsule.outcome, grove_types::RecoveryCapsuleOutcome::Failed);
+        assert!(capsule
+            .capsule
+            .strongest_evidence
+            .iter()
+            .any(|entry| entry.contains("mirror sync failed")));
         Ok(())
     }
 }

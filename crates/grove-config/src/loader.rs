@@ -148,6 +148,9 @@ pub fn apply_env_overrides(
             "GROVE_RESERVATIONS__DEFAULT_TTL_MINUTES" => {
                 config.reservations.default_ttl_minutes = parse_env(key, value)?
             }
+            "GROVE_REACTIONS__RULES" => {
+                config.reactions.rules = parse_reaction_rules(key, value)?
+            }
             "GROVE_SAFETY__SCAN_TRANSCRIPTS" => {
                 config.safety.scan_transcripts = parse_env(key, value)?
             }
@@ -267,4 +270,18 @@ fn parse_csv(value: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn parse_reaction_rules(field: &str, value: &str) -> Result<Vec<grove_types::ReactionRule>, ConfigError> {
+    #[derive(serde::Deserialize)]
+    struct ReactionRulesEnvelope {
+        rules: Vec<grove_types::ReactionRule>,
+    }
+
+    toml::from_str::<ReactionRulesEnvelope>(&format!("rules = {value}"))
+        .map(|envelope| envelope.rules)
+        .map_err(|source| ConfigError::Validation {
+            field: field.to_owned(),
+            message: source.to_string(),
+        })
 }

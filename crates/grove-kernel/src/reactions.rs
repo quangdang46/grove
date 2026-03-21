@@ -9,7 +9,7 @@ use grove_types::{
     AgentActivity, BeadId, EscalationTier, FailureClass, RunId, RunStatus, SessionOutcome,
     reaction::{
         ReactionAction, ReactionContextSnapshot, ReactionOutcome, ReactionRecord, ReactionRule,
-        ReactionTrigger, default_reactions,
+        ReactionTrigger,
     },
 };
 
@@ -26,6 +26,7 @@ pub struct TriggerContext {
     pub consecutive_failures: u32,
     pub circuit_state: grove_types::CircuitState,
     pub context_pressure_pct: Option<f32>,
+    pub mirror_failed: bool,
 }
 
 #[must_use]
@@ -61,7 +62,7 @@ pub struct ReactionEvalResult {
 ///
 /// Returns a list of reaction records for logging and the updated escalation tier.
 pub fn evaluate_reactions(
-    _db: &mut Database,
+    db: &mut Database,
     ctx: &TriggerContext,
     rules: &[ReactionRule],
 ) -> ReactionEvalResult {
@@ -74,6 +75,10 @@ pub fn evaluate_reactions(
         }
 
         if !trigger_matches(&rule.trigger, ctx) {
+            continue;
+        }
+
+        if prior_attempt_count(db, ctx, &rule.trigger) >= rule.max_attempts {
             continue;
         }
 
@@ -135,6 +140,7 @@ fn trigger_matches(trigger: &ReactionTrigger, ctx: &TriggerContext) -> bool {
     match trigger {
         ReactionTrigger::CircuitOpen => {
             ctx.circuit_state == grove_types::CircuitState::Open
+                || ctx.failure_class == Some(FailureClass::CircuitOpen)
         }
         ReactionTrigger::NoProgress { iterations } => {
             ctx.consecutive_failures >= *iterations
@@ -142,17 +148,29 @@ fn trigger_matches(trigger: &ReactionTrigger, ctx: &TriggerContext) -> bool {
         }
         ReactionTrigger::AgentIdle { .. } => ctx.activity == AgentActivity::Idle,
         ReactionTrigger::ContextPressureHigh => {
-            ctx.context_pressure_pct.unwrap_or(0.0) > 0.85
+            ctx.context_pressure_pct.unwrap_or(0.0) >= 0.85
         }
         ReactionTrigger::MirrorFailed => {
-            // Mirror failures are handled by the outbox retry; this trigger
-            // would be set by the mirror outbox processor. Not matched here.
-            false
+            ctx.mirror_failed || ctx.failure_class == Some(FailureClass::BrMirrorFailed)
         }
         ReactionTrigger::RetryBudgetExhausted => {
             ctx.escalation_tier.is_terminal()
         }
     }
+}
+
+fn prior_attempt_count(db: &Database, ctx: &TriggerContext, trigger: &ReactionTrigger) -> u32 {
+    db.list_events_for_run(&ctx.run_id)
+        .ok()
+        .map(|events| {
+            events
+                .into_iter()
+                .filter(|event| event.kind == grove_types::EventKind::ReactionInvoked)
+                .filter_map(|event| serde_json::from_value::<ReactionRecord>(event.payload).ok())
+                .filter(|record| &record.trigger == trigger)
+                .count() as u32
+        })
+        .unwrap_or(0)
 }
 
 /// Apply a reaction action, potentially escalating if the primary action
@@ -186,15 +204,17 @@ fn apply_action(
     }
 }
 
-/// Load reaction rules. Currently returns defaults; in the future these
-/// will be loaded from `grove.toml` configuration.
-pub fn load_reaction_rules(_config: &grove_config::GroveConfig) -> Vec<ReactionRule> {
-    default_reactions()
+/// Load reaction rules from config, falling back to defaults through config defaults.
+pub fn load_reaction_rules(config: &grove_config::GroveConfig) -> Vec<ReactionRule> {
+    config.reactions.rules.clone()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grove_br::BeadCacheStore;
+    use grove_types::default_reactions;
+    use tempfile::tempdir;
 
     fn make_ctx(status: RunStatus, failures: u32, tier: EscalationTier) -> TriggerContext {
         TriggerContext {
@@ -208,6 +228,7 @@ mod tests {
             consecutive_failures: failures,
             circuit_state: grove_types::CircuitState::Closed,
             context_pressure_pct: None,
+            mirror_failed: false,
         }
     }
 
@@ -269,6 +290,44 @@ mod tests {
     }
 
     #[test]
+    fn mirror_failed_trigger_matches_explicit_context_flag() {
+        let mut ctx = make_ctx(RunStatus::Failed, 1, EscalationTier::SecondAttempt);
+        ctx.failure_class = Some(FailureClass::BrMirrorFailed);
+        ctx.mirror_failed = true;
+        assert!(trigger_matches(&ReactionTrigger::MirrorFailed, &ctx));
+    }
+
+    #[test]
+    fn circuit_open_trigger_matches_failure_class() {
+        let mut ctx = make_ctx(RunStatus::Failed, 1, EscalationTier::SecondAttempt);
+        ctx.failure_class = Some(FailureClass::CircuitOpen);
+        assert!(trigger_matches(&ReactionTrigger::CircuitOpen, &ctx));
+    }
+
+    #[test]
+    fn context_pressure_triggers_at_threshold() {
+        let mut ctx = make_ctx(RunStatus::Active, 0, EscalationTier::FirstAttempt);
+        ctx.context_pressure_pct = Some(0.85);
+        assert!(trigger_matches(&ReactionTrigger::ContextPressureHigh, &ctx));
+    }
+
+    #[test]
+    fn load_reaction_rules_prefers_configured_rules() {
+        let mut config = grove_config::GroveConfig::default();
+        config.reactions.rules = vec![ReactionRule {
+            trigger: ReactionTrigger::MirrorFailed,
+            action: ReactionAction::EnqueueMirrorRetry,
+            enabled: true,
+            max_attempts: 9,
+            escalate_to: None,
+        }];
+        let loaded = load_reaction_rules(&config);
+        assert_eq!(loaded.len(), 1);
+        assert!(matches!(loaded[0].trigger, ReactionTrigger::MirrorFailed));
+        assert_eq!(loaded[0].max_attempts, 9);
+    }
+
+    #[test]
     fn infer_blocked_activity_from_permission_denial() {
         let outcome = SessionOutcome {
             session: grove_types::ClaudeSessionRecord {
@@ -301,5 +360,88 @@ mod tests {
         };
 
         assert_eq!(infer_agent_activity(&outcome, RunStatus::Failed), AgentActivity::Blocked);
+    }
+
+    #[test]
+    fn evaluate_reactions_stops_after_max_attempts() {
+        let dir = tempdir().unwrap();
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db")).unwrap();
+        let mut db = grove_db::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+
+        let bead_id = BeadId::new("grove-reaction-cap");
+        let run_id = RunId::new("run-cap-1");
+        db.upsert_bead_cache(&grove_br::BrIssueSummary {
+            id: bead_id.clone(),
+            title: "reaction cap".into(),
+            description: None,
+            priority: grove_types::BeadPriority::P1,
+            issue_type: "task".into(),
+            status: "open".into(),
+            assignee: None,
+            labels: Vec::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            blocked_by: Vec::new(),
+            blocks: Vec::new(),
+            raw_json: serde_json::json!({}),
+        })
+        .unwrap();
+        db.record_run_started(grove_db::RunStartInput {
+            bead_id: bead_id.clone(),
+            run_id: run_id.clone(),
+            attempt_no: 1,
+            started_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let trigger = ReactionTrigger::MirrorFailed;
+        let prior = ReactionRecord {
+            id: "rxn-prior".into(),
+            trigger: trigger.clone(),
+            action: ReactionAction::EnqueueMirrorRetry,
+            outcome: ReactionOutcome::Applied,
+            escalated_to: None,
+            recovery_capsule: None,
+            context: None,
+            invoked_at: chrono::Utc::now(),
+            success: true,
+            error: None,
+            run_id: Some(run_id.clone()),
+        };
+        db.write_event_log(
+            grove_types::EventKind::ReactionInvoked,
+            Some(&bead_id),
+            Some(&run_id),
+            None,
+            &serde_json::to_value(&prior).unwrap(),
+            &chrono::Utc::now(),
+        )
+        .unwrap();
+
+        let ctx = TriggerContext {
+            bead_id,
+            run_id,
+            run_status: RunStatus::Failed,
+            activity: AgentActivity::Blocked,
+            failure_class: Some(FailureClass::BrMirrorFailed),
+            failure_detail: Some("mirror failed".into()),
+            escalation_tier: EscalationTier::SecondAttempt,
+            consecutive_failures: 1,
+            circuit_state: grove_types::CircuitState::Closed,
+            context_pressure_pct: None,
+            mirror_failed: true,
+        };
+        let rules = vec![ReactionRule {
+            trigger,
+            action: ReactionAction::EnqueueMirrorRetry,
+            enabled: true,
+            max_attempts: 1,
+            escalate_to: None,
+        }];
+
+        let result = evaluate_reactions(&mut db, &ctx, &rules);
+        assert!(result.records.is_empty());
+        assert_eq!(result.new_tier, EscalationTier::SecondAttempt);
     }
 }
