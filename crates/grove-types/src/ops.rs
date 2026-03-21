@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{BeadId, PromptId, RunId, SessionId};
+use crate::{BeadId, RunId, SessionId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptMaterializationRecord {

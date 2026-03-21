@@ -15,9 +15,9 @@ use grove_session::{
     SingleTaskSessionRequest, execute_single_task_session, execute_single_task_session_with_hooks,
 };
 use grove_types::{
-    BeadId, ClaudeSessionRecord, ContextPressureLevel, ExecutionContract, FailureClass,
-    IterationAnalysis, ProgressSignal, PromptId, PromptManifest, PromptSegmentKind, RunId,
-    SessionId, SessionOutcome, SessionStatus, SessionTerminalClass, StopReason,
+    BeadId, ClaudeSessionRecord, ContextPressureLevel, EscalationTier, ExecutionContract,
+    FailureClass, IterationAnalysis, ProgressSignal, PromptId, PromptManifest, PromptSegmentKind,
+    RunId, SessionId, SessionOutcome, SessionStatus, SessionTerminalClass, StopReason,
 };
 use tempfile::tempdir;
 
@@ -69,6 +69,8 @@ fn sample_request(workspace_dir: Utf8PathBuf) -> SingleTaskSessionRequest {
         playbook_rules: Vec::new(),
         env: Vec::new(),
         shutdown: SessionShutdownConfig::default(),
+        escalation_tier: EscalationTier::FirstAttempt,
+        mutation_strategy: None,
     }
 }
 
@@ -112,10 +114,7 @@ struct RecordingHooks {
 
 impl SessionLifecycleHooks for RecordingHooks {
     fn on_session_started(&mut self, session: &ClaudeSessionRecord) -> anyhow::Result<()> {
-        self.started
-            .lock()
-            .expect("lock started hooks")
-            .push(session.clone());
+        self.started.lock().unwrap().push(session.clone());
         Ok(())
     }
 
@@ -123,10 +122,7 @@ impl SessionLifecycleHooks for RecordingHooks {
         &mut self,
         result: &grove_session::SingleTaskSessionResult,
     ) -> anyhow::Result<()> {
-        self.finished
-            .lock()
-            .expect("lock finished hooks")
-            .push(result.outcome.clone());
+        self.finished.lock().unwrap().push(result.outcome.clone());
         Ok(())
     }
 }
@@ -182,7 +178,7 @@ fn lifecycle_hooks_observe_session_start_and_finish() -> TestResult {
     let mut hooks = RecordingHooks::default();
     let result = execute_single_task_session_with_hooks(&backend, request, &mut hooks)?;
 
-    let started = hooks.started.lock().expect("lock started assertions");
+    let started = hooks.started.lock().unwrap();
     assert_eq!(started.len(), 1);
     assert_eq!(started[0].status, SessionStatus::Running);
     assert_eq!(started[0].ended_at, None);
@@ -191,7 +187,7 @@ fn lifecycle_hooks_observe_session_start_and_finish() -> TestResult {
         Some("prompt-1")
     );
 
-    let finished = hooks.finished.lock().expect("lock finished assertions");
+    let finished = hooks.finished.lock().unwrap();
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0].session.status, SessionStatus::Completed);
     assert_eq!(
@@ -214,18 +210,17 @@ fn started_then_runner_failure_still_emits_terminal_finish_callback() -> TestRes
 
     let request = sample_request(workspace_dir);
     let mut hooks = RecordingHooks::default();
-    let error = execute_single_task_session_with_hooks(&backend, request, &mut hooks)
-        .expect_err("backend start should fail");
+    let error = execute_single_task_session_with_hooks(&backend, request, &mut hooks).unwrap_err();
     assert!(matches!(
         error,
         grove_session::SingleTaskSessionRunnerError::BackendStart(_)
     ));
 
-    let started = hooks.started.lock().expect("lock started assertions");
+    let started = hooks.started.lock().unwrap();
     assert_eq!(started.len(), 1);
     assert_eq!(started[0].status, SessionStatus::Running);
 
-    let finished = hooks.finished.lock().expect("lock finished assertions");
+    let finished = hooks.finished.lock().unwrap();
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0].session.status, SessionStatus::UnknownFailure);
     assert_eq!(
@@ -250,7 +245,7 @@ fn lifecycle_start_hook_failure_surfaces_as_runner_error() -> TestResult {
 
     let request = sample_request(workspace_dir);
     let error = execute_single_task_session_with_hooks(&backend, request, &mut FailingStartHooks)
-        .expect_err("hook failure should bubble out");
+        .unwrap_err();
     assert!(matches!(
         error,
         grove_session::SingleTaskSessionRunnerError::LifecycleHook(_)
@@ -289,7 +284,7 @@ fn successful_run_with_finish_hook_failure_surfaces_error() -> TestResult {
     ];
 
     let error = execute_single_task_session_with_hooks(&backend, request, &mut FailingFinishHooks)
-        .expect_err("finish hook failure should bubble out");
+        .unwrap_err();
     assert!(matches!(
         error,
         grove_session::SingleTaskSessionRunnerError::LifecycleHook(_)
@@ -826,7 +821,7 @@ fn lifecycle_hooks_observe_checkpoint_terminal_outcome_and_payload() -> TestResu
     let mut hooks = RecordingHooks::default();
     let result = execute_single_task_session_with_hooks(&backend, request, &mut hooks)?;
 
-    let finished = hooks.finished.lock().expect("lock finished assertions");
+    let finished = hooks.finished.lock().unwrap();
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0].terminal_class, SessionTerminalClass::Checkpoint);
     assert_eq!(finished[0].session.status, SessionStatus::Checkpointed);

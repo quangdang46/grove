@@ -19,7 +19,7 @@ use grove_session::{
     SingleTaskSessionRequest, execute_single_task_session_with_hooks,
 };
 use grove_types::{
-    AgentActivity, BeadId, ClaudeSessionRecord, CoordinatorStopReason, EventKind,
+    AgentActivity, BeadId, ClaudeSessionRecord, CoordinatorStopReason, EscalationTier, EventKind,
     ExecutionContract, PromptId, RunId, SessionId,
 };
 use std::{fs, io, os::unix::fs::PermissionsExt, sync::Mutex, time::Duration};
@@ -76,6 +76,8 @@ fn sample_request(workspace_dir: Utf8PathBuf) -> SingleTaskSessionRequest {
         playbook_rules: Vec::new(),
         env: Vec::new(),
         shutdown: SessionShutdownConfig::default(),
+        escalation_tier: EscalationTier::FirstAttempt,
+        mutation_strategy: None,
     }
 }
 
@@ -87,7 +89,10 @@ struct ActivityRecordingHooks {
 
 impl SessionLifecycleHooks for ActivityRecordingHooks {
     fn on_session_started(&mut self, session: &ClaudeSessionRecord) -> anyhow::Result<()> {
-        self.started.lock().expect("lock started").push(session.clone());
+        self.started
+            .lock()
+            .expect("lock started")
+            .push(session.clone());
         Ok(())
     }
 
@@ -97,10 +102,11 @@ impl SessionLifecycleHooks for ActivityRecordingHooks {
         detail: Option<&str>,
         at: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        self.changes
-            .lock()
-            .expect("lock activity changes")
-            .push((activity, detail.map(str::to_owned), at));
+        self.changes.lock().expect("lock activity changes").push((
+            activity,
+            detail.map(str::to_owned),
+            at,
+        ));
         Ok(())
     }
 }
@@ -109,12 +115,15 @@ impl SessionLifecycleHooks for ActivityRecordingHooks {
 fn shutdown_signal_translates_to_durable_stop_reason() {
     let signal = ShutdownSignal::new();
     signal.trigger();
-    
-    assert!(signal.is_triggered(), "Shutdown signal should register as triggered.");
-    
+
+    assert!(
+        signal.is_triggered(),
+        "Shutdown signal should register as triggered."
+    );
+
     let exit_reason = DispatchExitReason::ShutdownRequested;
     let stop_reason = exit_reason.to_stop_reason();
-    
+
     assert_eq!(
         stop_reason,
         CoordinatorStopReason::UserStopped,
@@ -128,7 +137,7 @@ fn shutdown_signal_translates_to_durable_stop_reason() {
 fn empty_queue_maps_to_clean_stop_reason() {
     let exit_reason = DispatchExitReason::QueueEmpty;
     let stop_reason = exit_reason.to_stop_reason();
-    
+
     assert_eq!(stop_reason, CoordinatorStopReason::QueueEmpty);
     assert!(stop_reason.is_clean());
     assert!(!stop_reason.is_user_initiated());
@@ -140,14 +149,17 @@ fn leader_contested_maps_to_uncle_fast_fail_reason() {
     let stop_reason = exit_reason.to_stop_reason();
 
     assert_eq!(stop_reason, CoordinatorStopReason::LeaderContested);
-    assert!(!stop_reason.is_clean(), "Contested lease is not a clean expected exit.");
+    assert!(
+        !stop_reason.is_clean(),
+        "Contested lease is not a clean expected exit."
+    );
 }
 
 #[test]
 fn coordinator_shutdown_events_round_trip_in_db() {
     let dir = tempdir().expect("tempdir");
-    let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
-        .expect("utf8 db path");
+    let db_path =
+        camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db")).expect("utf8 db path");
     let mut db = Database::open(&db_path).expect("open db");
     db.migrate().expect("migrate");
 
@@ -218,11 +230,23 @@ fn live_session_hooks_expose_idle_blocked_and_ready_activity_transitions() -> Te
 
     let changes = hooks.changes.lock().expect("lock activity changes");
     let activities: Vec<_> = changes.iter().map(|(activity, _, _)| *activity).collect();
-    let details: Vec<_> = changes.iter().map(|(_, detail, _)| detail.as_deref()).collect();
+    let details: Vec<_> = changes
+        .iter()
+        .map(|(_, detail, _)| detail.as_deref())
+        .collect();
 
-    assert!(activities.contains(&AgentActivity::Ready), "checkpoint output should mark the session ready");
-    assert!(activities.contains(&AgentActivity::Blocked), "permission denied stderr should mark the session blocked");
-    assert!(activities.contains(&AgentActivity::Idle), "stream timeout should eventually mark the session idle");
+    assert!(
+        activities.contains(&AgentActivity::Ready),
+        "checkpoint output should mark the session ready"
+    );
+    assert!(
+        activities.contains(&AgentActivity::Blocked),
+        "permission denied stderr should mark the session blocked"
+    );
+    assert!(
+        activities.contains(&AgentActivity::Idle),
+        "stream timeout should eventually mark the session idle"
+    );
     assert!(
         details.contains(&Some("protocol_event")),
         "checkpoint-driven activity change should be tagged as a protocol event"
@@ -284,7 +308,13 @@ fn persisted_session_records_live_idle_transition_in_run_state_and_event_log() -
         ("EXIT_CODE".to_owned(), "0".to_owned()),
     ];
 
-    let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1, &GroveConfig::default())?;
+    let persisted = execute_persisted_single_task_session(
+        &mut db,
+        &backend,
+        request,
+        1,
+        &GroveConfig::default(),
+    )?;
 
     assert_eq!(persisted.run.activity, Some(AgentActivity::Blocked));
 
@@ -311,8 +341,7 @@ fn persisted_session_records_live_idle_transition_in_run_state_and_event_log() -
     let blocked_event = events.iter().find(|event| {
         event.kind == EventKind::ActivityStateChanged
             && event.payload["activity"] == "Blocked"
-            && event.payload.get("detail")
-                == Some(&serde_json::Value::String("stderr".to_owned()))
+            && event.payload.get("detail") == Some(&serde_json::Value::String("stderr".to_owned()))
     });
     assert!(
         blocked_event.is_some(),

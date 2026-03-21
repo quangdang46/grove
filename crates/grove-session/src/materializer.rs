@@ -1,3 +1,4 @@
+pub use grove_types::EscalationContext;
 use grove_types::{
     BeadId, CheckpointId, ExecutionContract, PromptId, PromptManifest, PromptManifestSection,
     PromptSectionProvenance, PromptSegment, PromptSegmentKind, PromptTrimReason, RunId, Timestamp,
@@ -34,6 +35,7 @@ pub struct PromptMaterializationInput {
     pub retrieval_query: Option<String>,
     pub archive_bundle: Option<grove_types::archive::RetrievalBundle>,
     pub playbook_rules: Vec<grove_types::playbook::PlaybookBulletRecord>,
+    pub escalation_context: Option<EscalationContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +111,10 @@ pub fn materialize_prompt(input: PromptMaterializationInput) -> PromptMaterializ
 
     if let Some(checkpoint) = &input.checkpoint {
         sections.push(build_checkpoint_section(checkpoint));
+    }
+
+    if let Some(ref ctx) = input.escalation_context {
+        sections.push(build_escalation_context_section(ctx));
     }
 
     sections.push(build_protocol_section(&input.protocol_block));
@@ -301,6 +307,20 @@ fn build_checkpoint_section(checkpoint: &CheckpointPromptInput) -> PromptSegment
     }
 }
 
+fn build_escalation_context_section(ctx: &EscalationContext) -> PromptSegment {
+    PromptSegment {
+        kind: PromptSegmentKind::EscalationContext,
+        priority: 65,
+        heading: format!("Escalation context (tier {})", ctx.tier_number),
+        estimated_tokens: estimate_tokens(&ctx.instruction),
+        text: format!(
+            "[ESCALATION CONTEXT]\nTier: {:?} (attempt {})\n{}\n",
+            ctx.tier, ctx.tier_number, ctx.instruction,
+        ),
+        provenance: PromptSectionProvenance::default(),
+    }
+}
+
 fn build_protocol_section(protocol_block: &str) -> PromptSegment {
     build_text_section(
         PromptSegmentKind::Protocol,
@@ -384,6 +404,7 @@ mod tests {
             retrieval_query: None,
             archive_bundle: None,
             playbook_rules: vec![],
+            escalation_context: None,
         }
     }
 

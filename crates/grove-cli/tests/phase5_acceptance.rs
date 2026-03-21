@@ -44,13 +44,19 @@ fn repeated_lessons_become_active_rules() -> TestResult {
     run_scoring_pass(&mut db, &score_config)?;
 
     let active = db.list_active_bullets(None)?; // but it's Draft so list_active_bullets won't show it!
-    assert!(active.is_empty(), "Candidates don't appear as active until promoted");
+    assert!(
+        active.is_empty(),
+        "Candidates don't appear as active until promoted"
+    );
 
     // Run 2 and 3 and 4: repeated ingestion (same hash) reinforces the bullet
     for i in 2..=5 {
         let run_id = RunId::new(format!("run-{i}"));
         let changed = ingest_lessons(&mut db, &bead_id, &run_id, &[target_lesson.to_string()])?;
-        assert_eq!(changed, 0, "Subsequent ingests should reinforce, not create new");
+        assert_eq!(
+            changed, 0,
+            "Subsequent ingests should reinforce, not create new"
+        );
     }
 
     // Now it has 5 helpful events. Let's run the scoring pass to promote it.
@@ -59,9 +65,13 @@ fn repeated_lessons_become_active_rules() -> TestResult {
     // It should now be promoted to Established/Active
     let active_now = db.list_active_bullets(None)?;
     assert_eq!(active_now.len(), 1, "Promoted bullet should now be active");
-    
+
     let bullet = &active_now[0];
-    assert_eq!(bullet.maturity, BulletMaturity::Established, "Should be promoted to Established");
+    assert_eq!(
+        bullet.maturity,
+        BulletMaturity::Established,
+        "Should be promoted to Established"
+    );
     assert_eq!(bullet.state, BulletState::Active, "State should be active");
 
     Ok(())
@@ -83,7 +93,10 @@ fn one_off_noisy_lessons_remain_weak_candidates() -> TestResult {
 
     // It should not be active because it lacks sufficient events
     let active = db.list_active_bullets(None)?;
-    assert!(active.is_empty(), "One-off noisy lesson should remain inactive draft/candidate");
+    assert!(
+        active.is_empty(),
+        "One-off noisy lesson should remain inactive draft/candidate"
+    );
 
     Ok(())
 }
@@ -92,10 +105,10 @@ fn one_off_noisy_lessons_remain_weak_candidates() -> TestResult {
 fn pure_db_no_external_memory_tool_in_prompt_assembly() -> TestResult {
     use grove_session::{PromptMaterializationInput, materialize_prompt};
     use grove_types::{ExecutionContract, PromptId, PromptSegmentKind};
-    
+
     // We demonstrate that passing a fully-formed PlaybookBulletRecord list
     // constructs the prompt segments entirely locally.
-    
+
     let rule = PlaybookBulletRecord {
         id: grove_types::BulletId::new("blt-1"),
         scope: grove_types::playbook::BulletScope::Global,
@@ -139,17 +152,24 @@ fn pure_db_no_external_memory_tool_in_prompt_assembly() -> TestResult {
         retrieval_query: None,
         archive_bundle: None,
         playbook_rules: vec![rule],
+        escalation_context: None,
     };
 
     let materialized = materialize_prompt(input);
     let rendered = &materialized.rendered_prompt;
-    
-    assert!(materialized.manifest.sections.iter().any(|section| {
-        section.kind == PromptSegmentKind::Playbook
-            && section.heading == "Playbook session_lesson (Maturity: Established)"
-    }), "Manifest includes playbook segment");
-    assert!(rendered.contains("[SESSION_LESSON] Use idiomatic Rust"), "Prompt includes actual rule text");
-    
+
+    assert!(
+        materialized.manifest.sections.iter().any(|section| {
+            section.kind == PromptSegmentKind::Playbook
+                && section.heading == "Playbook session_lesson (Maturity: Established)"
+        }),
+        "Manifest includes playbook segment"
+    );
+    assert!(
+        rendered.contains("[SESSION_LESSON] Use idiomatic Rust"),
+        "Prompt includes actual rule text"
+    );
+
     Ok(())
 }
 
@@ -169,7 +189,7 @@ fn verification_mode_inferred_from_contract_and_workspace() -> TestResult {
     std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
     let mode_rust = VerificationMode::infer(ExecutionContract::SingleTask, utf8_dir);
     assert_eq!(mode_rust, VerificationMode::RustCompileCheck);
-    
+
     // Clean up
     std::fs::remove_file(dir.path().join("Cargo.toml")).unwrap();
 

@@ -7,9 +7,10 @@ use crate::{
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::Utc;
 use grove_types::{
-    AgentActivity, BeadId, ClaudeSessionRecord, ContextPressureLevel, ExecutionContract, FailureClass,
-    PromptId, ProtocolEvent, ProtocolState, RunId, SessionId, SessionOutcome, SessionStatus,
-    SessionTerminalClass, StopReason,
+    AgentActivity, BeadId, ClaudeSessionRecord, ContextPressureLevel, EscalationContext,
+    EscalationTier, ExecutionContract, FailureClass, MutationStrategy, PromptId, ProtocolEvent,
+    ProtocolState, RunId, SessionId, SessionOutcome, SessionStatus, SessionTerminalClass,
+    StopReason,
 };
 use std::{
     fs,
@@ -69,6 +70,8 @@ pub struct SingleTaskSessionRequest {
     pub playbook_rules: Vec<grove_types::playbook::PlaybookBulletRecord>,
     pub env: Vec<(String, String)>,
     pub shutdown: SessionShutdownConfig,
+    pub escalation_tier: EscalationTier,
+    pub mutation_strategy: Option<MutationStrategy>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,7 +110,65 @@ pub trait SessionLifecycleHooks {
 
 impl SessionLifecycleHooks for () {}
 
+fn escalation_context_for(
+    tier: EscalationTier,
+    mutation_strategy: Option<MutationStrategy>,
+) -> EscalationContext {
+    let instruction = escalation_instruction_for(tier, mutation_strategy);
+    EscalationContext {
+        tier,
+        mutation_strategy,
+        tier_number: tier.tier_number(),
+        is_terminal: tier.is_terminal(),
+        instruction,
+    }
+}
+
+fn escalation_instruction_for(
+    tier: EscalationTier,
+    mutation_strategy: Option<MutationStrategy>,
+) -> String {
+    let strategy_note = match mutation_strategy {
+        Some(MutationStrategy::NarrowClaimedPaths) => {
+            "You are operating at reduced scope. Prioritize the highest-value remaining step and avoid expanding scope until that step is proven."
+        }
+        Some(MutationStrategy::DifferentArchiveSnippet) => {
+            "Use a different historical context. Draw on different past sessions and archived snippets than the previous attempt."
+        }
+        Some(MutationStrategy::AlternativeBeadContract) => {
+            "Try a fundamentally different approach to the task contract. Re-examine the task goal and pursue an alternative path to the same outcome."
+        }
+        Some(MutationStrategy::ReduceContextWindow) => {
+            "Context pressure is high. Keep your thinking and tool usage concise. Do not expand scope; finish the smallest verifiable step first."
+        }
+        Some(MutationStrategy::SwitchModel) => {
+            "Final attempt before recovery capsule. Exhaust all alternative strategies. Prove the smallest step first before expanding."
+        }
+        None => match tier {
+            EscalationTier::FirstAttempt => "Initial attempt. Proceed normally with full scope.",
+            EscalationTier::SecondAttempt => {
+                "Second attempt. If stuck, state one hypothesis before editing."
+            }
+            EscalationTier::ThirdAttempt => {
+                "Third attempt. Narrow scope and prioritize the most critical remaining step."
+            }
+            EscalationTier::FinalAttempt => {
+                "Final attempt. Use the most conservative, proven strategy."
+            }
+            EscalationTier::GiveUp => {
+                "This is the last attempt. Create a detailed recovery capsule before ending."
+            }
+        },
+    };
+    strategy_note.to_owned()
+}
+
 impl SingleTaskSessionRequest {
+    #[must_use]
+    pub fn escalation_context(&self) -> EscalationContext {
+        escalation_context_for(self.escalation_tier, self.mutation_strategy)
+    }
+
     #[must_use]
     pub fn with_retry_context(
         mut self,
@@ -120,6 +181,13 @@ impl SingleTaskSessionRequest {
         self.previous_outcome = previous_outcome;
         self.retry_delta_summary = Some(plan.retry_delta_summary);
         self.rescue_card = Some(plan.rescue_card);
+        self
+    }
+
+    #[must_use]
+    pub fn with_escalation_context(mut self, context: EscalationContext) -> Self {
+        self.escalation_tier = context.tier;
+        self.mutation_strategy = context.mutation_strategy;
         self
     }
 }
@@ -166,6 +234,8 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
 ) -> Result<SingleTaskSessionResult, SingleTaskSessionRunnerError> {
     let started_at = Utc::now();
     let protocol_block = default_protocol_block();
+    let escalation_context =
+        escalation_context_for(request.escalation_tier, request.mutation_strategy);
     let materialized = materialize_prompt(PromptMaterializationInput {
         prompt_id: request.prompt_id.clone(),
         bead_id: request.bead_id.clone(),
@@ -184,6 +254,7 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
         retrieval_query: request.retrieval_query.clone(),
         archive_bundle: request.archive_bundle.clone(),
         playbook_rules: request.playbook_rules.clone(),
+        escalation_context: Some(escalation_context),
     });
 
     let transcript_abs = resolve_under_working_dir(&request.working_dir, &request.transcript_path);
@@ -233,7 +304,8 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
         })?;
 
         let (sender, receiver) = mpsc::channel();
-        let stdout_handle = spawn_stream_forwarder(running.stdout, sender.clone(), StreamSource::Stdout);
+        let stdout_handle =
+            spawn_stream_forwarder(running.stdout, sender.clone(), StreamSource::Stdout);
         let stderr_handle = spawn_stream_forwarder(running.stderr, sender, StreamSource::Stderr);
 
         let mut stdout_closed = false;
@@ -281,11 +353,12 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
                     let ts = Utc::now();
                     transcript.append_stderr_line(line.clone(), ts)?;
                     if let ParserLineKind::PlainStderr(text) = parser.parse_stderr_line(&line) {
-                        let next_activity = if text.to_ascii_lowercase().contains("permission denied") {
-                            AgentActivity::Blocked
-                        } else {
-                            AgentActivity::Active
-                        };
+                        let next_activity =
+                            if text.to_ascii_lowercase().contains("permission denied") {
+                                AgentActivity::Blocked
+                            } else {
+                                AgentActivity::Active
+                            };
                         stderr_lines.push(text);
                         if next_activity != last_activity {
                             hooks
@@ -384,11 +457,11 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
 
         // Run Verification before closing out Success.
         if terminal_class == SessionTerminalClass::Success {
-            let mode = crate::verify::VerificationMode::infer(
-                request.contract,
-                &request.working_dir,
-            );
-            if let Err(verify_err) = crate::verify::run_verification(mode, &request.working_dir, &materialized.manifest) {
+            let mode =
+                crate::verify::VerificationMode::infer(request.contract, &request.working_dir);
+            if let Err(verify_err) =
+                crate::verify::run_verification(mode, &request.working_dir, &materialized.manifest)
+            {
                 // If verification failed, log it to stderr so it's captured in the analysis tail
                 // and fail the terminal class.
                 let msg = format!("grove verification failed:\n{}", verify_err);
@@ -487,7 +560,10 @@ fn spawn_stream_forwarder(
                 StreamSource::Stdout => StreamSource::Stdout,
                 StreamSource::Stderr => StreamSource::Stderr,
             };
-            if sender.send(StreamMessage::Line(message_source, line)).is_err() {
+            if sender
+                .send(StreamMessage::Line(message_source, line))
+                .is_err()
+            {
                 return;
             }
         }
@@ -710,6 +786,8 @@ exit "${EXIT_CODE:-0}"
             playbook_rules: vec![],
             env: Vec::new(),
             shutdown: SessionShutdownConfig::default(),
+            escalation_tier: EscalationTier::FirstAttempt,
+            mutation_strategy: None,
         }
     }
 

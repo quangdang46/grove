@@ -1,16 +1,16 @@
 use assert_cmd::Command;
 use chrono::Utc;
 use grove_db::Database;
+use grove_kernel::scoring::ScoringConfig;
+use grove_kernel::{diary, inspect_view, lesson_ingest, scoring};
+use grove_session::{PromptMaterializationInput, materialize_prompt};
 use grove_types::{
     BeadId, RunId, SessionOutcome, SessionStatus,
-    playbook::{BulletMaturity, BulletState, BulletType, PlaybookBulletRecord, BulletScope},
-    prompt::{PromptManifest, PromptManifestSection, PromptSegmentKind, PromptSectionProvenance},
+    playbook::{BulletMaturity, BulletScope, BulletState, BulletType, PlaybookBulletRecord},
+    prompt::{PromptManifest, PromptManifestSection, PromptSectionProvenance, PromptSegmentKind},
 };
-use tempfile::TempDir;
-use grove_kernel::{diary, inspect_view, lesson_ingest, scoring};
-use grove_kernel::scoring::ScoringConfig;
 use std::fs;
-use grove_session::{PromptMaterializationInput, materialize_prompt};
+use tempfile::TempDir;
 
 // 1. Outcome-derived feedback creates events
 #[test]
@@ -68,22 +68,20 @@ fn test_diary_implicit_feedback() {
         retry_delta_summary: None,
         retrieval_query: None,
         retrieval_ranking_summary: vec![],
-        sections: vec![
-            PromptManifestSection {
-                ordinal: 1,
-                kind: PromptSegmentKind::Playbook,
-                heading: "Playbook Rules".to_string(),
-                included: true,
-                estimated_tokens: 10,
-                char_count: 50,
-                trim_reason: None,
-                provenance: PromptSectionProvenance {
-                    bullet_ids: vec![bullet_id.clone()],
-                    ..Default::default()
-                },
-                preview: "preview".to_string(),
-            }
-        ],
+        sections: vec![PromptManifestSection {
+            ordinal: 1,
+            kind: PromptSegmentKind::Playbook,
+            heading: "Playbook Rules".to_string(),
+            included: true,
+            estimated_tokens: 10,
+            char_count: 50,
+            trim_reason: None,
+            provenance: PromptSectionProvenance {
+                bullet_ids: vec![bullet_id.clone()],
+                ..Default::default()
+            },
+            preview: "preview".to_string(),
+        }],
     };
     fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
 
@@ -120,8 +118,11 @@ fn test_diary_implicit_feedback() {
 
     // Verify bullet got a helpful feedback event!
     let updated_bullet = db.get_playbook_bullet(&bullet_id).unwrap().unwrap();
-    assert_eq!(updated_bullet.helpful_count, 1, "Should have received helpful feedback from Completed outcome");
-    
+    assert_eq!(
+        updated_bullet.helpful_count, 1,
+        "Should have received helpful feedback from Completed outcome"
+    );
+
     // Now simulate a crash and apply again
     outcome.session.status = SessionStatus::Crashed;
     outcome.session.ended_at = Some(Utc::now() + chrono::Duration::seconds(4000)); // over an hour
@@ -129,7 +130,10 @@ fn test_diary_implicit_feedback() {
     diary::apply_outcome_feedback(&mut db, &bead_id, &run_id, &outcome, true).unwrap();
 
     let crashed_bullet = db.get_playbook_bullet(&bullet_id).unwrap().unwrap();
-    assert_eq!(crashed_bullet.harmful_count, 1, "Should have received harmful feedback from Crash");
+    assert_eq!(
+        crashed_bullet.harmful_count, 1,
+        "Should have received harmful feedback from Crash"
+    );
 }
 
 // 2. Exact and approximate deduplication
@@ -144,23 +148,23 @@ fn test_lesson_deduplication() {
     let bead_id = BeadId::new("test-1");
     let run_id = RunId::new("run-1");
 
-    let lessons = vec![
-        "Validate inputs thoroughly before dispatching commands.".to_string(),
-    ];
+    let lessons = vec!["Validate inputs thoroughly before dispatching commands.".to_string()];
 
     // First ingestion creates it
     let created = lesson_ingest::ingest_lessons(&mut db, &bead_id, &run_id, &lessons).unwrap();
     assert_eq!(created, 1);
 
     // Exact duplicate does not create a new bullet
-    let duplicate_created = lesson_ingest::ingest_lessons(&mut db, &bead_id, &run_id, &lessons).unwrap();
+    let duplicate_created =
+        lesson_ingest::ingest_lessons(&mut db, &bead_id, &run_id, &lessons).unwrap();
     assert_eq!(duplicate_created, 0);
 
     // Approximate duplicate (Jaccard > 0.75) does not create a new bullet either
     let approx = vec![
         "Validate inputs thoroughly before dispatching any commands.".to_string(), // Just added 'any'
     ];
-    let approx_created = lesson_ingest::ingest_lessons(&mut db, &bead_id, &run_id, &approx).unwrap();
+    let approx_created =
+        lesson_ingest::ingest_lessons(&mut db, &bead_id, &run_id, &approx).unwrap();
     assert_eq!(approx_created, 0);
 
     // Verify it received helpful points for the duplicate ingestions
@@ -192,16 +196,14 @@ fn test_scoring_anti_pattern_inversion() {
         maturity: BulletMaturity::Established,
         helpful_count: 1,
         harmful_count: 10, // hugely harmful
-        feedback_events: vec![
-            grove_types::playbook::FeedbackEventRecord {
-                kind: grove_types::playbook::FeedbackKind::Harmful,
-                timestamp: Utc::now(),
-                bead_id: None,
-                run_id: Some(run_id.clone()),
-                context: None,
-                weight: 5.0,
-            }
-        ],
+        feedback_events: vec![grove_types::playbook::FeedbackEventRecord {
+            kind: grove_types::playbook::FeedbackKind::Harmful,
+            timestamp: Utc::now(),
+            bead_id: None,
+            run_id: Some(run_id.clone()),
+            context: None,
+            weight: 5.0,
+        }],
         confidence_decay_half_life_days: 30,
         pinned: false,
         deprecated: false,
@@ -232,9 +234,12 @@ fn test_scoring_anti_pattern_inversion() {
     // But wait, there should be a new inverted rule in draft!
     let all_bullets = db.list_non_retired_bullets().unwrap();
     assert!(!all_bullets.is_empty(), "Inverted AntiPattern should exist");
-    
+
     let text = &all_bullets[0].1;
-    assert!(text.contains("AVOID: Always hardcode file paths"), "Should invert text string");
+    assert!(
+        text.contains("AVOID: Always hardcode file paths"),
+        "Should invert text string"
+    );
 }
 
 // 4. Explainable curation stays budget-aware
@@ -307,6 +312,7 @@ fn test_phase6_curation_is_explainable_and_compact() {
                 updated_at: Utc::now(),
             },
         ],
+        escalation_context: None,
     };
     let materialized = materialize_prompt(input);
 
@@ -316,15 +322,26 @@ fn test_phase6_curation_is_explainable_and_compact() {
         .iter()
         .filter(|section| section.kind == PromptSegmentKind::Playbook)
         .collect();
-    assert_eq!(playbook_sections.len(), 2, "both playbook bullets should be represented in the manifest");
+    assert_eq!(
+        playbook_sections.len(),
+        2,
+        "both playbook bullets should be represented in the manifest"
+    );
 
     let trimmed_playbook = playbook_sections
         .iter()
-        .filter(|section| section.trim_reason == Some(grove_types::PromptTrimReason::LowerPriorityPlaybookBullet))
+        .filter(|section| {
+            section.trim_reason == Some(grove_types::PromptTrimReason::LowerPriorityPlaybookBullet)
+        })
         .count();
-    assert!(trimmed_playbook >= 1, "low-priority playbook bullets should trim under pressure");
     assert!(
-        playbook_sections.iter().all(|section| !section.provenance.bullet_ids.is_empty()),
+        trimmed_playbook >= 1,
+        "low-priority playbook bullets should trim under pressure"
+    );
+    assert!(
+        playbook_sections
+            .iter()
+            .all(|section| !section.provenance.bullet_ids.is_empty()),
         "playbook sections should remain explainable via bullet provenance even when trimmed"
     );
 }

@@ -1,11 +1,11 @@
+pub mod archive;
+pub mod diary;
 pub mod dispatch;
 pub mod inspect_view;
-pub mod status_view;
-pub mod archive;
 pub mod lesson_ingest;
-pub mod scoring;
-pub mod diary;
 pub mod reactions;
+pub mod scoring;
+pub mod status_view;
 
 use anyhow::{Context, Result};
 use grove_br::{BrClient, BrDependencySnapshot};
@@ -82,12 +82,13 @@ pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
         .join(DEFAULT_CHECKPOINTS_DIR_NAME);
     let started_at = chrono::Utc::now();
 
+    let escalation_tier = request.escalation_tier;
     db.record_run_started(RunStartInput {
         run_id: run_id.clone(),
         bead_id: bead_id.clone(),
         attempt_no,
         started_at,
-        escalation_tier: grove_types::EscalationTier::FirstAttempt,
+        escalation_tier,
     })?;
 
     let mut hooks = DbSessionLifecycleHooks::new(
@@ -102,7 +103,8 @@ pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
     match result {
         Ok(result) => {
             let checkpoint = hooks.take_checkpoint();
-            let run = finalize_persisted_run(hooks.db_mut(), &bead_id, &result.outcome, None, config)?;
+            let run =
+                finalize_persisted_run(hooks.db_mut(), &bead_id, &result.outcome, None, config)?;
             let handoff = persist_success_handoff(hooks.db_mut(), &bead_id, &result.outcome)?;
             Ok(PersistedTaskRunOutcome {
                 run,
@@ -223,7 +225,8 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
         detail: Option<&str>,
         at: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<()> {
-        self.db.update_run_activity(&self.bead_id, &self.run_id, activity, &at)?;
+        self.db
+            .update_run_activity(&self.bead_id, &self.run_id, activity, &at)?;
         if let Some(detail) = detail {
             self.db.write_event_log(
                 grove_types::EventKind::ActivityStateChanged,
@@ -240,7 +243,10 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
         Ok(())
     }
 
-    fn on_shutdown_requested(&mut self, grace_period: Option<std::time::Duration>) -> anyhow::Result<()> {
+    fn on_shutdown_requested(
+        &mut self,
+        grace_period: Option<std::time::Duration>,
+    ) -> anyhow::Result<()> {
         self.db.write_event_log(
             grove_types::EventKind::SessionTerminationRequested,
             Some(&self.bead_id),
@@ -301,15 +307,18 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
             self.checkpoint = Some(checkpoint);
         }
 
-        if let Ok(replay) = grove_session::replay_transcript(&result.outcome.session.transcript_path) {
+        if let Ok(replay) =
+            grove_session::replay_transcript(&result.outcome.session.transcript_path)
+        {
             if let Ok(mut archived) = crate::archive::ingest_transcript_to_archive(
                 self.bead_id.clone(),
                 self.run_id.clone(),
                 self.session_id.clone(),
                 &replay,
             ) {
-                archived.source_path = camino::Utf8PathBuf::from(result.outcome.session.transcript_path.clone());
-                
+                archived.source_path =
+                    camino::Utf8PathBuf::from(result.outcome.session.transcript_path.clone());
+
                 let source_record = grove_types::archive::SourceRecord {
                     id: grove_types::SourceId::new("transcript"),
                     source_path: archived.source_path.clone(),
@@ -476,7 +485,11 @@ fn recovery_capsule_from_outcome(
     grove_types::RecoveryCapsule::from_parts(
         outcome_kind,
         failure_class,
-        if enriched_detail.is_empty() { None } else { Some(enriched_detail.as_str()) },
+        if enriched_detail.is_empty() {
+            None
+        } else {
+            Some(enriched_detail.as_str())
+        },
         checkpoint.map(|payload| payload.progress.as_str()),
         checkpoint.map(|payload| payload.next_step.as_str()),
         None,
@@ -1060,7 +1073,9 @@ fn collect_local_suppressions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grove_types::{BeadId, BeadPriority, BeadRef, CircuitBreakerState, CircuitState, RunId, RunStatus};
+    use grove_types::{
+        BeadId, BeadPriority, BeadRef, CircuitBreakerState, CircuitState, RunId, RunStatus,
+    };
     use std::error::Error;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1567,6 +1582,8 @@ exit "${EXIT_CODE:-0}"
             playbook_rules: Vec::new(),
             env: Vec::new(),
             shutdown: grove_session::SessionShutdownConfig::default(),
+            escalation_tier: grove_types::EscalationTier::FirstAttempt,
+            mutation_strategy: None,
         }
     }
 
@@ -1611,7 +1628,13 @@ exit "${EXIT_CODE:-0}"
             ("EXIT_CODE".to_owned(), "0".to_owned()),
         ];
 
-        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1, &GroveConfig::default())?;
+        let persisted = execute_persisted_single_task_session(
+            &mut db,
+            &backend,
+            request,
+            1,
+            &GroveConfig::default(),
+        )?;
 
         assert_eq!(persisted.run.status, RunStatus::Succeeded);
         assert_eq!(persisted.session.session.status, SessionStatus::Completed);
@@ -1685,7 +1708,13 @@ exit "${EXIT_CODE:-0}"
             ("EXIT_CODE".to_owned(), "0".to_owned()),
         ];
 
-        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1, &GroveConfig::default())?;
+        let persisted = execute_persisted_single_task_session(
+            &mut db,
+            &backend,
+            request,
+            1,
+            &GroveConfig::default(),
+        )?;
 
         assert_eq!(persisted.run.status, RunStatus::Checkpointed);
         assert_eq!(
@@ -1843,7 +1872,13 @@ exit "${EXIT_CODE:-0}"
             ("EXIT_CODE".to_owned(), "1".to_owned()),
         ];
 
-        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1, &GroveConfig::default())?;
+        let persisted = execute_persisted_single_task_session(
+            &mut db,
+            &backend,
+            request,
+            1,
+            &GroveConfig::default(),
+        )?;
 
         assert_eq!(persisted.run.status, RunStatus::WaitingToRetry);
         assert_eq!(persisted.run.failure_class, Some(FailureClass::RateLimit));

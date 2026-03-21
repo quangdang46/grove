@@ -9,11 +9,11 @@
 
 use grove_db::Database;
 use grove_types::{
-    BeadId, RunId, SessionId, SourceId,
+    BeadId, PromptSegmentKind, RunId, SessionId, SourceId,
     archive::{
-        ConversationRecord, MessageRecord, MessageRole, RetrievalBundle, SnippetRecord, SourceRecord,
+        ConversationRecord, MessageRecord, MessageRole, RetrievalBundle, SnippetRecord,
+        SourceRecord,
     },
-    PromptSegmentKind,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -79,7 +79,7 @@ fn ingest_transcript_produces_searchable_archive_record() -> TestResult {
     db.insert_source_record(&sample_source())?;
     let conversation = sample_conversation(
         "ses-search-1",
-        "Implemented the graceful shutdown handler with SIGTERM support and clean stop reason tracking."
+        "Implemented the graceful shutdown handler with SIGTERM support and clean stop reason tracking.",
     );
 
     let conv_id = db.insert_conversation_record(&conversation)?;
@@ -108,11 +108,11 @@ fn fts_search_ranks_relevant_snippets_by_bm25() -> TestResult {
     // Insert two conversations with different relevance
     let conv1 = sample_conversation(
         "ses-rank-1",
-        "The authentication middleware validates JWT tokens and checks role-based permissions."
+        "The authentication middleware validates JWT tokens and checks role-based permissions.",
     );
     let conv2 = sample_conversation(
         "ses-rank-2",
-        "Fixed a typo in the README file and updated the changelog."
+        "Fixed a typo in the README file and updated the changelog.",
     );
 
     db.insert_conversation_record(&conv1)?;
@@ -177,6 +177,7 @@ fn archive_retrieval_integrates_into_prompt_assembly_as_bounded_snippets() -> Te
         retrieval_query: Some("shutdown OR archive".to_string()),
         archive_bundle: Some(bundle),
         playbook_rules: vec![],
+        escalation_context: None,
     };
 
     let materialized = materialize_prompt(input);
@@ -257,6 +258,7 @@ fn archive_snippets_are_trimmed_when_budget_is_tight() -> TestResult {
         retrieval_query: Some("budget OR archive".to_string()),
         archive_bundle: Some(bundle),
         playbook_rules: vec![],
+        escalation_context: None,
     };
 
     let materialized = materialize_prompt(input);
@@ -283,7 +285,7 @@ fn watermark_prevents_duplicate_ingest_on_restart() -> TestResult {
     db.insert_source_record(&sample_source())?;
     let conversation = sample_conversation(
         "ses-idempotent-1",
-        "First ingest of this session transcript."
+        "First ingest of this session transcript.",
     );
 
     // First insert should succeed
@@ -292,11 +294,18 @@ fn watermark_prevents_duplicate_ingest_on_restart() -> TestResult {
 
     // Second insert with same source+session should be no-op
     let second = db.insert_conversation_idempotent(&conversation)?;
-    assert!(second.is_none(), "duplicate ingest should be skipped by watermark");
+    assert!(
+        second.is_none(),
+        "duplicate ingest should be skipped by watermark"
+    );
 
     // Verify watermark was recorded
     let watermarks = db.list_watermarks_for_source("transcript")?;
-    assert_eq!(watermarks.len(), 1, "should have exactly one watermark entry");
+    assert_eq!(
+        watermarks.len(),
+        1,
+        "should have exactly one watermark entry"
+    );
     assert_eq!(watermarks[0].0, "ses-idempotent-1");
     assert_eq!(watermarks[0].2, 1, "record_count should be 1 (one message)");
 
@@ -310,7 +319,7 @@ fn fts_search_returns_empty_bundle_for_no_matches() -> TestResult {
     db.insert_source_record(&sample_source())?;
     db.insert_conversation_record(&sample_conversation(
         "ses-empty-1",
-        "A conversation about implementing error handling patterns."
+        "A conversation about implementing error handling patterns.",
     ))?;
 
     let bundle = db.search_archive_fts("quantum teleportation warp drive", 5)?;
