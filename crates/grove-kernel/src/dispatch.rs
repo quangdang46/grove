@@ -251,6 +251,7 @@ fn build_session_request(
         previous_outcome: None,
         rescue_card: None,
         retry_delta_summary: None,
+        retrieval_query: None,
         token_budget: None,
         ordinal_in_run: 1,
         archive_bundle: None,
@@ -534,6 +535,7 @@ pub fn run_dispatch_loop<B: ClaudeBackend, C: BrClient>(
         let fts_query = search_tokens.join(" OR ");
         
         if !fts_query.is_empty() {
+            request.retrieval_query = Some(fts_query.clone());
             if let Ok(bundle) = db.search_archive_fts(&fts_query, 5) {
                 request.archive_bundle = Some(bundle);
             }

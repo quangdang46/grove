@@ -62,6 +62,7 @@ fn sample_request(workspace_dir: Utf8PathBuf) -> SingleTaskSessionRequest {
         previous_outcome: None,
         rescue_card: None,
         retry_delta_summary: None,
+        retrieval_query: None,
         token_budget: Some(2_000),
         ordinal_in_run: 1,
         archive_bundle: None,

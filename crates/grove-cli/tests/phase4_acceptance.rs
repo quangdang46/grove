@@ -174,6 +174,7 @@ fn archive_retrieval_integrates_into_prompt_assembly_as_bounded_snippets() -> Te
         rescue_card: None,
         token_budget: None,
         retry_delta_summary: None,
+        retrieval_query: Some("shutdown OR archive".to_string()),
         archive_bundle: Some(bundle),
         playbook_rules: vec![],
     };
@@ -201,6 +202,13 @@ fn archive_retrieval_integrates_into_prompt_assembly_as_bounded_snippets() -> Te
             "archive snippet should carry message_id provenance"
         );
     }
+
+    assert_eq!(
+        materialized.manifest.retrieval_query.as_deref(),
+        Some("shutdown OR archive")
+    );
+    assert_eq!(materialized.manifest.retrieval_ranking_summary.len(), 2);
+    assert!(materialized.manifest.retrieval_ranking_summary[0].contains("Historical snippet"));
 
     // Rendered prompt should contain the snippet text
     assert!(
@@ -246,6 +254,7 @@ fn archive_snippets_are_trimmed_when_budget_is_tight() -> TestResult {
         rescue_card: None,
         token_budget: Some(30), // Very tight budget
         retry_delta_summary: None,
+        retrieval_query: Some("budget OR archive".to_string()),
         archive_bundle: Some(bundle),
         playbook_rules: vec![],
     };

@@ -31,6 +31,7 @@ pub struct PromptMaterializationInput {
     pub rescue_card: Option<String>,
     pub token_budget: Option<u32>,
     pub retry_delta_summary: Option<String>,
+    pub retrieval_query: Option<String>,
     pub archive_bundle: Option<grove_types::archive::RetrievalBundle>,
     pub playbook_rules: Vec<grove_types::playbook::PlaybookBulletRecord>,
 }
@@ -153,8 +154,13 @@ pub fn materialize_prompt(input: PromptMaterializationInput) -> PromptMaterializ
         prompt_bytes,
         trimmed: !materialized.trimmed_ordinals.is_empty(),
         retry_delta_summary: input.retry_delta_summary,
-        retrieval_query: None,
-        retrieval_ranking_summary: Vec::new(),
+        retrieval_query: input.retrieval_query,
+        retrieval_ranking_summary: materialized
+            .all_sections
+            .iter()
+            .filter(|section| section.kind == PromptSegmentKind::ArchiveSnippet)
+            .map(|section| section.heading.clone())
+            .collect(),
         sections: manifest_sections,
     };
 
@@ -375,6 +381,7 @@ mod tests {
             rescue_card: None,
             token_budget: None,
             retry_delta_summary: None,
+            retrieval_query: None,
             archive_bundle: None,
             playbook_rules: vec![],
         }

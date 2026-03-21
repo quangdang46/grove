@@ -136,6 +136,7 @@ fn pure_db_no_external_memory_tool_in_prompt_assembly() -> TestResult {
         rescue_card: None,
         token_budget: None,
         retry_delta_summary: None,
+        retrieval_query: None,
         archive_bundle: None,
         playbook_rules: vec![rule],
     };

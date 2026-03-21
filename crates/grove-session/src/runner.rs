@@ -37,6 +37,7 @@ pub struct SingleTaskSessionRequest {
     pub previous_outcome: Option<SessionOutcome>,
     pub rescue_card: Option<String>,
     pub retry_delta_summary: Option<String>,
+    pub retrieval_query: Option<String>,
     pub token_budget: Option<u32>,
     pub ordinal_in_run: i32,
     pub archive_bundle: Option<grove_types::archive::RetrievalBundle>,
@@ -135,6 +136,7 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
         rescue_card: request.rescue_card.clone(),
         token_budget: request.token_budget,
         retry_delta_summary: request.retry_delta_summary.clone(),
+        retrieval_query: request.retrieval_query.clone(),
         archive_bundle: request.archive_bundle.clone(),
         playbook_rules: request.playbook_rules.clone(),
     });
@@ -507,6 +509,7 @@ exit "${EXIT_CODE:-0}"
             previous_outcome: None,
             rescue_card: None,
             retry_delta_summary: None,
+            retrieval_query: None,
             token_budget: Some(2_000),
             ordinal_in_run: 1,
             archive_bundle: None,
