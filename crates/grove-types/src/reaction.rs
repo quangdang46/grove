@@ -107,7 +107,7 @@ pub struct ReactionContextSnapshot {
 }
 
 /// A rule that maps a trigger to an autonomous action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReactionRule {
     /// The trigger that invokes this reaction.
     pub trigger: ReactionTrigger,
@@ -230,6 +230,7 @@ pub fn default_reactions() -> Vec<ReactionRule> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]

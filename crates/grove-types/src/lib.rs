@@ -1,13 +1,14 @@
-mod archive;
+pub mod archive;
 mod checkpoint;
 mod errors;
 mod event;
 mod handoff;
 mod ids;
-mod playbook;
+mod ops;
+pub mod playbook;
 mod priority;
-mod prompt;
-mod reaction;
+pub mod prompt;
+pub mod reaction;
 mod reservation;
 mod run;
 mod session;
@@ -27,6 +28,9 @@ pub use event::{
 };
 pub use handoff::HandoffRecord;
 pub use ids::{BeadId, BulletId, CheckpointId, PromptId, RunId, SessionId, SourceId, TickId};
+pub use ops::{
+    ConfigSnapshotRecord, DispatchDecisionRecord, IntegrityCheckRecord, PromptMaterializationRecord,
+};
 pub use playbook::{
     BulletMaturity, BulletScope, BulletState, BulletType, FeedbackEventRecord, FeedbackKind,
     MemoryDiaryRecord, PlaybookBulletRecord,
@@ -42,9 +46,9 @@ pub use reaction::{
 };
 pub use reservation::{ReservationConflict, ReservationMode, ReservationRecord};
 pub use run::{
-    AgentActivity, AutonomousAction, EscalationPolicy, EscalationTier, FailureClass,
-    LeaderLeaseRecord, MirrorOutboxRecord, MirrorStatus, RecoveryCapsule, RecoveryCapsuleOutcome,
-    RetryPolicy, RunStatus, TaskRunRecord,
+    AgentActivity, AutonomousAction, CoordinatorStopReason, EscalationPolicy, EscalationTier,
+    FailureClass, LeaderLeaseRecord, MirrorOutboxRecord, MirrorStatus, RecoveryCapsule,
+    RecoveryCapsuleOutcome, RetryPolicy, RunStatus, TaskRunRecord,
 };
 pub use session::{
     CircuitBreakerState, CircuitState, ClaudeSessionRecord, ContextPressureLevel,

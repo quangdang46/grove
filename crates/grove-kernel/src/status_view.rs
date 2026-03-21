@@ -1,6 +1,7 @@
 use crate::{DispatchEligibility, DispatchEligibilityContext, LocalSuppressionReason};
 use anyhow::Result;
 use chrono::{Duration, Utc};
+use serde::Serialize;
 use grove_br::{BrClient, BrDependencySnapshot};
 use grove_bv::BvTriageOutput;
 use grove_config::GroveConfig;
@@ -15,10 +16,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub const QUERY_PURPOSE: &str =
     "Operator-facing status query models for grove status and dispatch explainability.";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StatusSnapshot {
     pub workspace_root: String,
     pub leader: Option<LeaderLeaseView>,
+    pub last_coordinator_stop: Option<CoordinatorStopView>,
     pub beads: Vec<GroveBeadRecord>,
     pub running_beads: Vec<RunningBeadView>,
     pub ready_queue: Vec<ReadyQueueEntry>,
@@ -34,6 +36,7 @@ impl StatusSnapshot {
         WorkspaceStatusView {
             workspace_root: self.workspace_root,
             leader: self.leader,
+            last_coordinator_stop: self.last_coordinator_stop,
             bead_status_counts: count_beads_statuses(&self.beads),
             grove_status_counts: count_grove_statuses(&self.beads),
             running_beads: self.running_beads,
@@ -46,10 +49,11 @@ impl StatusSnapshot {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceStatusView {
     pub workspace_root: String,
     pub leader: Option<LeaderLeaseView>,
+    pub last_coordinator_stop: Option<CoordinatorStopView>,
     pub bead_status_counts: Vec<StatusCount>,
     pub grove_status_counts: Vec<StatusCount>,
     pub running_beads: Vec<RunningBeadView>,
@@ -60,18 +64,27 @@ pub struct WorkspaceStatusView {
     pub mirror_pending: Vec<MirrorPendingView>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StatusCount {
     pub status: String,
     pub count: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LeaderLeaseView {
     pub owner_label: String,
     pub acquired_at: Option<Timestamp>,
     pub heartbeat_at: Option<Timestamp>,
     pub expires_at: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoordinatorStopView {
+    pub reason: String,
+    pub created_at: Timestamp,
+    pub forced: bool,
+    pub running_session_count: Option<u64>,
+    pub leader_released: Option<bool>,
 }
 
 impl LeaderLeaseView {
@@ -86,7 +99,7 @@ impl LeaderLeaseView {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RunningBeadView {
     pub bead_id: BeadId,
     pub title: String,
@@ -100,7 +113,7 @@ pub struct RunningBeadView {
     pub last_progress: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ReadyQueueEntry {
     pub bead_id: BeadId,
     pub title: String,
@@ -114,14 +127,14 @@ pub struct ReadyQueueEntry {
     pub ready_minutes: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ScoreComponentView {
     pub label: String,
     pub value: f64,
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CheckpointedBeadView {
     pub bead_id: BeadId,
     pub title: String,
@@ -134,7 +147,7 @@ pub struct CheckpointedBeadView {
     pub recovery_capsule: Option<RecoveryCapsule>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FailedBeadView {
     pub bead_id: BeadId,
     pub title: String,
@@ -149,7 +162,7 @@ pub struct FailedBeadView {
     pub mirror_pending: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MirrorPendingView {
     pub bead_id: BeadId,
     pub run_id: Option<RunId>,
@@ -158,7 +171,7 @@ pub struct MirrorPendingView {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DispatchExplanationView {
     pub ready_in_br: bool,
     pub dispatchable_in_grove: bool,
@@ -201,7 +214,7 @@ impl DispatchExplanationView {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SuppressionReasonView {
     pub code: &'static str,
     pub summary: String,
@@ -307,7 +320,7 @@ impl SuppressionReasonView {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ReservationConflictView {
     pub requested_by_bead: BeadId,
     pub conflicting_bead: BeadId,
@@ -388,6 +401,32 @@ pub fn load_status_snapshot<C: BrClient>(
     let dependency_map = dependency_snapshots_by_bead(&beads, db)?;
 
     let leader = db.active_leader_lease(&now)?;
+    let last_coordinator_stop = db
+        .latest_event_by_kind(grove_types::EventKind::CoordinatorStopped)?
+        .and_then(|event| {
+            Some(CoordinatorStopView {
+                reason: event
+                    .payload
+                    .get("stop_reason")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                created_at: event.created_at,
+                forced: event
+                    .payload
+                    .get("forced_termination")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                running_session_count: event
+                    .payload
+                    .get("running_session_count")
+                    .and_then(|value| value.as_u64()),
+                leader_released: event
+                    .payload
+                    .get("leader_released")
+                    .and_then(|value| value.as_bool()),
+            })
+        });
     let running_beads = build_running_beads(&beads, db)?;
     let ready_queue = build_ready_queue(
         &beads,
@@ -411,6 +450,7 @@ pub fn load_status_snapshot<C: BrClient>(
     Ok(StatusSnapshot {
         workspace_root: workspace_root.to_owned(),
         leader: leader.map(LeaderLeaseView::from_record),
+        last_coordinator_stop,
         beads,
         running_beads,
         ready_queue,
@@ -470,7 +510,7 @@ fn build_ready_queue(
                 bead,
                 &DispatchEligibilityContext {
                     ready_in_br: ready_ids.contains(&bead.bead.id),
-                    circuit_state: grove_types::CircuitState::Closed,
+                    circuit_state: crate::circuit_state_for_bead(bead),
                     reservation_conflicts: conflicts.clone(),
                     now,
                 },
@@ -647,7 +687,7 @@ fn build_failed_beads(
             bead,
             &DispatchEligibilityContext {
                 ready_in_br: ready_ids.contains(&bead.bead.id),
-                circuit_state: grove_types::CircuitState::Closed,
+                circuit_state: crate::circuit_state_for_bead(bead),
                 reservation_conflicts: conflicts,
                 now,
             },
@@ -1033,8 +1073,8 @@ mod tests {
         BvTriageMeta, BvTriageOutput, BvVelocitySummary,
     };
     use grove_types::{
-        BeadRef, CircuitState, HandoffRecord, MirrorStatus, RecoveryCapsule,
-        RecoveryCapsuleOutcome, RunId, Timestamp,
+        BeadRef, CircuitBreakerState, CircuitState, HandoffRecord, MirrorStatus,
+        RecoveryCapsule, RecoveryCapsuleOutcome, RunId, Timestamp,
     };
     use std::collections::{HashMap, HashSet};
     use std::error::Error;
@@ -1098,6 +1138,35 @@ mod tests {
         assert_eq!(grove_counts[0].status, "Ready");
         assert_eq!(grove_counts[1].status, "Running");
         assert_eq!(grove_counts[2].status, "Succeeded");
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_explanation_uses_persisted_open_circuit_state() -> TestResult {
+        let mut bead = sample_bead("grove-circuit", "open", GroveBeadStatus::Ready)?;
+        bead.circuit_breaker_state = Some(CircuitBreakerState {
+            state: CircuitState::Open,
+            no_progress_count: 3,
+            same_error_count: 0,
+            permission_denial_count: 0,
+            last_error_fingerprint: Some("same-error".to_owned()),
+            opened_at: Some(parse_ts("2026-03-16T12:00:00Z")?),
+        });
+        let eligibility = crate::evaluate_dispatch_eligibility(
+            &bead,
+            &crate::DispatchEligibilityContext {
+                ready_in_br: true,
+                circuit_state: crate::circuit_state_for_bead(&bead),
+                reservation_conflicts: Vec::new(),
+                now: parse_ts("2026-03-16T12:00:00Z")?,
+            },
+        );
+
+        let view = DispatchExplanationView::from_eligibility(&eligibility);
+
+        assert!(!view.dispatchable_in_grove);
+        assert_eq!(view.summary(), "circuit breaker is open");
+        assert_eq!(view.local_suppression_reasons[0].code, "circuit_open");
         Ok(())
     }
 
@@ -1464,6 +1533,7 @@ mod tests {
             retry_after: None,
             last_failure_class: None,
             last_failure_detail: None,
+            circuit_breaker_state: None,
             synced_at: parse_ts("2026-03-16T12:05:00Z")?,
             runtime_updated_at: parse_ts("2026-03-16T12:05:00Z")?,
         };
@@ -1647,6 +1717,7 @@ mod tests {
             retry_after,
             last_failure_class: None,
             last_failure_detail: None,
+            circuit_breaker_state: None,
             synced_at: updated_at,
             runtime_updated_at: updated_at,
         })

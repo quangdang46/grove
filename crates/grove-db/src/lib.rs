@@ -9,13 +9,19 @@ use grove_br::{
 };
 use grove_types::{
     BeadId, BeadPriority, BeadRef, CheckpointId, CheckpointPayload, CheckpointRecord,
-    ClaudeSessionRecord, EventKind, EventLogRecord, FailureClass, GroveBeadRecord, GroveBeadStatus,
-    HandoffRecord, LeaderLeaseRecord, MirrorOutboxRecord, MirrorStatus, PromptId, RecoveryCapsule,
-    RecoveryCapsuleOutcome, ReservationConflict, ReservationMode, ReservationRecord, RunId,
-    RunStatus, SessionId, SessionStatus, StopReason, TaskRunRecord, Timestamp,
+    CircuitBreakerState, ClaudeSessionRecord, EventKind, EventLogRecord, FailureClass,
+    GroveBeadRecord, GroveBeadStatus, HandoffRecord, LeaderLeaseRecord, MirrorOutboxRecord,
+    MirrorStatus, PromptId, RecoveryCapsule, RecoveryCapsuleOutcome, ReservationConflict,
+    ReservationMode, ReservationRecord, RunId, RunStatus, SessionId, SessionStatus, StopReason,
+    TaskRunRecord, Timestamp,
 };
 
+mod ops;
+mod archive;
+mod playbook;
+
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use serde::Serialize;
 use serde_json::Value;
 
 pub const CRATE_PURPOSE: &str = "SQLite bootstrap, migrations, and runtime persistence.";
@@ -62,6 +68,7 @@ pub struct RunFinishInput {
     pub failure_detail: Option<String>,
     pub ended_at: chrono::DateTime<Utc>,
     pub retry_after: Option<chrono::DateTime<Utc>>,
+    pub circuit_breaker_state: Option<CircuitBreakerState>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,7 +126,7 @@ pub struct MirrorOutboxUpdateInput {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RecoveryCapsuleEvent {
     pub capsule: RecoveryCapsule,
     pub source_event_id: i64,
@@ -163,6 +170,41 @@ const MIGRATION_MANIFEST: &[Migration<'_>] = &[
         name: "0004_mirror_outbox.sql",
         sql: include_str!("../migrations/0004_mirror_outbox.sql"),
     },
+    Migration {
+        version: 5,
+        name: "0005_operational_schema.sql",
+        sql: include_str!("../migrations/0005_operational_schema.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "0006_observability.sql",
+        sql: include_str!("../migrations/0006_observability.sql"),
+    },
+    Migration {
+        version: 7,
+        name: "0007_archive_fts.sql",
+        sql: include_str!("../migrations/0007_archive_fts.sql"),
+    },
+    Migration {
+        version: 8,
+        name: "0008_archive_watermarks.sql",
+        sql: include_str!("../migrations/0008_archive_watermarks.sql"),
+    },
+    Migration {
+        version: 9,
+        name: "0009_playbook.sql",
+        sql: include_str!("../migrations/0009_playbook.sql"),
+    },
+    Migration {
+        version: 10,
+        name: "0010_activity_state.sql",
+        sql: include_str!("../migrations/0010_activity_state.sql"),
+    },
+    Migration {
+        version: 11,
+        name: "0011_circuit_breaker_state.sql",
+        sql: include_str!("../migrations/0011_circuit_breaker_state.sql"),
+    },
 ];
 
 #[derive(Debug)]
@@ -202,6 +244,7 @@ struct RawBeadRecordRow {
     retry_after: Option<String>,
     last_failure_class: Option<String>,
     last_failure_detail: Option<String>,
+    circuit_breaker_json: Option<String>,
     runtime_updated_at: Option<String>,
 }
 
@@ -218,6 +261,9 @@ struct RawTaskRunRow {
     session_count: i32,
     checkpoint_count: i32,
     last_checkpoint_id: Option<String>,
+    activity: Option<String>,
+    last_activity_at: Option<String>,
+    escalation_tier: String,
 }
 
 #[derive(Debug)]
@@ -380,7 +426,7 @@ impl Database {
                 "SELECT c.bead_id, c.title, c.description, c.priority, c.issue_type, c.status, c.assignee, \
                     c.labels_json, c.raw_json, c.synced_at, r.grove_status, r.declared_paths_json, \
                     r.metadata_json, r.last_run_id, r.retry_after, r.last_failure_class, \
-                    r.last_failure_detail, r.runtime_updated_at \
+                    r.last_failure_detail, r.circuit_breaker_json, r.runtime_updated_at \
                  FROM bead_cache c \
                  LEFT JOIN bead_runtime r ON r.bead_id = c.bead_id \
                  ORDER BY c.priority ASC, c.bead_id ASC",
@@ -408,7 +454,7 @@ impl Database {
                 "SELECT c.bead_id, c.title, c.description, c.priority, c.issue_type, c.status, c.assignee, \
                     c.labels_json, c.raw_json, c.synced_at, r.grove_status, r.declared_paths_json, \
                     r.metadata_json, r.last_run_id, r.retry_after, r.last_failure_class, \
-                    r.last_failure_detail, r.runtime_updated_at \
+                    r.last_failure_detail, r.circuit_breaker_json, r.runtime_updated_at \
                  FROM bead_cache c \
                  LEFT JOIN bead_runtime r ON r.bead_id = c.bead_id \
                  WHERE c.bead_id = ?1",
@@ -470,7 +516,7 @@ impl Database {
             .conn
             .prepare(
                 "SELECT id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, \
-                    session_count, checkpoint_count, last_checkpoint_id \
+                    session_count, checkpoint_count, last_checkpoint_id, activity, last_activity_at, escalation_tier \
                  FROM task_runs \
                  WHERE bead_id = ?1 \
                  ORDER BY attempt_no DESC, started_at DESC",
@@ -496,14 +542,17 @@ impl Database {
         ensure_bead_exists(&tx, &input.bead_id)?;
         tx.execute(
             "INSERT INTO task_runs(\
-                id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id\
-             ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, NULL, 0, 0, NULL)",
+                id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id, activity, last_activity_at, escalation_tier\
+             ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, NULL, 0, 0, NULL, ?6, ?7, ?8)",
             params![
                 input.run_id.as_str(),
                 input.bead_id.as_str(),
                 input.attempt_no,
                 encode_run_status(RunStatus::Active),
                 timestamp_string(&input.started_at),
+                encode_agent_activity(grove_types::AgentActivity::Active),
+                timestamp_string(&input.started_at),
+                encode_escalation_tier(grove_types::EscalationTier::FirstAttempt),
             ],
         )
         .with_context(|| format!("insert task run {}", input.run_id.as_str()))?;
@@ -516,6 +565,7 @@ impl Database {
             Some(None),
             Some(None),
             Some(None),
+            None,
             &input.started_at,
         )?;
         insert_event_log_tx(
@@ -532,7 +582,7 @@ impl Database {
         )?;
         let raw = tx
             .query_row(
-                "SELECT id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id \
+                "SELECT id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id, activity, last_activity_at, escalation_tier \
                  FROM task_runs WHERE id = ?1",
                 [input.run_id.as_str()],
                 raw_task_run_row,
@@ -591,6 +641,7 @@ impl Database {
             None,
             Some(None),
             Some(None),
+            None,
             &session.started_at,
         )?;
         insert_event_log_tx(
@@ -676,6 +727,7 @@ impl Database {
             Some(None),
             Some(failure_class),
             Some(failure_detail.clone()),
+            None,
             &session.ended_at.unwrap_or_else(Utc::now),
         )?;
         insert_event_log_tx(
@@ -738,6 +790,7 @@ impl Database {
             Some(None),
             Some(None),
             Some(None),
+            None,
             &input.saved_at,
         )?;
         insert_event_log_tx(
@@ -778,12 +831,13 @@ impl Database {
         ensure_run_exists(&tx, &input.run_id)?;
         ensure_run_belongs_to_bead(&tx, &input.run_id, bead_id)?;
         tx.execute(
-            "UPDATE task_runs SET status = ?2, failure_class = ?3, failure_detail = ?4, ended_at = ?5 WHERE id = ?1",
+            "UPDATE task_runs SET status = ?2, failure_class = ?3, failure_detail = ?4, ended_at = ?5, last_activity_at = ?6 WHERE id = ?1",
             params![
                 input.run_id.as_str(),
                 encode_run_status(input.status),
                 input.failure_class.map(encode_failure_class),
                 input.failure_detail.as_deref(),
+                timestamp_string(&input.ended_at),
                 timestamp_string(&input.ended_at),
             ],
         )
@@ -808,6 +862,7 @@ impl Database {
             Some(input.retry_after),
             Some(input.failure_class),
             Some(input.failure_detail.clone()),
+            Some(input.circuit_breaker_state.clone()),
             &input.ended_at,
         )?;
         let event_kind = match input.status {
@@ -832,7 +887,7 @@ impl Database {
         )?;
         let raw = tx
             .query_row(
-                "SELECT id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id \
+                "SELECT id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id, activity, last_activity_at, escalation_tier \
                  FROM task_runs WHERE id = ?1",
                 [input.run_id.as_str()],
                 raw_task_run_row,
@@ -1191,6 +1246,7 @@ impl Database {
                 Some(None),
                 Some(Some(FailureClass::Interrupted)),
                 Some(Some(failure_detail.to_owned())),
+                None,
                 now,
             )?;
 
@@ -1232,7 +1288,7 @@ impl Database {
             }
 
             let raw = tx.query_row(
-                "SELECT id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id \
+                "SELECT id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id, activity, last_activity_at, escalation_tier \
                  FROM task_runs WHERE id = ?1",
                 [run.id.as_str()],
                 raw_task_run_row,
@@ -1248,6 +1304,82 @@ impl Database {
         tx.commit()
             .context("commit interrupted run reconciliation transaction")?;
         Ok(recovered)
+    }
+
+    pub fn write_event_log(
+        &mut self,
+        kind: EventKind,
+        bead_id: Option<&BeadId>,
+        run_id: Option<&RunId>,
+        session_id: Option<&SessionId>,
+        payload: &serde_json::Value,
+        created_at: &chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        self.with_tx(|tx| insert_event_log_tx(tx, kind, bead_id, run_id, session_id, payload, created_at))
+    }
+
+    pub fn update_run_activity(
+        &mut self,
+        bead_id: &BeadId,
+        run_id: &RunId,
+        activity: grove_types::AgentActivity,
+        updated_at: &chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        self.with_tx(|tx| {
+            ensure_bead_exists(tx, bead_id)?;
+            ensure_run_exists(tx, run_id)?;
+            ensure_run_belongs_to_bead(tx, run_id, bead_id)?;
+            tx.execute(
+                "UPDATE task_runs SET activity = ?2, last_activity_at = ?3 WHERE id = ?1",
+                params![
+                    run_id.as_str(),
+                    encode_agent_activity(activity),
+                    timestamp_string(updated_at),
+                ],
+            )
+            .with_context(|| format!("update run activity {}", run_id.as_str()))?;
+            insert_event_log_tx(
+                tx,
+                EventKind::ActivityStateChanged,
+                Some(bead_id),
+                Some(run_id),
+                None,
+                &serde_json::json!({
+                    "activity": encode_agent_activity(activity),
+                }),
+                updated_at,
+            )
+        })
+    }
+
+    pub fn update_run_escalation_tier(
+        &mut self,
+        bead_id: &BeadId,
+        run_id: &RunId,
+        tier: grove_types::EscalationTier,
+        updated_at: &chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        self.with_tx(|tx| {
+            ensure_bead_exists(tx, bead_id)?;
+            ensure_run_exists(tx, run_id)?;
+            ensure_run_belongs_to_bead(tx, run_id, bead_id)?;
+            tx.execute(
+                "UPDATE task_runs SET escalation_tier = ?2 WHERE id = ?1",
+                params![run_id.as_str(), encode_escalation_tier(tier)],
+            )
+            .with_context(|| format!("update escalation tier {}", run_id.as_str()))?;
+            insert_event_log_tx(
+                tx,
+                EventKind::EscalationTierChanged,
+                Some(bead_id),
+                Some(run_id),
+                None,
+                &serde_json::json!({
+                    "escalation_tier": encode_escalation_tier(tier),
+                }),
+                updated_at,
+            )
+        })
     }
 
     pub fn list_event_logs_for_bead(&self, bead_id: &BeadId) -> Result<Vec<EventLogRecord>> {
@@ -1401,6 +1533,83 @@ impl Database {
             .map(raw_reservation_into_record)
             .collect()
     }
+
+    pub fn reset_bead_for_retry(
+        &mut self,
+        bead_id: &BeadId,
+        now: &chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .context("begin reset bead for retry transaction")?;
+        
+        tx.execute(
+            "UPDATE bead_runtime \
+             SET grove_status = ?2, retry_after = NULL, circuit_breaker_json = NULL, runtime_updated_at = ?3 \
+             WHERE bead_id = ?1",
+            params![
+                bead_id.as_str(),
+                encode_grove_bead_status(GroveBeadStatus::Ready),
+                timestamp_string(now)
+            ],
+        )
+        .with_context(|| format!("update bead_runtime for retry {}", bead_id.as_str()))?;
+
+        insert_event_log_tx(
+            &tx,
+            EventKind::RecoveryActionTaken,
+            Some(bead_id),
+            None,
+            None,
+            &serde_json::json!({"action": "retry_reset"}),
+            now,
+        )?;
+
+        tx.commit().context("commit reset bead for retry transaction")?;
+        Ok(())
+    }
+
+    pub fn latest_event_by_kind(&self, kind: EventKind) -> Result<Option<EventLogRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, kind, bead_id, run_id, session_id, payload_json, created_at \
+                 FROM event_log \
+                 WHERE kind = ?1 \
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .context("prepare latest event by kind query")?;
+
+        stmt.query_row([encode_event_kind(kind)], raw_event_log_row)
+            .optional()
+            .context("query latest event by kind")?
+            .map(raw_event_log_into_record)
+            .transpose()
+    }
+
+    pub fn list_events_for_run(&self, run_id: &RunId) -> Result<Vec<EventLogRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, kind, bead_id, run_id, session_id, payload_json, created_at \
+                 FROM event_log \
+                 WHERE run_id = ?1 \
+                 ORDER BY id ASC",
+            )
+            .context("prepare run event log list query")?;
+
+        let rows = stmt
+            .query_map([run_id.as_str()], raw_event_log_row)
+            .with_context(|| format!("query event log for run {}", run_id.as_str()))?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect run event log rows")?
+            .into_iter()
+            .map(raw_event_log_into_record)
+            .collect()
+    }
+
 
     pub fn acquire_reservations(
         &mut self,
@@ -2147,8 +2356,8 @@ impl BeadCacheStore for Database {
             .execute(
                 "INSERT INTO bead_runtime(\
                     bead_id, grove_status, declared_paths_json, metadata_json, last_run_id, retry_after,\
-                    last_failure_class, last_failure_detail, runtime_updated_at\
-                 ) VALUES (?1, ?2, '[]', '{}', NULL, NULL, NULL, NULL, ?3) \
+                    last_failure_class, last_failure_detail, circuit_breaker_json, runtime_updated_at\
+                 ) VALUES (?1, ?2, '[]', '{}', NULL, NULL, NULL, NULL, NULL, ?3) \
                  ON CONFLICT(bead_id) DO UPDATE SET \
                     grove_status = excluded.grove_status, \
                     runtime_updated_at = excluded.runtime_updated_at",
@@ -2214,7 +2423,8 @@ fn raw_bead_record_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawBeadRecor
         retry_after: row.get(14)?,
         last_failure_class: row.get(15)?,
         last_failure_detail: row.get(16)?,
-        runtime_updated_at: row.get(17)?,
+        circuit_breaker_json: row.get(17)?,
+        runtime_updated_at: row.get(18)?,
     })
 }
 
@@ -2231,6 +2441,9 @@ fn raw_task_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTaskRunRow> 
         session_count: row.get(8)?,
         checkpoint_count: row.get(9)?,
         last_checkpoint_id: row.get(10)?,
+        activity: row.get(11)?,
+        last_activity_at: row.get(12)?,
+        escalation_tier: row.get(13)?,
     })
 }
 
@@ -2368,6 +2581,11 @@ fn raw_bead_record_into_record(row: RawBeadRecordRow) -> Result<GroveBeadRecord>
             .map(parse_failure_class)
             .transpose()?,
         last_failure_detail: row.last_failure_detail,
+        circuit_breaker_state: row
+            .circuit_breaker_json
+            .as_deref()
+            .map(|text| parse_json(text, "circuit breaker state"))
+            .transpose()?,
         synced_at,
         runtime_updated_at,
     })
@@ -2390,10 +2608,17 @@ fn raw_task_run_into_record(row: RawTaskRunRow) -> Result<TaskRunRecord> {
         session_count: row.session_count,
         checkpoint_count: row.checkpoint_count,
         last_checkpoint_id: row.last_checkpoint_id.map(CheckpointId::new),
-        // New fields - will be None for existing records
-        activity: None,
-        last_activity_at: None,
-        escalation_tier: Default::default(),
+        activity: row
+            .activity
+            .as_deref()
+            .map(parse_agent_activity)
+            .transpose()?,
+        last_activity_at: row
+            .last_activity_at
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?,
+        escalation_tier: parse_escalation_tier(&row.escalation_tier)?,
     })
 }
 
@@ -2639,7 +2864,7 @@ fn active_leader_lease_tx(
 fn list_runs_by_status_tx(tx: &Transaction<'_>, status: RunStatus) -> Result<Vec<TaskRunRecord>> {
     let mut stmt = tx
         .prepare(
-            "SELECT id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id \
+            "SELECT id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id, activity, last_activity_at, escalation_tier \
              FROM task_runs WHERE status = ?1 ORDER BY started_at ASC, id ASC",
         )
         .context("prepare runs by status query")?;
@@ -2769,7 +2994,7 @@ fn set_declared_paths_tx(
     tx.execute(
         "INSERT INTO bead_runtime(\
             bead_id, grove_status, declared_paths_json, metadata_json, last_run_id, retry_after,\
-            last_failure_class, last_failure_detail, runtime_updated_at\
+            last_failure_class, last_failure_detail, circuit_breaker_json, runtime_updated_at\
          ) VALUES (\
             ?1, COALESCE((SELECT grove_status FROM bead_runtime WHERE bead_id = ?1), 'Idle'), ?2,\
             COALESCE((SELECT metadata_json FROM bead_runtime WHERE bead_id = ?1), '{}'),\
@@ -2777,6 +3002,7 @@ fn set_declared_paths_tx(
             COALESCE((SELECT retry_after FROM bead_runtime WHERE bead_id = ?1), NULL),\
             COALESCE((SELECT last_failure_class FROM bead_runtime WHERE bead_id = ?1), NULL),\
             COALESCE((SELECT last_failure_detail FROM bead_runtime WHERE bead_id = ?1), NULL),\
+            COALESCE((SELECT circuit_breaker_json FROM bead_runtime WHERE bead_id = ?1), NULL),\
             ?4\
          )\
          ON CONFLICT(bead_id) DO UPDATE SET \
@@ -2840,6 +3066,10 @@ fn encode_event_kind(kind: EventKind) -> &'static str {
         EventKind::LeaseAcquired => "LeaseAcquired",
         EventKind::LeaseHeartbeat => "LeaseHeartbeat",
         EventKind::LeaseReleased => "LeaseReleased",
+        EventKind::ShutdownRequested => "ShutdownRequested",
+        EventKind::SessionTerminationRequested => "SessionTerminationRequested",
+        EventKind::SessionTerminationForced => "SessionTerminationForced",
+        EventKind::CoordinatorStopped => "CoordinatorStopped",
         EventKind::ArchiveIngested => "ArchiveIngested",
         EventKind::PlaybookBulletAdded => "PlaybookBulletAdded",
         EventKind::PlaybookBulletPromoted => "PlaybookBulletPromoted",
@@ -2885,6 +3115,9 @@ fn session_failure_class(session: &ClaudeSessionRecord) -> Option<FailureClass> 
         SessionStatus::RateLimited => Some(FailureClass::RateLimit),
         SessionStatus::PermissionDenied => Some(FailureClass::PermissionDenied),
         SessionStatus::Crashed => Some(FailureClass::ClaudeCrashed),
+        SessionStatus::UnknownFailure if session.stop_reason == Some(StopReason::Kill) => {
+            Some(FailureClass::Interrupted)
+        }
         SessionStatus::UnknownFailure => Some(FailureClass::Unknown),
         SessionStatus::Starting
         | SessionStatus::Running
@@ -2902,6 +3135,7 @@ fn upsert_bead_runtime_tx(
     retry_after: Option<Option<chrono::DateTime<Utc>>>,
     last_failure_class: Option<Option<FailureClass>>,
     last_failure_detail: Option<Option<String>>,
+    circuit_breaker_state: Option<Option<CircuitBreakerState>>,
     runtime_updated_at: &chrono::DateTime<Utc>,
 ) -> Result<()> {
     let declared_paths_json = declared_paths
@@ -2911,15 +3145,20 @@ fn upsert_bead_runtime_tx(
     let retry_after = retry_after.flatten().map(|value| timestamp_string(&value));
     let last_failure_class = last_failure_class.flatten().map(encode_failure_class);
     let last_failure_detail = last_failure_detail.flatten();
+    let circuit_breaker_json = circuit_breaker_state
+        .flatten()
+        .map(|state| serde_json::to_string(&state).context("serialize circuit breaker state"))
+        .transpose()?;
     let runtime_updated_at = timestamp_string(runtime_updated_at);
 
     tx.execute(
         "INSERT INTO bead_runtime(\
             bead_id, grove_status, declared_paths_json, metadata_json, last_run_id, retry_after,\
-            last_failure_class, last_failure_detail, runtime_updated_at\
+            last_failure_class, last_failure_detail, circuit_breaker_json, runtime_updated_at\
          ) VALUES (\
             ?1, ?2, COALESCE(?3, (SELECT declared_paths_json FROM bead_runtime WHERE bead_id = ?1), '[]'),\
-            COALESCE((SELECT metadata_json FROM bead_runtime WHERE bead_id = ?1), '{}'), ?4, ?5, ?6, ?7, ?8\
+            COALESCE((SELECT metadata_json FROM bead_runtime WHERE bead_id = ?1), '{}'), ?4, ?5, ?6, ?7,\
+            COALESCE(?8, (SELECT circuit_breaker_json FROM bead_runtime WHERE bead_id = ?1), NULL), ?9\
          ) \
          ON CONFLICT(bead_id) DO UPDATE SET \
             grove_status = COALESCE(excluded.grove_status, bead_runtime.grove_status),\
@@ -2928,6 +3167,7 @@ fn upsert_bead_runtime_tx(
             retry_after = excluded.retry_after,\
             last_failure_class = excluded.last_failure_class,\
             last_failure_detail = excluded.last_failure_detail,\
+            circuit_breaker_json = excluded.circuit_breaker_json,\
             runtime_updated_at = excluded.runtime_updated_at",
         params![
             bead_id.as_str(),
@@ -2937,6 +3177,7 @@ fn upsert_bead_runtime_tx(
             retry_after,
             last_failure_class,
             last_failure_detail,
+            circuit_breaker_json,
             runtime_updated_at,
         ],
     )
@@ -3065,6 +3306,26 @@ fn encode_grove_bead_status(status: GroveBeadStatus) -> &'static str {
     }
 }
 
+fn encode_agent_activity(activity: grove_types::AgentActivity) -> &'static str {
+    match activity {
+        grove_types::AgentActivity::Active => "Active",
+        grove_types::AgentActivity::Ready => "Ready",
+        grove_types::AgentActivity::Idle => "Idle",
+        grove_types::AgentActivity::Blocked => "Blocked",
+        grove_types::AgentActivity::Exited => "Exited",
+    }
+}
+
+fn encode_escalation_tier(tier: grove_types::EscalationTier) -> &'static str {
+    match tier {
+        grove_types::EscalationTier::FirstAttempt => "FirstAttempt",
+        grove_types::EscalationTier::SecondAttempt => "SecondAttempt",
+        grove_types::EscalationTier::ThirdAttempt => "ThirdAttempt",
+        grove_types::EscalationTier::FinalAttempt => "FinalAttempt",
+        grove_types::EscalationTier::GiveUp => "GiveUp",
+    }
+}
+
 fn encode_failure_class(class: FailureClass) -> &'static str {
     match class {
         FailureClass::Timeout => "Timeout",
@@ -3138,6 +3399,28 @@ fn parse_grove_bead_status(text: &str) -> Result<GroveBeadStatus> {
         "succeeded" => Ok(GroveBeadStatus::Succeeded),
         "failed" => Ok(GroveBeadStatus::Failed),
         _ => bail!("unsupported grove bead status {text}"),
+    }
+}
+
+fn parse_agent_activity(text: &str) -> Result<grove_types::AgentActivity> {
+    match normalize_enum_token(text).as_str() {
+        "active" => Ok(grove_types::AgentActivity::Active),
+        "ready" => Ok(grove_types::AgentActivity::Ready),
+        "idle" => Ok(grove_types::AgentActivity::Idle),
+        "blocked" => Ok(grove_types::AgentActivity::Blocked),
+        "exited" => Ok(grove_types::AgentActivity::Exited),
+        _ => bail!("unsupported agent activity {text}"),
+    }
+}
+
+fn parse_escalation_tier(text: &str) -> Result<grove_types::EscalationTier> {
+    match normalize_enum_token(text).as_str() {
+        "firstattempt" => Ok(grove_types::EscalationTier::FirstAttempt),
+        "secondattempt" => Ok(grove_types::EscalationTier::SecondAttempt),
+        "thirdattempt" => Ok(grove_types::EscalationTier::ThirdAttempt),
+        "finalattempt" => Ok(grove_types::EscalationTier::FinalAttempt),
+        "giveup" => Ok(grove_types::EscalationTier::GiveUp),
+        _ => bail!("unsupported escalation tier {text}"),
     }
 }
 
@@ -3219,6 +3502,10 @@ fn parse_event_kind(text: &str) -> Result<EventKind> {
         "leaseacquired" => Ok(EventKind::LeaseAcquired),
         "leaseheartbeat" => Ok(EventKind::LeaseHeartbeat),
         "leasereleased" => Ok(EventKind::LeaseReleased),
+        "shutdownrequested" => Ok(EventKind::ShutdownRequested),
+        "sessionterminationrequested" => Ok(EventKind::SessionTerminationRequested),
+        "sessionterminationforced" => Ok(EventKind::SessionTerminationForced),
+        "coordinatorstopped" => Ok(EventKind::CoordinatorStopped),
         "archiveingested" => Ok(EventKind::ArchiveIngested),
         "playbookbulletadded" => Ok(EventKind::PlaybookBulletAdded),
         "playbookbulletpromoted" => Ok(EventKind::PlaybookBulletPromoted),
@@ -3252,9 +3539,10 @@ mod tests {
         BrIssueSummary, BrVersion, sync_bead_cache,
     };
     use grove_types::{
-        BeadId, BeadPriority, CheckpointId, CheckpointPayload, ClaudeSessionRecord, EventKind,
-        FailureClass, HandoffRecord, PromptId, RecoveryCapsuleOutcome, ReservationMode, RunId,
-        RunStatus, SessionId, SessionStatus, StopReason, Timestamp,
+        BeadId, BeadPriority, CheckpointId, CheckpointPayload, CircuitBreakerState,
+        ClaudeSessionRecord, EventKind, FailureClass, HandoffRecord, PromptId,
+        RecoveryCapsuleOutcome, ReservationMode, RunId, RunStatus, SessionId, SessionStatus,
+        StopReason, Timestamp,
     };
     use rusqlite::OptionalExtension;
     use serde_json::json;
@@ -3290,7 +3578,7 @@ mod tests {
         db.migrate()?;
 
         let migrations = db.applied_migrations()?;
-        assert_eq!(migrations.len(), 4);
+        assert_eq!(migrations.len(), 11);
         assert_eq!(
             migrations[0],
             MigrationState {
@@ -3317,6 +3605,55 @@ mod tests {
             MigrationState {
                 version: 4,
                 name: "0004_mirror_outbox.sql".into(),
+            }
+        );
+        assert_eq!(
+            migrations[4],
+            MigrationState {
+                version: 5,
+                name: "0005_operational_schema.sql".into(),
+            }
+        );
+        assert_eq!(
+            migrations[5],
+            MigrationState {
+                version: 6,
+                name: "0006_observability.sql".into(),
+            }
+        );
+        assert_eq!(
+            migrations[6],
+            MigrationState {
+                version: 7,
+                name: "0007_archive_fts.sql".into(),
+            }
+        );
+        assert_eq!(
+            migrations[7],
+            MigrationState {
+                version: 8,
+                name: "0008_archive_watermarks.sql".into(),
+            }
+        );
+        assert_eq!(
+            migrations[8],
+            MigrationState {
+                version: 9,
+                name: "0009_playbook.sql".into(),
+            }
+        );
+        assert_eq!(
+            migrations[9],
+            MigrationState {
+                version: 10,
+                name: "0010_activity_state.sql".into(),
+            }
+        );
+        assert_eq!(
+            migrations[10],
+            MigrationState {
+                version: 11,
+                name: "0011_circuit_breaker_state.sql".into(),
             }
         );
         Ok(())
@@ -3485,8 +3822,57 @@ mod tests {
         assert_eq!(record.grove_status, GroveBeadStatus::Idle);
         assert!(record.declared_paths.is_empty());
         assert_eq!(record.metadata, json!({}));
+        assert!(record.circuit_breaker_state.is_none());
         assert_eq!(record.bead.created_at, record.synced_at);
         assert_eq!(record.bead.updated_at, record.bead.created_at);
+        Ok(())
+    }
+
+    #[test]
+    fn bead_record_round_trips_circuit_breaker_state() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| anyhow::anyhow!("temp path was not valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        insert_bead_cache_row(&db, "grove-breaker", "Breaker bead")?;
+        let started_at: Timestamp = "2026-03-16T11:00:00Z".parse()?;
+        let ended_at: Timestamp = "2026-03-16T11:10:00Z".parse()?;
+        let run = db.record_run_started(RunStartInput {
+            run_id: RunId::new("run-breaker"),
+            bead_id: BeadId::new("grove-breaker"),
+            attempt_no: 1,
+            started_at,
+        })?;
+        assert_eq!(run.status, RunStatus::Active);
+
+        let breaker = CircuitBreakerState {
+            state: grove_types::CircuitState::Open,
+            no_progress_count: 3,
+            same_error_count: 0,
+            permission_denial_count: 0,
+            last_error_fingerprint: Some("same-error".to_owned()),
+            opened_at: Some(ended_at),
+        };
+
+        db.record_run_finished(
+            &BeadId::new("grove-breaker"),
+            RunFinishInput {
+                run_id: RunId::new("run-breaker"),
+                status: RunStatus::Failed,
+                failure_class: Some(FailureClass::NoProgress),
+                failure_detail: Some("stuck".to_owned()),
+                ended_at,
+                retry_after: None,
+                circuit_breaker_state: Some(breaker.clone()),
+            },
+        )?;
+
+        let bead = db
+            .get_bead_record(&BeadId::new("grove-breaker"))?
+            .expect("breaker bead should persist");
+        assert_eq!(bead.circuit_breaker_state, Some(breaker));
         Ok(())
     }
 
@@ -3802,6 +4188,7 @@ mod tests {
                 failure_detail: None,
                 ended_at: "2026-03-16T11:07:00Z".parse()?,
                 retry_after: None,
+                circuit_breaker_state: None,
             },
         )?;
         assert_eq!(finished_run.status, RunStatus::Checkpointed);
@@ -4399,10 +4786,59 @@ mod tests {
     fn insert_run_row(db: &Database, run_id: &str, bead_id: &str, status: &str) -> Result<()> {
         db.connection().execute(
             "INSERT INTO task_runs(\
-                id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id\
-             ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, NULL, 0, 0, NULL)",
-            rusqlite::params![run_id, bead_id, 1, status, "2026-03-16T11:00:00Z"],
+                id, bead_id, attempt_no, status, failure_class, failure_detail, started_at, ended_at, session_count, checkpoint_count, last_checkpoint_id, activity, last_activity_at, escalation_tier\
+             ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, NULL, 0, 0, NULL, ?6, ?7, ?8)",
+            rusqlite::params![
+                run_id,
+                bead_id,
+                1,
+                status,
+                "2026-03-16T11:00:00Z",
+                "Active",
+                "2026-03-16T11:00:00Z",
+                "FirstAttempt"
+            ],
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn run_activity_and_escalation_round_trip() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| anyhow::anyhow!("temp path was not valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+        insert_bead_cache_row(&db, "grove-activity", "Activity bead")?;
+
+        let started = db.record_run_started(RunStartInput {
+            run_id: RunId::new("run-activity"),
+            bead_id: BeadId::new("grove-activity"),
+            attempt_no: 1,
+            started_at: "2026-03-16T11:00:00Z".parse()?,
+        })?;
+        assert_eq!(started.activity, Some(grove_types::AgentActivity::Active));
+        assert_eq!(started.escalation_tier, grove_types::EscalationTier::FirstAttempt);
+
+        let updated_at: Timestamp = "2026-03-16T11:05:00Z".parse()?;
+        db.update_run_activity(
+            &BeadId::new("grove-activity"),
+            &RunId::new("run-activity"),
+            grove_types::AgentActivity::Idle,
+            &updated_at,
+        )?;
+        db.update_run_escalation_tier(
+            &BeadId::new("grove-activity"),
+            &RunId::new("run-activity"),
+            grove_types::EscalationTier::ThirdAttempt,
+            &updated_at,
+        )?;
+
+        let runs = db.list_task_runs_for_bead(&BeadId::new("grove-activity"))?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].activity, Some(grove_types::AgentActivity::Idle));
+        assert_eq!(runs[0].last_activity_at, Some(updated_at));
+        assert_eq!(runs[0].escalation_tier, grove_types::EscalationTier::ThirdAttempt);
         Ok(())
     }
 

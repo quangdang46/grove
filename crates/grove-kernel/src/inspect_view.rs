@@ -6,15 +6,16 @@ use crate::status_view::{
 use crate::{DispatchEligibilityContext, evaluate_dispatch_eligibility};
 use anyhow::Result;
 use chrono::Utc;
+use serde::Serialize;
 use grove_br::BrClient;
 use grove_bv::BvTriageOutput;
 use grove_config::GroveConfig;
 use grove_db::{Database, RecoveryCapsuleEvent};
 use grove_types::{
-    BeadId, CheckpointRecord, ClaudeSessionRecord, EventLogRecord, GroveBeadRecord,
+    BeadId, BulletId, CheckpointRecord, ClaudeSessionRecord, EventLogRecord, GroveBeadRecord,
     GroveBeadStatus, HandoffRecord, PlaybookBulletRecord, PromptManifest, RecoveryCapsule,
     RecoveryCapsuleOutcome, RelevantSnippet, RetrievalBundle, RunId, SessionOutcome, TaskRunRecord,
-    Timestamp,
+    Timestamp, DispatchDecisionRecord, PromptMaterializationRecord,
 };
 use std::fs;
 
@@ -53,7 +54,7 @@ pub fn load_inspect_snapshot<C: BrClient>(
         &bead,
         &DispatchEligibilityContext {
             ready_in_br,
-            circuit_state: grove_types::CircuitState::Closed,
+            circuit_state: crate::circuit_state_for_bead(&bead),
             reservation_conflicts: bead_conflicts.clone(),
             now,
         },
@@ -99,6 +100,21 @@ pub fn load_inspect_snapshot<C: BrClient>(
         }),
         None => None,
     };
+
+    let selected_playbook_bullets = latest_session
+        .as_ref()
+        .and_then(|session| session.prompt_provenance.as_ref())
+        .map(|prompt| {
+            prompt
+                .sections
+                .iter()
+                .filter(|section| section.kind == "playbook" && section.included)
+                .flat_map(|section| section.bullet_ids.iter())
+                .filter_map(|bullet_id| db.get_playbook_bullet(&BulletId::new(bullet_id.clone())).ok())
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let latest_checkpoint = match (latest_run, db.latest_checkpoint_for_bead(bead_id)?) {
         (Some(run), Some(checkpoint))
             if run
@@ -129,6 +145,14 @@ pub fn load_inspect_snapshot<C: BrClient>(
         .collect();
     let mirror_pending = latest_mirror_pending_for_bead(bead_id, db)?;
 
+    let historical_dispatch_decisions = db.list_dispatch_decisions_for_bead(bead_id, 10).unwrap_or_default();
+    let prompt_materializations = db.list_prompt_materializations_for_bead(bead_id).unwrap_or_default();
+
+    let retrieval_bundle = latest_session
+        .as_ref()
+        .and_then(|session| session.prompt_provenance.as_ref())
+        .and_then(retrieval_bundle_from_prompt_provenance);
+
     Ok(Some(InspectSnapshot {
         bead,
         dependencies: dependency_snapshot
@@ -142,14 +166,16 @@ pub fn load_inspect_snapshot<C: BrClient>(
             .map(|dependent_id| dependency_edge_view(br, dependent_id, &bead_index))
             .collect(),
         latest_dispatch,
+        historical_dispatch_decisions,
+        prompt_materializations,
         runs,
         latest_session,
         latest_checkpoint,
         latest_recovery_capsule,
         latest_handoff,
         mirror_actions,
-        retrieval_bundle: None,
-        selected_playbook_bullets: Vec::new(),
+        retrieval_bundle,
+        selected_playbook_bullets,
         mirror_pending,
     }))
 }
@@ -162,6 +188,37 @@ fn load_prompt_manifest(workspace_root: &str, path: &str) -> Option<PromptManife
     };
     let contents = fs::read_to_string(manifest_path).ok()?;
     serde_json::from_str(&contents).ok()
+}
+
+fn retrieval_bundle_from_prompt_provenance(
+    provenance: &PromptProvenanceView,
+) -> Option<RetrievalBundle> {
+    let snippets: Vec<RelevantSnippet> = provenance
+        .sections
+        .iter()
+        .filter(|section| section.kind == "archive_snippet")
+        .enumerate()
+        .filter_map(|(idx, section)| {
+            let message_id = section.preview_message_id?;
+            Some(RelevantSnippet {
+                conversation_id: idx as i64 + 1,
+                message_id,
+                file_path: None,
+                snippet: section.preview.clone(),
+                score: 0.0,
+            })
+        })
+        .collect();
+
+    if snippets.is_empty() {
+        None
+    } else {
+        let conversations: Vec<i64> = snippets.iter().map(|snippet| snippet.conversation_id).collect();
+        Some(RetrievalBundle {
+            snippets,
+            conversations,
+        })
+    }
 }
 
 fn inspect_score_breakdown(
@@ -300,12 +357,14 @@ fn inspect_dispatch_why(
     why
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InspectSnapshot {
     pub bead: GroveBeadRecord,
     pub dependencies: Vec<DependencyEdgeView>,
     pub dependents: Vec<DependencyEdgeView>,
     pub latest_dispatch: Option<DispatchDecisionView>,
+    pub historical_dispatch_decisions: Vec<DispatchDecisionRecord>,
+    pub prompt_materializations: Vec<PromptMaterializationRecord>,
     pub runs: Vec<TaskRunRecord>,
     pub latest_session: Option<SessionSummaryView>,
     pub latest_checkpoint: Option<CheckpointSummaryView>,
@@ -335,6 +394,8 @@ impl InspectSnapshot {
             dependencies: self.dependencies,
             dependents: self.dependents,
             latest_dispatch: self.latest_dispatch,
+            historical_dispatch_decisions: self.historical_dispatch_decisions,
+            prompt_materializations: self.prompt_materializations,
             latest_run,
             run_history,
             latest_session: self.latest_session,
@@ -349,12 +410,14 @@ impl InspectSnapshot {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BeadInspectView {
     pub bead: GroveBeadRecord,
     pub dependencies: Vec<DependencyEdgeView>,
     pub dependents: Vec<DependencyEdgeView>,
     pub latest_dispatch: Option<DispatchDecisionView>,
+    pub historical_dispatch_decisions: Vec<DispatchDecisionRecord>,
+    pub prompt_materializations: Vec<PromptMaterializationRecord>,
     pub latest_run: Option<TaskRunRecord>,
     pub run_history: Vec<RunSummaryView>,
     pub latest_session: Option<SessionSummaryView>,
@@ -367,7 +430,7 @@ pub struct BeadInspectView {
     pub mirror_pending: Option<MirrorPendingView>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DependencyEdgeView {
     pub bead_id: BeadId,
     pub title: Option<String>,
@@ -375,7 +438,7 @@ pub struct DependencyEdgeView {
     pub grove_status: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DispatchDecisionView {
     pub attempted_at: Option<Timestamp>,
     pub dispatch: DispatchExplanationView,
@@ -387,7 +450,7 @@ pub struct DispatchDecisionView {
     pub bv_score: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RunSummaryView {
     pub run_id: RunId,
     pub attempt_no: i32,
@@ -418,7 +481,7 @@ impl From<TaskRunRecord> for RunSummaryView {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionSummaryView {
     pub session_id: grove_types::SessionId,
     pub run_id: RunId,
@@ -489,7 +552,7 @@ impl SessionSummaryView {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PromptProvenanceView {
     pub contract: String,
     pub estimated_tokens: u32,
@@ -499,7 +562,7 @@ pub struct PromptProvenanceView {
     pub sections: Vec<PromptSectionView>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RecoveryCapsuleView {
     pub outcome: String,
     pub summary: String,
@@ -554,7 +617,7 @@ impl From<PromptManifest> for PromptProvenanceView {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PromptSectionView {
     pub ordinal: u32,
     pub kind: String,
@@ -566,11 +629,17 @@ pub struct PromptSectionView {
     pub bullet_ids: Vec<String>,
     pub checkpoint_id: Option<String>,
     pub handoff_run_id: Option<String>,
+    pub preview_message_id: Option<i64>,
     pub preview: String,
 }
 
 impl From<grove_types::PromptManifestSection> for PromptSectionView {
     fn from(section: grove_types::PromptManifestSection) -> Self {
+        let preview_message_id = section
+            .provenance
+            .archive_message_id
+            .as_deref()
+            .and_then(|id| id.parse::<i64>().ok());
         Self {
             ordinal: section.ordinal,
             kind: section.kind.as_str().to_owned(),
@@ -592,12 +661,13 @@ impl From<grove_types::PromptManifestSection> for PromptSectionView {
                 .collect(),
             checkpoint_id: section.provenance.checkpoint_id.map(|id| id.to_string()),
             handoff_run_id: section.provenance.handoff_run_id.map(|id| id.to_string()),
+            preview_message_id,
             preview: section.preview,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CheckpointSummaryView {
     pub checkpoint_id: String,
     pub run_id: RunId,
@@ -676,7 +746,7 @@ fn recovery_capsule_for_inspect(
     .map(RecoveryCapsuleView::from)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HandoffSummaryView {
     pub run_id: RunId,
     pub summary: String,
@@ -701,7 +771,7 @@ impl From<HandoffRecord> for HandoffSummaryView {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MirrorActionView {
     pub event_id: i64,
     pub action: String,
@@ -735,7 +805,7 @@ impl MirrorActionView {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RetrievalSummaryView {
     pub conversation_ids: Vec<i64>,
     pub snippet_count: usize,
@@ -760,7 +830,7 @@ impl From<RetrievalBundle> for RetrievalSummaryView {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RelevantSnippetView {
     pub conversation_id: i64,
     pub message_id: i64,
@@ -781,7 +851,7 @@ impl From<RelevantSnippet> for RelevantSnippetView {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PlaybookBulletView {
     pub bullet_id: String,
     pub category: String,
@@ -1039,6 +1109,8 @@ mod tests {
                 ready_minutes: Some(5),
                 bv_score: Some(0.75),
             }),
+            historical_dispatch_decisions: Vec::new(),
+            prompt_materializations: Vec::new(),
             runs: vec![TaskRunRecord {
                 id: RunId::new("run-1"),
                 bead_id: BeadId::new("grove-1"),
@@ -1447,22 +1519,62 @@ mod tests {
                 retry_delta_summary: None,
                 retrieval_query: None,
                 retrieval_ranking_summary: Vec::new(),
-                sections: vec![grove_types::PromptManifestSection {
-                    ordinal: 1,
-                    kind: grove_types::PromptSegmentKind::Task,
-                    heading: "Task".to_owned(),
-                    included: true,
-                    estimated_tokens: 20,
-                    char_count: 80,
-                    trim_reason: None,
-                    provenance: grove_types::PromptSectionProvenance::default(),
-                    preview: "[TASK] fix inspect".to_owned(),
-                }],
+                sections: vec![
+                    grove_types::PromptManifestSection {
+                        ordinal: 1,
+                        kind: grove_types::PromptSegmentKind::Task,
+                        heading: "Task".to_owned(),
+                        included: true,
+                        estimated_tokens: 20,
+                        char_count: 80,
+                        trim_reason: None,
+                        provenance: grove_types::PromptSectionProvenance::default(),
+                        preview: "[TASK] fix inspect".to_owned(),
+                    },
+                    grove_types::PromptManifestSection {
+                        ordinal: 2,
+                        kind: grove_types::PromptSegmentKind::Playbook,
+                        heading: "Playbook workflow (Maturity: Established)".to_owned(),
+                        included: true,
+                        estimated_tokens: 12,
+                        char_count: 48,
+                        trim_reason: None,
+                        provenance: grove_types::PromptSectionProvenance {
+                            bullet_ids: vec![grove_types::BulletId::new("bullet-keep")],
+                            ..Default::default()
+                        },
+                        preview: "[WORKFLOW] prefer explicit markers".to_owned(),
+                    },
+                ],
             })?,
         )?;
         let db_path = workspace_root.join("grove.db");
         let mut db = Database::open(&db_path)?;
         db.migrate()?;
+        db.insert_playbook_bullet(&PlaybookBulletRecord {
+            id: grove_types::BulletId::new("bullet-keep"),
+            scope: grove_types::BulletScope::Workspace,
+            scope_key: None,
+            category: "workflow".to_owned(),
+            text: "Prefer explicit markers".to_owned(),
+            bullet_type: grove_types::BulletType::Rule,
+            state: grove_types::BulletState::Active,
+            maturity: grove_types::BulletMaturity::Established,
+            helpful_count: 4,
+            harmful_count: 0,
+            feedback_events: Vec::new(),
+            confidence_decay_half_life_days: 30,
+            pinned: false,
+            deprecated: false,
+            replaced_by: None,
+            deprecation_reason: None,
+            source_bead_ids: vec![BeadId::new("grove-child")],
+            source_run_ids: vec![RunId::new("run-child")],
+            tags: vec!["phase:6".to_owned()],
+            effective_score: Some(2.5),
+            created_at: parse_ts("2026-03-16T10:30:00Z")?,
+            updated_at: parse_ts("2026-03-16T10:45:00Z")?,
+        })?;
 
         db.connection().execute(
             "INSERT INTO bead_cache(\
@@ -1567,6 +1679,8 @@ mod tests {
                 .map(|prompt| prompt.sections[0].preview.as_str()),
             Some("[TASK] fix inspect")
         );
+        assert_eq!(snapshot.selected_playbook_bullets.len(), 1);
+        assert_eq!(snapshot.selected_playbook_bullets[0].id.as_str(), "bullet-keep");
         Ok(())
     }
 
@@ -1832,6 +1946,7 @@ mod tests {
             retry_after: None,
             last_failure_class: None,
             last_failure_detail: None,
+            circuit_breaker_state: None,
             synced_at: updated_at,
             runtime_updated_at: updated_at,
         })

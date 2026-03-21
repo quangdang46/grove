@@ -90,8 +90,8 @@ fn init_creates_database_with_migrations() -> TestResult {
     let applied_migrations = db.applied_migrations()?;
     assert_eq!(
         applied_migrations.len(),
-        4,
-        "should have 4 applied migrations"
+        9,
+        "should apply all current migrations"
     );
     assert_eq!(applied_migrations[0].version, 1);
     assert_eq!(applied_migrations[0].name, "0001_init.sql");
@@ -104,6 +104,16 @@ fn init_creates_database_with_migrations() -> TestResult {
     assert_eq!(applied_migrations[2].name, "0003_leader_lease.sql");
     assert_eq!(applied_migrations[3].version, 4);
     assert_eq!(applied_migrations[3].name, "0004_mirror_outbox.sql");
+    assert_eq!(applied_migrations[4].version, 5);
+    assert_eq!(applied_migrations[4].name, "0005_operational_schema.sql");
+    assert_eq!(applied_migrations[5].version, 6);
+    assert_eq!(applied_migrations[5].name, "0006_observability.sql");
+    assert_eq!(applied_migrations[6].version, 7);
+    assert_eq!(applied_migrations[6].name, "0007_archive_fts.sql");
+    assert_eq!(applied_migrations[7].version, 8);
+    assert_eq!(applied_migrations[7].name, "0008_archive_watermarks.sql");
+    assert_eq!(applied_migrations[8].version, 9);
+    assert_eq!(applied_migrations[8].name, "0009_playbook.sql");
 
     // Verify tables exist by attempting to query them
     let conn = db.connection();
@@ -752,6 +762,49 @@ fn init_tolerates_missing_beads_and_prints_guidance() -> TestResult {
 }
 
 #[test]
+fn init_json_emits_machine_readable_output() -> TestResult {
+    let harness = CliHarness::new()?;
+    let output = harness.run(["--json", "init"])?;
+
+    assert!(
+        output.status.success(),
+        "init --json should succeed: {}",
+        output_text(&output)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let payload: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert_eq!(payload["ok"], true);
+    assert!(payload["workspace_root"].as_str().is_some());
+    assert!(payload["db_path"].as_str().is_some());
+    assert!(payload["config_path"].as_str().is_some());
+    assert!(payload["tooling"].is_object());
+    assert!(payload["notes"].is_array());
+    assert!(payload["next_steps"].is_array());
+
+    Ok(())
+}
+
+#[test]
+fn no_subcommand_json_emits_machine_readable_output() -> TestResult {
+    let harness = CliHarness::new()?;
+    let output = harness.run(["--json"])?;
+
+    assert!(
+        output.status.success(),
+        "global --json without subcommand should succeed: {}",
+        output_text(&output)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let payload: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert_eq!(payload["ok"], true);
+    assert!(payload["command"].is_null());
+    assert!(payload["message"].as_str().is_some());
+    assert!(payload["available_commands"].is_array());
+
+    Ok(())
+}
+
+#[test]
 fn status_requires_beads_directory() -> TestResult {
     let harness = CliHarness::new()?;
     let output = harness.run(["status"])?;
@@ -787,6 +840,59 @@ fn status_reports_bv_unavailable_but_still_succeeds() -> TestResult {
     assert!(stdout.contains("grove-cli-test"));
     assert!(stdout.contains("BV triage:"));
     assert!(stdout.contains("unavailable: bv command failed (bv --robot-triage)"));
+
+    Ok(())
+}
+
+#[test]
+fn status_json_emits_machine_readable_operator_surface() -> TestResult {
+    let harness = CliHarness::new()?;
+    harness.enable_beads()?;
+    harness.seed_runtime_bead(GroveBeadStatus::Running)?;
+
+    let output = harness.run(["--json", "status"])?;
+
+    assert!(
+        output.status.success(),
+        "status --json should succeed: {}",
+        output_text(&output)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let payload: serde_json::Value = serde_json::from_str(&stdout)?;
+    let workspace_root = payload["workspace_root"].as_str().expect("workspace_root string");
+    assert!(workspace_root.starts_with(harness.workspace_root.as_str()));
+    assert!(payload["db_path"].as_str().is_some());
+    assert!(payload["triage_error"].is_null());
+    assert!(payload["view"].is_object());
+    let view_root = payload["view"]["workspace_root"]
+        .as_str()
+        .expect("view.workspace_root string");
+    assert!(view_root.starts_with(harness.workspace_root.as_str()));
+    assert!(payload["view"]["running_beads"].is_array());
+    assert!(payload["view"]["ready_queue"].is_array());
+    assert!(payload["view"]["mirror_pending"].is_array());
+
+    Ok(())
+}
+
+#[test]
+fn run_json_failure_emits_machine_readable_payload() -> TestResult {
+    let harness = CliHarness::new()?;
+
+    let output = harness.run(["--json", "run"])?;
+
+    assert!(
+        output.status.success(),
+        "run --json failure payload should still exit successfully for machine parsing: {}",
+        output_text(&output)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let payload: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["command"], "run");
+    let errors = payload["error"].as_array().expect("error array");
+    assert!(!errors.is_empty(), "error chain should not be empty");
+    assert!(errors[0].as_str().is_some());
 
     Ok(())
 }
@@ -920,6 +1026,7 @@ fn bv_augments_br_does_not_replace_authority() -> TestResult {
         retry_after: None,
         last_failure_class: None,
         last_failure_detail: None,
+        circuit_breaker_state: None,
         synced_at: bead.updated_at,
         runtime_updated_at: bead.updated_at,
     };
@@ -974,6 +1081,7 @@ fn bv_unavailable_degrades_gracefully() -> TestResult {
         retry_after: None,
         last_failure_class: None,
         last_failure_detail: None,
+        circuit_breaker_state: None,
         synced_at: bead.updated_at,
         runtime_updated_at: bead.updated_at,
     };
@@ -1050,6 +1158,7 @@ fn sample_bead_record(
         retry_after: None,
         last_failure_class: None,
         last_failure_detail: None,
+        circuit_breaker_state: None,
         synced_at: now,
         runtime_updated_at: now,
     }
@@ -1081,6 +1190,7 @@ fn sample_bead_with_retry(
         retry_after,
         last_failure_class: None,
         last_failure_detail: None,
+        circuit_breaker_state: None,
         synced_at: now,
         runtime_updated_at: now,
     }

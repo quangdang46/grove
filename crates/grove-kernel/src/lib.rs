@@ -1,5 +1,11 @@
+pub mod dispatch;
 pub mod inspect_view;
 pub mod status_view;
+pub mod archive;
+pub mod lesson_ingest;
+pub mod scoring;
+pub mod diary;
+pub mod reactions;
 
 use anyhow::{Context, Result};
 use grove_br::{BrClient, BrDependencySnapshot};
@@ -12,12 +18,12 @@ use grove_db::{
 };
 use grove_session::{
     ClaudeBackend, SessionLifecycleHooks, SingleTaskSessionRequest, SingleTaskSessionResult,
-    execute_single_task_session_with_hooks,
+    execute_single_task_session_with_hooks, update_circuit_breaker,
 };
 use grove_types::{
-    BeadId, CheckpointId, CircuitState, FailureClass, GroveBeadRecord, GroveBeadStatus,
-    ReservationConflict, ReservationMode, ReservationRecord, RunId, RunStatus, SessionStatus,
-    Timestamp,
+    AgentActivity, BeadId, CheckpointId, CircuitBreakerState, CircuitState, FailureClass,
+    GroveBeadRecord, GroveBeadStatus, ReservationConflict, ReservationMode, ReservationRecord,
+    RunId, RunStatus, SessionStatus, Timestamp,
 };
 use std::{
     collections::BTreeMap,
@@ -25,6 +31,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub use dispatch::{
+    DispatchExitReason, DispatchLoopConfig, DispatchLoopOutcome, ShutdownSignal, run_dispatch_loop,
+};
 pub use inspect_view::BeadInspectView;
 pub use status_view::WorkspaceStatusView;
 
@@ -62,6 +71,7 @@ pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
     backend: &B,
     request: SingleTaskSessionRequest,
     attempt_no: i32,
+    config: &GroveConfig,
 ) -> Result<PersistedTaskRunOutcome> {
     let bead_id = request.bead_id.clone();
     let run_id = request.run_id.clone();
@@ -91,7 +101,7 @@ pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
     match result {
         Ok(result) => {
             let checkpoint = hooks.take_checkpoint();
-            let run = finalize_persisted_run(hooks.db_mut(), &bead_id, &result.outcome, None)?;
+            let run = finalize_persisted_run(hooks.db_mut(), &bead_id, &result.outcome, None, config)?;
             let handoff = persist_success_handoff(hooks.db_mut(), &bead_id, &result.outcome)?;
             Ok(PersistedTaskRunOutcome {
                 run,
@@ -107,6 +117,7 @@ pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
                     &bead_id,
                     &outcome,
                     Some(error.to_string()),
+                    config,
                 );
             } else {
                 let _ = hooks.db_mut().record_run_finished(
@@ -118,6 +129,7 @@ pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
                         failure_detail: Some(error.to_string()),
                         ended_at: chrono::Utc::now(),
                         retry_after: None,
+                        circuit_breaker_state: None,
                     },
                 );
             }
@@ -204,6 +216,55 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
         Ok(())
     }
 
+    fn on_activity_changed(
+        &mut self,
+        activity: AgentActivity,
+        detail: Option<&str>,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        self.db.update_run_activity(&self.bead_id, &self.run_id, activity, &at)?;
+        if let Some(detail) = detail {
+            self.db.write_event_log(
+                grove_types::EventKind::ActivityStateChanged,
+                Some(&self.bead_id),
+                Some(&self.run_id),
+                Some(&self.session_id),
+                &serde_json::json!({
+                    "activity": activity,
+                    "detail": detail,
+                }),
+                &at,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn on_shutdown_requested(&mut self, grace_period: Option<std::time::Duration>) -> anyhow::Result<()> {
+        self.db.write_event_log(
+            grove_types::EventKind::SessionTerminationRequested,
+            Some(&self.bead_id),
+            Some(&self.run_id),
+            Some(&self.session_id),
+            &serde_json::json!({
+                "grace_period_ms": grace_period.map(|duration| duration.as_millis() as u64),
+            }),
+            &chrono::Utc::now(),
+        )?;
+        Ok(())
+    }
+
+    fn on_shutdown_forced(&mut self) -> anyhow::Result<()> {
+        self.db.write_event_log(
+            grove_types::EventKind::SessionTerminationForced,
+            Some(&self.bead_id),
+            Some(&self.run_id),
+            Some(&self.session_id),
+            &serde_json::json!({"forced": true}),
+            &chrono::Utc::now(),
+        )?;
+        Ok(())
+    }
+
     fn on_session_finished(&mut self, result: &SingleTaskSessionResult) -> anyhow::Result<()> {
         self.db
             .record_session_finished(&self.bead_id, &result.outcome.session)?;
@@ -239,6 +300,46 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
             self.checkpoint = Some(checkpoint);
         }
 
+        if let Ok(replay) = grove_session::replay_transcript(&result.outcome.session.transcript_path) {
+            if let Ok(mut archived) = crate::archive::ingest_transcript_to_archive(
+                self.bead_id.clone(),
+                self.run_id.clone(),
+                self.session_id.clone(),
+                &replay,
+            ) {
+                archived.source_path = camino::Utf8PathBuf::from(result.outcome.session.transcript_path.clone());
+                
+                let source_record = grove_types::archive::SourceRecord {
+                    id: grove_types::SourceId::new("transcript"),
+                    source_path: archived.source_path.clone(),
+                    origin_host: None,
+                    metadata_json: serde_json::json!({}),
+                };
+                let _ = self.db.insert_source_record(&source_record);
+                // Idempotent: skips if this session was already ingested (watermark check)
+                let _ = self.db.insert_conversation_idempotent(&archived);
+            }
+        }
+
+        // Ingest GROVE_LESSONS from protocol state into playbook as draft candidates
+        if !result.protocol_state.lessons.is_empty() {
+            let _ = crate::lesson_ingest::ingest_lessons(
+                self.db,
+                &self.bead_id,
+                &self.run_id,
+                &result.protocol_state.lessons,
+            );
+        }
+
+        // Apply implicit outcome feedback to any playbook bullets injected during this session
+        let _ = crate::diary::apply_outcome_feedback(
+            self.db,
+            &self.bead_id,
+            &self.run_id,
+            &result.outcome,
+            result.outcome.session.ordinal_in_run > 1,
+        );
+
         self.latest_outcome = Some(result.outcome.clone());
         Ok(())
     }
@@ -249,8 +350,10 @@ fn finalize_persisted_run(
     bead_id: &BeadId,
     outcome: &grove_types::SessionOutcome,
     failure_detail_override: Option<String>,
+    config: &GroveConfig,
 ) -> Result<grove_types::TaskRunRecord> {
     let ended_at = outcome.session.ended_at.unwrap_or_else(chrono::Utc::now);
+    let forced_kill = outcome.session.stop_reason == Some(grove_types::StopReason::Kill);
     let (status, failure_class, retry_after) = match outcome.session.status {
         SessionStatus::Checkpointed => (RunStatus::Checkpointed, None, None),
         SessionStatus::Completed => (RunStatus::Succeeded, None, None),
@@ -270,6 +373,9 @@ fn finalize_persisted_run(
             None,
         ),
         SessionStatus::Crashed => (RunStatus::Failed, Some(FailureClass::ClaudeCrashed), None),
+        SessionStatus::UnknownFailure if forced_kill => {
+            (RunStatus::Failed, Some(FailureClass::Interrupted), None)
+        }
         SessionStatus::UnknownFailure => (RunStatus::Failed, Some(FailureClass::Unknown), None),
         SessionStatus::Starting | SessionStatus::Running => {
             (RunStatus::Failed, Some(FailureClass::Unknown), None)
@@ -281,6 +387,19 @@ fn finalize_persisted_run(
             .stop_reason
             .map(|reason| format!("session ended with {:?}", reason))
     });
+    let prior_breaker = db
+        .get_bead_record(bead_id)?
+        .and_then(|record| record.circuit_breaker_state)
+        .unwrap_or_default();
+    let circuit_breaker_state = update_circuit_breaker(
+        prior_breaker,
+        &outcome.analysis,
+        ended_at,
+        config.circuit_breaker.no_progress_threshold,
+        config.circuit_breaker.same_error_threshold,
+        config.circuit_breaker.permission_denial_threshold,
+        config.circuit_breaker.cooldown_minutes,
+    );
 
     let run = db.record_run_finished(
         bead_id,
@@ -291,6 +410,7 @@ fn finalize_persisted_run(
             failure_detail: failure_detail.clone(),
             ended_at,
             retry_after,
+            circuit_breaker_state: Some(circuit_breaker_state),
         },
     )?;
 
@@ -343,14 +463,28 @@ fn recovery_capsule_from_outcome(
         })
         .unwrap_or(&[]);
 
+    let mut enriched_detail = failure_detail.unwrap_or_default().to_string();
+    if !outcome.stderr_tail.is_empty() {
+        if !enriched_detail.is_empty() {
+            enriched_detail.push_str("\n\n");
+        }
+        enriched_detail.push_str("Recent stderr:\n");
+        enriched_detail.push_str(&outcome.stderr_tail.join("\n"));
+    }
+
     grove_types::RecoveryCapsule::from_parts(
         outcome_kind,
         failure_class,
-        failure_detail,
+        if enriched_detail.is_empty() { None } else { Some(enriched_detail.as_str()) },
         checkpoint.map(|payload| payload.progress.as_str()),
         checkpoint.map(|payload| payload.next_step.as_str()),
         None,
-        None,
+        outcome.session.prompt_manifest_path.as_ref().and_then(|_| {
+            // Note: In a complete implementation, we'd load the prompt manifest
+            // to fetch `retry_delta_summary`. For now we rely on it being populated
+            // via the with_retry_context in the dispatch loop.
+            None
+        }),
         artifacts,
     )
 }
@@ -857,6 +991,14 @@ pub fn is_non_executable_issue_type(issue_type: &str) -> bool {
     )
 }
 
+#[must_use]
+pub fn circuit_state_for_bead(bead: &GroveBeadRecord) -> CircuitState {
+    bead.circuit_breaker_state
+        .as_ref()
+        .map(|state| state.state)
+        .unwrap_or(CircuitState::Closed)
+}
+
 fn collect_local_suppressions(
     bead: &GroveBeadRecord,
     context: &DispatchEligibilityContext,
@@ -917,7 +1059,7 @@ fn collect_local_suppressions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grove_types::{BeadId, BeadPriority, BeadRef, RunId, RunStatus};
+    use grove_types::{BeadId, BeadPriority, BeadRef, CircuitBreakerState, CircuitState, RunId, RunStatus};
     use std::error::Error;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1142,9 +1284,25 @@ mod tests {
             retry_after: retry_after.map(str::parse).transpose()?,
             last_failure_class: None,
             last_failure_detail: None,
+            circuit_breaker_state: None,
             synced_at: updated_at,
             runtime_updated_at: updated_at,
         })
+    }
+
+    #[test]
+    fn circuit_state_for_bead_uses_persisted_breaker_snapshot() -> TestResult {
+        let mut bead = sample_bead(GroveBeadStatus::Ready, "task", &[], None, None)?;
+        bead.circuit_breaker_state = Some(CircuitBreakerState {
+            state: CircuitState::Open,
+            no_progress_count: 3,
+            same_error_count: 0,
+            permission_denial_count: 0,
+            last_error_fingerprint: Some("same-error".to_owned()),
+            opened_at: Some("2026-03-16T12:00:00Z".parse()?),
+        });
+        assert_eq!(circuit_state_for_bead(&bead), CircuitState::Open);
+        Ok(())
     }
 
     fn suppression_codes(eligibility: &DispatchEligibility) -> Vec<&'static str> {
@@ -1401,9 +1559,13 @@ exit "${EXIT_CODE:-0}"
             previous_outcome: None,
             rescue_card: None,
             retry_delta_summary: None,
+            retrieval_query: None,
             token_budget: Some(2_000),
             ordinal_in_run: 1,
+            archive_bundle: None,
+            playbook_rules: Vec::new(),
             env: Vec::new(),
+            shutdown: grove_session::SessionShutdownConfig::default(),
         }
     }
 
@@ -1448,7 +1610,7 @@ exit "${EXIT_CODE:-0}"
             ("EXIT_CODE".to_owned(), "0".to_owned()),
         ];
 
-        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1)?;
+        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1, &GroveConfig::default())?;
 
         assert_eq!(persisted.run.status, RunStatus::Succeeded);
         assert_eq!(persisted.session.session.status, SessionStatus::Completed);
@@ -1522,7 +1684,7 @@ exit "${EXIT_CODE:-0}"
             ("EXIT_CODE".to_owned(), "0".to_owned()),
         ];
 
-        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1)?;
+        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1, &GroveConfig::default())?;
 
         assert_eq!(persisted.run.status, RunStatus::Checkpointed);
         assert_eq!(
@@ -1600,8 +1762,14 @@ exit "${EXIT_CODE:-0}"
             ("EXIT_CODE".to_owned(), "0".to_owned()),
         ];
 
-        let error = execute_persisted_single_task_session(&mut db, &backend, request, 1)
-            .expect_err("checkpoint file write should fail");
+        let error = execute_persisted_single_task_session(
+            &mut db,
+            &backend,
+            request,
+            1,
+            &GroveConfig::default(),
+        )
+        .expect_err("checkpoint file write should fail");
         assert!(
             error
                 .to_string()
@@ -1674,7 +1842,7 @@ exit "${EXIT_CODE:-0}"
             ("EXIT_CODE".to_owned(), "1".to_owned()),
         ];
 
-        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1)?;
+        let persisted = execute_persisted_single_task_session(&mut db, &backend, request, 1, &GroveConfig::default())?;
 
         assert_eq!(persisted.run.status, RunStatus::WaitingToRetry);
         assert_eq!(persisted.run.failure_class, Some(FailureClass::RateLimit));

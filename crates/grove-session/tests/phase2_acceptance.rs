@@ -11,8 +11,8 @@ use std::{
 use camino::Utf8PathBuf;
 use chrono::Utc;
 use grove_session::{
-    CliClaudeBackend, ContextMonitor, ExitPolicy, SessionLifecycleHooks, SingleTaskSessionRequest,
-    execute_single_task_session, execute_single_task_session_with_hooks,
+    CliClaudeBackend, ContextMonitor, ExitPolicy, SessionLifecycleHooks, SessionShutdownConfig,
+    SingleTaskSessionRequest, execute_single_task_session, execute_single_task_session_with_hooks,
 };
 use grove_types::{
     BeadId, ClaudeSessionRecord, ContextPressureLevel, ExecutionContract, FailureClass,
@@ -62,9 +62,13 @@ fn sample_request(workspace_dir: Utf8PathBuf) -> SingleTaskSessionRequest {
         previous_outcome: None,
         rescue_card: None,
         retry_delta_summary: None,
+        retrieval_query: None,
         token_budget: Some(2_000),
         ordinal_in_run: 1,
+        archive_bundle: None,
+        playbook_rules: Vec::new(),
         env: Vec::new(),
+        shutdown: SessionShutdownConfig::default(),
     }
 }
 

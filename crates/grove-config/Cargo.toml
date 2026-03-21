@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 camino.workspace = true
+grove-types = { path = "../grove-types" }
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true

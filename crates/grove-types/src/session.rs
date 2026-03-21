@@ -50,11 +50,13 @@ pub enum SessionTerminalClass {
     RateLimit,
     PermissionDenied,
     Crash,
+    VerifyFailed,
     UnknownFailure,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ContextPressureLevel {
+    #[default]
     Ok,
     Warn,
     Rotate,
@@ -203,12 +205,6 @@ impl CircuitState {
                 | (HalfOpen, Open)
                 | (Open, HalfOpen)
         )
-    }
-}
-
-impl Default for ContextPressureLevel {
-    fn default() -> Self {
-        Self::Ok
     }
 }
 
