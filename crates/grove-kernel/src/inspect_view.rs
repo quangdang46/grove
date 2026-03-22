@@ -1,11 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use crate::status_view::{
+    DispatchExplanationView, MirrorPendingView, ReservationConflictView, ScoreComponentView,
     conflicts_for_bead, find_reservation_conflicts, latest_mirror_pending_for_bead,
-    ready_age_minutes, triage_context_for_bead, DispatchExplanationView, MirrorPendingView,
-    ReservationConflictView, ScoreComponentView,
+    ready_age_minutes, triage_context_for_bead,
 };
-use crate::{evaluate_dispatch_eligibility, DispatchEligibilityContext};
+use crate::{DispatchEligibilityContext, evaluate_dispatch_eligibility};
 use anyhow::Result;
 use chrono::Utc;
 use grove_br::BrClient;
