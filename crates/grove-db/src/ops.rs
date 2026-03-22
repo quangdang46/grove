@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use grove_types::{
     BeadId, ConfigSnapshotRecord, DispatchDecisionRecord, IntegrityCheckRecord,
     PromptMaterializationRecord, RunId, SessionId,
 };
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::params;
 
 use crate::{timestamp_string, Database};
 

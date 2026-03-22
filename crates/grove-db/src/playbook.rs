@@ -267,6 +267,7 @@ impl Database {
     }
 
     /// Log a curation action.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_curation_action(
         &mut self,
         bullet_id: &BulletId,

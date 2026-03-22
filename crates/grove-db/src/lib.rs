@@ -2168,11 +2168,9 @@ impl Database {
                         .ok_or_else(|| rusqlite::Error::InvalidQuery)?,
                     attempt_count: row.get(6)?,
                     last_attempt_at: row.get::<_, Option<String>>(7)?
-                        .map(|s| s.parse().ok())
-                        .flatten(),
+                        .and_then(|s| s.parse().ok()),
                     next_retry_after: row.get::<_, Option<String>>(8)?
-                        .map(|s| s.parse().ok())
-                        .flatten(),
+                        .and_then(|s| s.parse().ok()),
                     last_error: row.get(9)?,
                     created_at: row.get::<_, String>(10)?.parse().ok()
                         .ok_or_else(|| rusqlite::Error::InvalidQuery)?,
@@ -2257,7 +2255,7 @@ impl Database {
             .transaction()
             .context("begin record mirror failure transaction")?;
         let now = now_timestamp_string();
-        let retry_after_str = retry_after.map(|dt| timestamp_string(dt));
+        let retry_after_str = retry_after.map(timestamp_string);
         let bead_id: Option<String> = tx
             .query_row(
                 "SELECT bead_id FROM mirror_outbox WHERE id = ?1",
@@ -2350,11 +2348,9 @@ impl Database {
                         .ok_or_else(|| rusqlite::Error::InvalidQuery)?,
                     attempt_count: row.get(6)?,
                     last_attempt_at: row.get::<_, Option<String>>(7)?
-                        .map(|s| s.parse().ok())
-                        .flatten(),
+                        .and_then(|s| s.parse().ok()),
                     next_retry_after: row.get::<_, Option<String>>(8)?
-                        .map(|s| s.parse().ok())
-                        .flatten(),
+                        .and_then(|s| s.parse().ok()),
                     last_error: row.get(9)?,
                     created_at: row.get::<_, String>(10)?.parse().ok()
                         .ok_or_else(|| rusqlite::Error::InvalidQuery)?,
@@ -3375,6 +3371,7 @@ fn session_failure_class(session: &ClaudeSessionRecord) -> Option<FailureClass> 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn upsert_bead_runtime_tx(
     tx: &Transaction<'_>,
     bead_id: &BeadId,

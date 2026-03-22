@@ -7,7 +7,7 @@ use anyhow::Result;
 use grove_db::Database;
 use grove_types::{
     playbook::{
-        BulletMaturity, BulletScope, BulletState, BulletType, FeedbackKind, PlaybookBulletRecord,
+        BulletMaturity, BulletState, BulletType, FeedbackKind, PlaybookBulletRecord,
     },
     BulletId,
 };

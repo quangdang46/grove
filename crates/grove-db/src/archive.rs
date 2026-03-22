@@ -1,15 +1,11 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use grove_types::{
-    archive::{
-        ConversationRecord, MessageRecord, MessageRole, RelevantSnippet, RetrievalBundle,
-        SnippetRecord, SourceRecord,
-    },
-    BeadId, RunId, SessionId, SourceId,
+    archive::{ConversationRecord, MessageRole, RelevantSnippet, RetrievalBundle, SourceRecord},
+    BeadId, RunId,
 };
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::params;
 
-use crate::{parse_json, timestamp_string, Database};
+use crate::{timestamp_string, Database};
 
 impl Database {
     pub fn insert_source_record(&mut self, record: &SourceRecord) -> Result<()> {

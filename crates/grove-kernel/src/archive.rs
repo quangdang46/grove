@@ -21,11 +21,11 @@ pub fn ingest_transcript_to_archive(
         match event {
             TranscriptEvent::SessionStarted { ts, .. } => {
                 if started_at.is_none() {
-                    started_at = Some(ts.clone());
+                    started_at = Some(*ts);
                 }
             }
             TranscriptEvent::SessionEnded { ts, .. } => {
-                ended_at = Some(ts.clone());
+                ended_at = Some(*ts);
             }
             TranscriptEvent::StdoutLine { line, ts } => {
                 messages.push(MessageRecord {
@@ -33,7 +33,7 @@ pub fn ingest_transcript_to_archive(
                     idx: idx as i64,
                     role: MessageRole::Agent,
                     author: Some("sonnet".to_string()),
-                    created_at: Some(ts.clone()),
+                    created_at: Some(*ts),
                     content: line.clone(),
                     extra_json: serde_json::json!({ "kind": "stdout" }),
                     snippets: extract_markdown_snippets(line),
@@ -45,7 +45,7 @@ pub fn ingest_transcript_to_archive(
                     idx: idx as i64,
                     role: MessageRole::System,
                     author: None,
-                    created_at: Some(ts.clone()),
+                    created_at: Some(*ts),
                     content: line.clone(),
                     extra_json: serde_json::json!({ "kind": "stderr" }),
                     snippets: extract_markdown_snippets(line),
@@ -79,7 +79,7 @@ pub fn ingest_transcript_to_archive(
                     idx: idx as i64,
                     role: MessageRole::System,
                     author: Some("grove-protocol".to_string()),
-                    created_at: Some(ts.clone()),
+                    created_at: Some(*ts),
                     content,
                     extra_json: serde_json::to_value(event)
                         .unwrap_or_else(|_| serde_json::json!({})),

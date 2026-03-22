@@ -21,7 +21,7 @@ use grove_session::{
     SessionLifecycleHooks, SingleTaskSessionRequest, SingleTaskSessionResult,
 };
 use grove_types::{
-    AgentActivity, BeadId, CheckpointId, CircuitBreakerState, CircuitState, FailureClass,
+    AgentActivity, BeadId, CheckpointId, CircuitState, FailureClass,
     GroveBeadRecord, GroveBeadStatus, ReservationConflict, ReservationMode, ReservationRecord,
     RunId, RunStatus, SessionStatus, Timestamp,
 };
@@ -309,8 +309,7 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
 
         if let Ok(replay) =
             grove_session::replay_transcript(&result.outcome.session.transcript_path)
-        {
-            if let Ok(mut archived) = crate::archive::ingest_transcript_to_archive(
+            && let Ok(mut archived) = crate::archive::ingest_transcript_to_archive(
                 self.bead_id.clone(),
                 self.run_id.clone(),
                 self.session_id.clone(),
@@ -329,7 +328,6 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
                 // Idempotent: skips if this session was already ingested (watermark check)
                 let _ = self.db.insert_conversation_idempotent(&archived);
             }
-        }
 
         // Ingest GROVE_LESSONS from protocol state into playbook as draft candidates
         if !result.protocol_state.lessons.is_empty() {
@@ -493,7 +491,7 @@ fn recovery_capsule_from_outcome(
         checkpoint.map(|payload| payload.progress.as_str()),
         checkpoint.map(|payload| payload.next_step.as_str()),
         None,
-        outcome.session.prompt_manifest_path.as_ref().and_then(|_| {
+        outcome.session.prompt_manifest_path.as_ref().and({
             // Note: In a complete implementation, we'd load the prompt manifest
             // to fetch `retry_delta_summary`. For now we rely on it being populated
             // via the with_retry_context in the dispatch loop.

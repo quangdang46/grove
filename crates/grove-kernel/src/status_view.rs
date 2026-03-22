@@ -404,9 +404,7 @@ pub fn load_status_snapshot<C: BrClient>(
 
     let leader = db.active_leader_lease(&now)?;
     let last_coordinator_stop = db
-        .latest_event_by_kind(grove_types::EventKind::CoordinatorStopped)?
-        .and_then(|event| {
-            Some(CoordinatorStopView {
+        .latest_event_by_kind(grove_types::EventKind::CoordinatorStopped)?.map(|event| CoordinatorStopView {
                 reason: event
                     .payload
                     .get("stop_reason")
@@ -427,8 +425,7 @@ pub fn load_status_snapshot<C: BrClient>(
                     .payload
                     .get("leader_released")
                     .and_then(|value| value.as_bool()),
-            })
-        });
+            });
     let running_beads = build_running_beads(&beads, db)?;
     let ready_queue = build_ready_queue(
         &beads,

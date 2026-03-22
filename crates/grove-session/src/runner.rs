@@ -396,8 +396,8 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
                     );
                 }
 
-                if let Some(deadline) = grace_deadline {
-                    if !kill_sent && Instant::now() >= deadline {
+                if let Some(deadline) = grace_deadline
+                    && !kill_sent && Instant::now() >= deadline {
                         running
                             .child
                             .kill()
@@ -408,7 +408,6 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
                         kill_sent = true;
                         forced_shutdown = true;
                     }
-                }
 
                 if let Some(status) = running
                     .child
@@ -557,10 +556,7 @@ fn spawn_stream_forwarder(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         for line in lines.by_ref() {
-            let message_source = match source {
-                StreamSource::Stdout => StreamSource::Stdout,
-                StreamSource::Stderr => StreamSource::Stderr,
-            };
+            let message_source = source;
             if sender
                 .send(StreamMessage::Line(message_source, line))
                 .is_err()
@@ -568,10 +564,7 @@ fn spawn_stream_forwarder(
                 return;
             }
         }
-        let closed_source = match source {
-            StreamSource::Stdout => StreamSource::Stdout,
-            StreamSource::Stderr => StreamSource::Stderr,
-        };
+        let closed_source = source;
         let _ = sender.send(StreamMessage::Closed(closed_source));
     })
 }

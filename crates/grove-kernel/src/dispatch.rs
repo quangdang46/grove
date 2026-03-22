@@ -12,7 +12,7 @@ use grove_session::{
 };
 use grove_types::{
     BeadId, CoordinatorStopReason, EscalationTier, ExecutionContract, GroveBeadRecord,
-    GroveBeadStatus, MutationStrategy, PromptId, ReservationMode, RunId, SessionId, Timestamp,
+    GroveBeadStatus, PromptId, ReservationMode, RunId, SessionId, Timestamp,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -295,8 +295,8 @@ fn apply_reaction_side_effects(
             db.update_run_escalation_tier(&ctx.bead_id, &ctx.run_id, reaction_eval.new_tier, &now);
     }
 
-    if let Some(outcome) = outcome {
-        if matches!(
+    if let Some(outcome) = outcome
+        && matches!(
             outcome.run.status,
             grove_types::RunStatus::Succeeded | grove_types::RunStatus::Checkpointed
         ) {
@@ -315,7 +315,6 @@ fn apply_reaction_side_effects(
                 &now,
             );
         }
-    }
 
     for record in reaction_eval.records {
         let _ = db.write_event_log(
@@ -698,8 +697,8 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                         );
                     }
 
-                    if outcome.run.status == grove_types::RunStatus::Succeeded {
-                        if let Some(handoff) = outcome.handoff.as_ref() {
+                    if outcome.run.status == grove_types::RunStatus::Succeeded
+                        && let Some(handoff) = outcome.handoff.as_ref() {
                             match br.mirror_handoff(&ctx.bead_id, handoff, true) {
                                 Ok(()) => {
                                     eprintln!(
@@ -729,7 +728,6 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                                 }
                             }
                         }
-                    }
                 }
                 Err(error) => {
                     apply_reaction_side_effects(db, &config, &ctx, None, Some(&error), false);
@@ -765,8 +763,8 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
             continue;
         }
 
-        if let Some(limit) = loop_config.max_poll_cycles {
-            if poll_cycles > limit {
+        if let Some(limit) = loop_config.max_poll_cycles
+            && poll_cycles > limit {
                 let exit_reason = DispatchExitReason::MaxPollCycles { limit };
                 return Ok(DispatchLoopOutcome {
                     dispatched_count,
@@ -775,10 +773,9 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                     stop_reason: exit_reason.to_stop_reason(),
                 });
             }
-        }
 
-        if let Some(max_runs) = loop_config.max_total_runs {
-            if dispatched_count >= max_runs {
+        if let Some(max_runs) = loop_config.max_total_runs
+            && dispatched_count >= max_runs {
                 let exit_reason = DispatchExitReason::MaxRunsReached;
                 return Ok(DispatchLoopOutcome {
                     dispatched_count,
@@ -787,7 +784,6 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                     stop_reason: exit_reason.to_stop_reason(),
                 });
             }
-        }
 
         let now = chrono::Utc::now();
         match LeaderLeaseManager::heartbeat(db, lease_config, now)? {
