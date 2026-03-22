@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use glob::{MatchOptions, Pattern};
@@ -20,7 +20,7 @@ mod archive;
 mod ops;
 mod playbook;
 
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -3801,8 +3801,8 @@ mod tests {
     use camino::Utf8PathBuf;
     use chrono::Utc;
     use grove_br::{
-        sync_bead_cache, BeadCacheStore, BrCapability, BrClient, BrDependencySnapshot, BrError,
-        BrIssueDetail, BrIssueSummary, BrVersion,
+        BeadCacheStore, BrCapability, BrClient, BrDependencySnapshot, BrError, BrIssueDetail,
+        BrIssueSummary, BrVersion, sync_bead_cache,
     };
     use grove_types::{
         BeadId, BeadPriority, CheckpointId, CheckpointPayload, CircuitBreakerState,
@@ -4276,9 +4276,10 @@ mod tests {
             .release_leader_lease("leader-a", &"2026-03-16T12:00:20Z".parse()?)?
             .unwrap();
         assert_eq!(released.owner_label, "leader-a");
-        assert!(db
-            .active_leader_lease(&"2026-03-16T12:00:20Z".parse()?)?
-            .is_none());
+        assert!(
+            db.active_leader_lease(&"2026-03-16T12:00:20Z".parse()?)?
+                .is_none()
+        );
         Ok(())
     }
 
@@ -4355,9 +4356,10 @@ mod tests {
             recovered[0].reason,
             crate::RecoveryReason::RunNoLongerActive
         );
-        assert!(db
-            .list_active_reservations_at(&"2026-03-16T12:05:00Z".parse()?)?
-            .is_empty());
+        assert!(
+            db.list_active_reservations_at(&"2026-03-16T12:05:00Z".parse()?)?
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -4559,9 +4561,11 @@ mod tests {
                 },
             )
             .expect_err("session finish should reject a mismatched bead");
-        assert!(wrong_bead_err
-            .to_string()
-            .contains("belongs to bead grove-a, not grove-b"));
+        assert!(
+            wrong_bead_err
+                .to_string()
+                .contains("belongs to bead grove-a, not grove-b")
+        );
 
         let wrong_run_err = db.record_checkpoint_saved(SessionCheckpointInput {
             checkpoint_id: CheckpointId::new("chk-bad"),
@@ -4599,9 +4603,11 @@ mod tests {
                 resume_generation: 2,
             })
             .expect_err("checkpoint save should reject a mismatched session/run pair");
-        assert!(cross_run_session_err
-            .to_string()
-            .contains("session ses-a belongs to run run-a, not run-a-2"));
+        assert!(
+            cross_run_session_err
+                .to_string()
+                .contains("session ses-a belongs to run run-a, not run-a-2")
+        );
         Ok(())
     }
 
@@ -4904,9 +4910,11 @@ mod tests {
         assert!(row.4.is_none());
 
         let events = db.list_event_logs_for_bead(&BeadId::new("grove-mirror-success"))?;
-        assert!(events
-            .iter()
-            .any(|event| event.kind == EventKind::BrMirrorSucceeded));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == EventKind::BrMirrorSucceeded)
+        );
         Ok(())
     }
 
@@ -4950,9 +4958,11 @@ mod tests {
         )?;
 
         let events = db.list_event_logs_for_bead(&BeadId::new("grove-mirror-failure"))?;
-        assert!(events
-            .iter()
-            .any(|event| event.kind == EventKind::BrMirrorFailed));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == EventKind::BrMirrorFailed)
+        );
         Ok(())
     }
 

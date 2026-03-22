@@ -11,11 +11,8 @@
 
 use grove_db::Database;
 use grove_types::{
-    archive::{
-        ConversationRecord, MessageRecord, MessageRole, RetrievalBundle,
-        SourceRecord,
-    },
     BeadId, PromptSegmentKind, RunId, SessionId, SourceId,
+    archive::{ConversationRecord, MessageRecord, MessageRole, RetrievalBundle, SourceRecord},
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -138,7 +135,7 @@ fn fts_search_ranks_relevant_snippets_by_bm25() -> TestResult {
 
 #[test]
 fn archive_retrieval_integrates_into_prompt_assembly_as_bounded_snippets() -> TestResult {
-    use grove_session::{materialize_prompt, PromptMaterializationInput};
+    use grove_session::{PromptMaterializationInput, materialize_prompt};
     use grove_types::{ExecutionContract, PromptId};
 
     let bundle = RetrievalBundle {
@@ -228,7 +225,7 @@ fn archive_retrieval_integrates_into_prompt_assembly_as_bounded_snippets() -> Te
 
 #[test]
 fn archive_snippets_are_trimmed_when_budget_is_tight() -> TestResult {
-    use grove_session::{materialize_prompt, PromptMaterializationInput};
+    use grove_session::{PromptMaterializationInput, materialize_prompt};
     use grove_types::{ExecutionContract, PromptId, PromptTrimReason};
 
     let bundle = RetrievalBundle {

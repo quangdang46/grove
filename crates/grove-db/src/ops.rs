@@ -5,7 +5,7 @@ use grove_types::{
 };
 use rusqlite::params;
 
-use crate::{timestamp_string, Database};
+use crate::{Database, timestamp_string};
 
 impl Database {
     // 21.2 Prompt materialization

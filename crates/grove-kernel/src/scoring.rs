@@ -6,10 +6,8 @@
 use anyhow::Result;
 use grove_db::Database;
 use grove_types::{
-    playbook::{
-        BulletMaturity, BulletState, BulletType, FeedbackKind, PlaybookBulletRecord,
-    },
     BulletId,
+    playbook::{BulletMaturity, BulletState, BulletType, FeedbackKind, PlaybookBulletRecord},
 };
 
 /// Scoring configuration (matches PLAN.md defaults).

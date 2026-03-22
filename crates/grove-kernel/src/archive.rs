@@ -1,8 +1,8 @@
 use anyhow::Result;
 use grove_session::TranscriptReplay;
 use grove_types::{
-    archive::{ConversationRecord, MessageRecord, MessageRole, SnippetRecord},
     BeadId, RunId, SessionId, TranscriptEvent,
+    archive::{ConversationRecord, MessageRecord, MessageRole, SnippetRecord},
 };
 use regex::Regex;
 

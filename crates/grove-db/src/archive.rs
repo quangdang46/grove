@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use grove_types::{
-    archive::{ConversationRecord, MessageRole, RelevantSnippet, RetrievalBundle, SourceRecord},
     BeadId, RunId,
+    archive::{ConversationRecord, MessageRole, RelevantSnippet, RetrievalBundle, SourceRecord},
 };
 use rusqlite::params;
 
-use crate::{timestamp_string, Database};
+use crate::{Database, timestamp_string};
 
 impl Database {
     pub fn insert_source_record(&mut self, record: &SourceRecord) -> Result<()> {

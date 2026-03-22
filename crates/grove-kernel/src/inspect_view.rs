@@ -1200,6 +1200,7 @@ mod tests {
                 last_attempt_at: None,
                 last_error: Some("network hiccup".to_owned()),
             }),
+            run_report: None,
         };
 
         let view = snapshot.into_view();
@@ -1215,6 +1216,10 @@ mod tests {
             Some(1)
         );
         assert!(view.mirror_pending.is_some());
+        assert!(
+            view.run_report.is_none(),
+            "run_report requires real DB; snapshot test uses None"
+        );
         Ok(())
     }
 

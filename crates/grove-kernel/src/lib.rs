@@ -10,20 +10,20 @@ pub mod status_view;
 use anyhow::{Context, Result};
 use grove_br::{BrClient, BrDependencySnapshot};
 use grove_bv::BvTriageOutput;
-use grove_config::{GroveConfig, DEFAULT_CHECKPOINTS_DIR_NAME, DEFAULT_GROVE_DIR_NAME};
+use grove_config::{DEFAULT_CHECKPOINTS_DIR_NAME, DEFAULT_GROVE_DIR_NAME, GroveConfig};
 use grove_db::{
     Database, HandoffWriteInput, InterruptedRunRecovery, LeaderLeaseAcquireInput,
     RecoveredReservation, RecoveryCapsuleWriteInput, ReservationAcquireOutcome, ReservationRequest,
     RunFinishInput, RunStartInput, SessionCheckpointInput,
 };
 use grove_session::{
-    execute_single_task_session_with_hooks, update_circuit_breaker, ClaudeBackend,
-    SessionLifecycleHooks, SingleTaskSessionRequest, SingleTaskSessionResult,
+    ClaudeBackend, SessionLifecycleHooks, SingleTaskSessionRequest, SingleTaskSessionResult,
+    execute_single_task_session_with_hooks, update_circuit_breaker,
 };
 use grove_types::{
-    AgentActivity, BeadId, CheckpointId, CircuitState, FailureClass,
-    GroveBeadRecord, GroveBeadStatus, ReservationConflict, ReservationMode, ReservationRecord,
-    RunId, RunStatus, SessionStatus, Timestamp,
+    AgentActivity, BeadId, CheckpointId, CircuitState, FailureClass, GroveBeadRecord,
+    GroveBeadStatus, ReservationConflict, ReservationMode, ReservationRecord, RunId, RunStatus,
+    SessionStatus, Timestamp,
 };
 use std::{
     collections::BTreeMap,
@@ -32,7 +32,7 @@ use std::{
 };
 
 pub use dispatch::{
-    run_dispatch_loop, DispatchExitReason, DispatchLoopConfig, DispatchLoopOutcome, ShutdownSignal,
+    DispatchExitReason, DispatchLoopConfig, DispatchLoopOutcome, ShutdownSignal, run_dispatch_loop,
 };
 pub use inspect_view::BeadInspectView;
 pub use status_view::WorkspaceStatusView;
@@ -314,20 +314,21 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
                 self.run_id.clone(),
                 self.session_id.clone(),
                 &replay,
-            ) {
-                archived.source_path =
-                    camino::Utf8PathBuf::from(result.outcome.session.transcript_path.clone());
+            )
+        {
+            archived.source_path =
+                camino::Utf8PathBuf::from(result.outcome.session.transcript_path.clone());
 
-                let source_record = grove_types::archive::SourceRecord {
-                    id: grove_types::SourceId::new("transcript"),
-                    source_path: archived.source_path.clone(),
-                    origin_host: None,
-                    metadata_json: serde_json::json!({}),
-                };
-                let _ = self.db.insert_source_record(&source_record);
-                // Idempotent: skips if this session was already ingested (watermark check)
-                let _ = self.db.insert_conversation_idempotent(&archived);
-            }
+            let source_record = grove_types::archive::SourceRecord {
+                id: grove_types::SourceId::new("transcript"),
+                source_path: archived.source_path.clone(),
+                origin_host: None,
+                metadata_json: serde_json::json!({}),
+            };
+            let _ = self.db.insert_source_record(&source_record);
+            // Idempotent: skips if this session was already ingested (watermark check)
+            let _ = self.db.insert_conversation_idempotent(&archived);
+        }
 
         // Ingest GROVE_LESSONS from protocol state into playbook as draft candidates
         if !result.protocol_state.lessons.is_empty() {
@@ -1410,8 +1411,8 @@ mod tests {
     }
 
     #[test]
-    fn startup_reconciliation_marks_active_runs_failed_and_releases_stale_reservations(
-    ) -> TestResult {
+    fn startup_reconciliation_marks_active_runs_failed_and_releases_stale_reservations()
+    -> TestResult {
         let dir = tempfile::tempdir()?;
         let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
             .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
@@ -1800,9 +1801,11 @@ exit "${EXIT_CODE:-0}"
             &GroveConfig::default(),
         )
         .expect_err("checkpoint file write should fail");
-        assert!(error
-            .to_string()
-            .contains("failed to persist checkpoint file"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to persist checkpoint file")
+        );
 
         let bead = db
             .get_bead_record(&BeadId::new("grove-life"))?
@@ -1826,10 +1829,11 @@ exit "${EXIT_CODE:-0}"
             .into_iter()
             .next()
             .expect("run should persist");
-        assert!(run
-            .failure_detail
-            .as_deref()
-            .is_some_and(|detail| detail.contains("failed to persist checkpoint file")));
+        assert!(
+            run.failure_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("failed to persist checkpoint file"))
+        );
         Ok(())
     }
 

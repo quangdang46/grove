@@ -549,9 +549,10 @@ fn handle_log(bead_id: &BeadId, json_mode: bool) -> Result<()> {
                 event.kind, session_label, event.created_at
             );
             if event.payload != serde_json::Value::Null
-                && let Ok(pretty) = serde_json::to_string(&event.payload) {
-                    println!("    {pretty}");
-                }
+                && let Ok(pretty) = serde_json::to_string(&event.payload)
+            {
+                println!("    {pretty}");
+            }
         }
     }
 
@@ -1512,10 +1513,7 @@ fn print_run_report(report: &RunReport) {
         println!("- failure class: {:?}", failure_class);
     }
     let m = &report.metrics;
-    println!(
-        "- duration: {}s",
-        m.total_duration_secs
-    );
+    println!("- duration: {}s", m.total_duration_secs);
     println!("- checkpoints: {}", m.checkpoints_taken);
     println!("- retries: {}", m.retries_attempted);
     println!("- rescue injections: {}", m.rescue_injections);

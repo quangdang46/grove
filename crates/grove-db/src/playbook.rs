@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use grove_types::{
+    BeadId, BulletId, RunId,
     playbook::{
         BulletMaturity, BulletScope, BulletState, BulletType, FeedbackEventRecord, FeedbackKind,
         PlaybookBulletRecord,
     },
-    BeadId, BulletId, RunId,
 };
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 
-use crate::{timestamp_string, Database};
+use crate::{Database, timestamp_string};
 
 impl Database {
     /// Insert a new playbook bullet.

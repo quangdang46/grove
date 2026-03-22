@@ -13,10 +13,10 @@ use camino::Utf8PathBuf;
 use chrono::{DateTime, Utc};
 use grove_config::GroveConfig;
 use grove_db::{Database, RunFinishInput, RunStartInput};
-use grove_kernel::{execute_persisted_single_task_session, DispatchExitReason, ShutdownSignal};
+use grove_kernel::{DispatchExitReason, ShutdownSignal, execute_persisted_single_task_session};
 use grove_session::{
-    execute_single_task_session_with_hooks, CliClaudeBackend, ContextMonitor, ExitPolicy,
-    SessionLifecycleHooks, SessionShutdownConfig, SingleTaskSessionRequest,
+    CliClaudeBackend, ContextMonitor, ExitPolicy, SessionLifecycleHooks, SessionShutdownConfig,
+    SingleTaskSessionRequest, execute_single_task_session_with_hooks,
 };
 use grove_types::{
     AgentActivity, BeadId, ClaudeSessionRecord, CoordinatorStopReason, EscalationTier, EventKind,

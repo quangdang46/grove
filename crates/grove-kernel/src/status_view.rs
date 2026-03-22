@@ -6,7 +6,7 @@ use chrono::{Duration, Utc};
 use grove_br::{BrClient, BrDependencySnapshot};
 use grove_bv::BvTriageOutput;
 use grove_config::GroveConfig;
-use grove_db::{reservation_patterns_overlap, Database, RecoveryCapsuleEvent};
+use grove_db::{Database, RecoveryCapsuleEvent, reservation_patterns_overlap};
 use grove_types::{
     BeadId, BeadPriority, FailureClass, GroveBeadRecord, GroveBeadStatus, LeaderLeaseRecord,
     PromptManifest, RecoveryCapsule, RecoveryCapsuleOutcome, ReservationConflict, ReservationMode,
@@ -404,28 +404,29 @@ pub fn load_status_snapshot<C: BrClient>(
 
     let leader = db.active_leader_lease(&now)?;
     let last_coordinator_stop = db
-        .latest_event_by_kind(grove_types::EventKind::CoordinatorStopped)?.map(|event| CoordinatorStopView {
-                reason: event
-                    .payload
-                    .get("stop_reason")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("unknown")
-                    .to_owned(),
-                created_at: event.created_at,
-                forced: event
-                    .payload
-                    .get("forced_termination")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false),
-                running_session_count: event
-                    .payload
-                    .get("running_session_count")
-                    .and_then(|value| value.as_u64()),
-                leader_released: event
-                    .payload
-                    .get("leader_released")
-                    .and_then(|value| value.as_bool()),
-            });
+        .latest_event_by_kind(grove_types::EventKind::CoordinatorStopped)?
+        .map(|event| CoordinatorStopView {
+            reason: event
+                .payload
+                .get("stop_reason")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown")
+                .to_owned(),
+            created_at: event.created_at,
+            forced: event
+                .payload
+                .get("forced_termination")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+            running_session_count: event
+                .payload
+                .get("running_session_count")
+                .and_then(|value| value.as_u64()),
+            leader_released: event
+                .payload
+                .get("leader_released")
+                .and_then(|value| value.as_bool()),
+        });
     let running_beads = build_running_beads(&beads, db)?;
     let ready_queue = build_ready_queue(
         &beads,
@@ -1263,25 +1264,33 @@ mod tests {
         let p0_entry = &queue[0];
         assert!(p0_entry.score.is_some_and(|score| score >= 100.0));
         assert!(p0_entry.why.iter().any(|item| item == "P0 priority"));
-        assert!(p0_entry
-            .why
-            .iter()
-            .any(|item| item == "no reservation conflicts"));
-        assert!(p0_entry
-            .score_breakdown
-            .iter()
-            .any(|component| component.label == "ready_age"));
+        assert!(
+            p0_entry
+                .why
+                .iter()
+                .any(|item| item == "no reservation conflicts")
+        );
+        assert!(
+            p0_entry
+                .score_breakdown
+                .iter()
+                .any(|component| component.label == "ready_age")
+        );
 
         let bonus_entry = &queue[1];
         assert!(bonus_entry.score.is_some_and(|score| score >= 95.0));
-        assert!(bonus_entry
-            .score_breakdown
-            .iter()
-            .any(|component| component.label == "critical_path" && component.value == 20.0));
-        assert!(bonus_entry
-            .why
-            .iter()
-            .any(|item| item == "1 downstream bead"));
+        assert!(
+            bonus_entry
+                .score_breakdown
+                .iter()
+                .any(|component| component.label == "critical_path" && component.value == 20.0)
+        );
+        assert!(
+            bonus_entry
+                .why
+                .iter()
+                .any(|item| item == "1 downstream bead")
+        );
 
         let tied_queue = build_ready_queue(
             &[
@@ -1356,10 +1365,12 @@ mod tests {
             .expect("clean ready bead should stay in queue");
         assert!(clean_entry.dispatch.dispatchable_in_grove);
         assert!(clean_entry.score.is_some_and(|score| score >= 75.0));
-        assert!(clean_entry
-            .score_breakdown
-            .iter()
-            .all(|component| component.label != "reservation_conflict_penalty"));
+        assert!(
+            clean_entry
+                .score_breakdown
+                .iter()
+                .all(|component| component.label != "reservation_conflict_penalty")
+        );
 
         let conflicted_entry = queue
             .iter()
@@ -1370,24 +1381,30 @@ mod tests {
             conflicted_entry.dispatch.summary(),
             "reservation conflict between grove-conflicted (crates/grove-kernel/src/status_view.rs) and grove-held (crates/grove-kernel/src/*)"
         );
-        assert!(conflicted_entry
-            .dispatch
-            .local_suppression_reasons
-            .iter()
-            .any(|reason| reason.code == "reservation_conflict"));
+        assert!(
+            conflicted_entry
+                .dispatch
+                .local_suppression_reasons
+                .iter()
+                .any(|reason| reason.code == "reservation_conflict")
+        );
         assert!(conflicted_entry.score_breakdown.iter().any(|component| {
             component.label == "reservation_conflict_penalty"
                 && component.value == -1000.0
                 && component.note.as_deref() == Some("1 active conflict(s)")
         }));
-        assert!(conflicted_entry
-            .score_breakdown
-            .iter()
-            .any(|component| component.label == "ready_age"));
-        assert!(conflicted_entry
-            .why
-            .iter()
-            .any(|item| item == "1 reservation conflict(s)"));
+        assert!(
+            conflicted_entry
+                .score_breakdown
+                .iter()
+                .any(|component| component.label == "ready_age")
+        );
+        assert!(
+            conflicted_entry
+                .why
+                .iter()
+                .any(|item| item == "1 reservation conflict(s)")
+        );
 
         Ok(())
     }
@@ -1638,18 +1655,24 @@ mod tests {
         let entry = queue.first().ok_or("expected ready entry")?;
         assert_eq!(entry.bv_score, Some(0.75));
         assert!(entry.ready_minutes.is_some());
-        assert!(entry
-            .score_breakdown
-            .iter()
-            .any(|component| component.label == "bv_triage" && component.value == 0.75));
-        assert!(entry
-            .score_breakdown
-            .iter()
-            .any(|component| component.label == "ready_age"));
-        assert!(entry
-            .why
-            .iter()
-            .any(|item| item.contains("bv triage 0.75: critical path bead, top pagerank")));
+        assert!(
+            entry
+                .score_breakdown
+                .iter()
+                .any(|component| component.label == "bv_triage" && component.value == 0.75)
+        );
+        assert!(
+            entry
+                .score_breakdown
+                .iter()
+                .any(|component| component.label == "ready_age")
+        );
+        assert!(
+            entry
+                .why
+                .iter()
+                .any(|item| item.contains("bv triage 0.75: critical path bead, top pagerank"))
+        );
         Ok(())
     }
 

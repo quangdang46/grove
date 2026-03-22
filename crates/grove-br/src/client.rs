@@ -1,6 +1,6 @@
 use crate::schema::{
-    parse_dep_list_output, parse_list_output, parse_ready_output, parse_show_output, BrCapability,
-    BrDependencySnapshot, BrIssueDetail, BrIssueSummary, BrVersion, ShowParseError,
+    BrCapability, BrDependencySnapshot, BrIssueDetail, BrIssueSummary, BrVersion, ShowParseError,
+    parse_dep_list_output, parse_list_output, parse_ready_output, parse_show_output,
 };
 use grove_types::{BeadId, HandoffRecord};
 use std::{

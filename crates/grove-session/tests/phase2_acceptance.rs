@@ -12,9 +12,8 @@ use std::{
 use camino::Utf8PathBuf;
 use chrono::Utc;
 use grove_session::{
-    execute_single_task_session, execute_single_task_session_with_hooks, CliClaudeBackend,
-    ContextMonitor, ExitPolicy, SessionLifecycleHooks, SessionShutdownConfig,
-    SingleTaskSessionRequest,
+    CliClaudeBackend, ContextMonitor, ExitPolicy, SessionLifecycleHooks, SessionShutdownConfig,
+    SingleTaskSessionRequest, execute_single_task_session, execute_single_task_session_with_hooks,
 };
 use grove_types::{
     BeadId, ClaudeSessionRecord, ContextPressureLevel, EscalationTier, ExecutionContract,
@@ -572,8 +571,8 @@ fn rate_limit_preempts_generic_crash_classification() -> TestResult {
 }
 
 #[test]
-fn repeated_error_retry_context_uses_retry_rescue_contract_and_persists_manifest_details(
-) -> TestResult {
+fn repeated_error_retry_context_uses_retry_rescue_contract_and_persists_manifest_details()
+-> TestResult {
     let dir = tempdir()?;
     let workspace_dir = dir.path().join("workspace");
     fs::create_dir_all(&workspace_dir)?;
@@ -603,10 +602,12 @@ fn repeated_error_retry_context_uses_retry_rescue_contract_and_persists_manifest
         Some(FailureClass::RepeatedError)
     );
     assert_eq!(request.contract, ExecutionContract::RetryRescue);
-    assert!(request
-        .retry_delta_summary
-        .as_deref()
-        .is_some_and(|summary| { summary.contains("repeated error path") }));
+    assert!(
+        request
+            .retry_delta_summary
+            .as_deref()
+            .is_some_and(|summary| { summary.contains("repeated error path") })
+    );
     assert!(request.rescue_card.as_deref().is_some_and(|card| {
         card.contains("Previous repeated error to avoid") && card.contains("`GROVE_EXIT: false`")
     }));
@@ -633,19 +634,23 @@ fn repeated_error_retry_context_uses_retry_rescue_contract_and_persists_manifest
     let manifest: PromptManifest =
         serde_json::from_str(&fs::read_to_string(prompt_path.as_std_path())?)?;
     assert_eq!(manifest.contract, ExecutionContract::RetryRescue);
-    assert!(manifest
-        .retry_delta_summary
-        .as_deref()
-        .is_some_and(|summary| { summary.contains("repeated error path") }));
+    assert!(
+        manifest
+            .retry_delta_summary
+            .as_deref()
+            .is_some_and(|summary| { summary.contains("repeated error path") })
+    );
     let rescue_card = manifest
         .sections
         .iter()
         .find(|section| section.kind == PromptSegmentKind::RescueCard)
         .ok_or("missing rescue-card section")?;
     assert!(rescue_card.included);
-    assert!(rescue_card
-        .preview
-        .contains("Do not repeat the same failing path"));
+    assert!(
+        rescue_card
+            .preview
+            .contains("Do not repeat the same failing path")
+    );
     assert_eq!(
         result.protocol_state.result_summary.as_deref(),
         Some("retry mutation applied")
@@ -681,14 +686,18 @@ fn interrupted_retry_context_uses_resume_contract_and_persists_manifest_details(
         Some(FailureClass::Interrupted)
     );
     assert_eq!(request.contract, ExecutionContract::Resume);
-    assert!(request
-        .retry_delta_summary
-        .as_deref()
-        .is_some_and(|summary| summary.contains("resumes from durable progress")));
-    assert!(request
-        .rescue_card
-        .as_deref()
-        .is_some_and(|card| card.contains("Resume from the first unfinished step only")));
+    assert!(
+        request
+            .retry_delta_summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("resumes from durable progress"))
+    );
+    assert!(
+        request
+            .rescue_card
+            .as_deref()
+            .is_some_and(|card| card.contains("Resume from the first unfinished step only"))
+    );
 
     request.env = vec![
         (
@@ -712,18 +721,22 @@ fn interrupted_retry_context_uses_resume_contract_and_persists_manifest_details(
     let manifest: PromptManifest =
         serde_json::from_str(&fs::read_to_string(prompt_path.as_std_path())?)?;
     assert_eq!(manifest.contract, ExecutionContract::Resume);
-    assert!(manifest
-        .retry_delta_summary
-        .as_deref()
-        .is_some_and(|summary| summary.contains("resumes from durable progress")));
+    assert!(
+        manifest
+            .retry_delta_summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("resumes from durable progress"))
+    );
     let rescue_card = manifest
         .sections
         .iter()
         .find(|section| section.kind == PromptSegmentKind::RescueCard)
         .ok_or("missing rescue-card section")?;
-    assert!(rescue_card
-        .preview
-        .contains("Resume from the first unfinished step only"));
+    assert!(
+        rescue_card
+            .preview
+            .contains("Resume from the first unfinished step only")
+    );
     assert_eq!(result.outcome.terminal_class, SessionTerminalClass::Success);
     assert_eq!(result.outcome.session.status, SessionStatus::Completed);
     Ok(())

@@ -10,10 +10,10 @@
 
 use grove_db::Database;
 use grove_kernel::lesson_ingest::ingest_lessons;
-use grove_kernel::scoring::{run_scoring_pass, ScoringConfig};
+use grove_kernel::scoring::{ScoringConfig, run_scoring_pass};
 use grove_types::{
-    playbook::{BulletMaturity, BulletState, PlaybookBulletRecord},
     BeadId, RunId,
+    playbook::{BulletMaturity, BulletState, PlaybookBulletRecord},
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -105,7 +105,7 @@ fn one_off_noisy_lessons_remain_weak_candidates() -> TestResult {
 
 #[test]
 fn pure_db_no_external_memory_tool_in_prompt_assembly() -> TestResult {
-    use grove_session::{materialize_prompt, PromptMaterializationInput};
+    use grove_session::{PromptMaterializationInput, materialize_prompt};
     use grove_types::{ExecutionContract, PromptId, PromptSegmentKind};
 
     // We demonstrate that passing a fully-formed PlaybookBulletRecord list

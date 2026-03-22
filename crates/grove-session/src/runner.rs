@@ -397,17 +397,19 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
                 }
 
                 if let Some(deadline) = grace_deadline
-                    && !kill_sent && Instant::now() >= deadline {
-                        running
-                            .child
-                            .kill()
-                            .map_err(SingleTaskSessionRunnerError::Kill)?;
-                        hooks
-                            .on_shutdown_forced()
-                            .map_err(SingleTaskSessionRunnerError::LifecycleHook)?;
-                        kill_sent = true;
-                        forced_shutdown = true;
-                    }
+                    && !kill_sent
+                    && Instant::now() >= deadline
+                {
+                    running
+                        .child
+                        .kill()
+                        .map_err(SingleTaskSessionRunnerError::Kill)?;
+                    hooks
+                        .on_shutdown_forced()
+                        .map_err(SingleTaskSessionRunnerError::LifecycleHook)?;
+                    kill_sent = true;
+                    forced_shutdown = true;
+                }
 
                 if let Some(status) = running
                     .child

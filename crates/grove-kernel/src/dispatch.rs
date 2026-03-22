@@ -1,6 +1,6 @@
 use crate::{
-    execute_persisted_single_task_session, AcquireReservationInput, DispatchEligibilityContext,
-    LeaderLeaseConfig, LeaderLeaseManager, PersistedTaskRunOutcome, ReservationManager,
+    AcquireReservationInput, DispatchEligibilityContext, LeaderLeaseConfig, LeaderLeaseManager,
+    PersistedTaskRunOutcome, ReservationManager, execute_persisted_single_task_session,
 };
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -15,9 +15,9 @@ use grove_types::{
     GroveBeadStatus, PromptId, ReservationMode, RunId, SessionId, Timestamp,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -299,22 +299,23 @@ fn apply_reaction_side_effects(
         && matches!(
             outcome.run.status,
             grove_types::RunStatus::Succeeded | grove_types::RunStatus::Checkpointed
-        ) {
-            let _ = db.update_run_escalation_tier(
-                &ctx.bead_id,
-                &ctx.run_id,
-                grove_types::EscalationTier::FirstAttempt,
-                &now,
-            );
-            let _ = db.write_event_log(
-                grove_types::EventKind::EscalationTierReset,
-                Some(&ctx.bead_id),
-                Some(&ctx.run_id),
-                Some(&ctx.session_id),
-                &serde_json::json!({"reset_to": "FirstAttempt"}),
-                &now,
-            );
-        }
+        )
+    {
+        let _ = db.update_run_escalation_tier(
+            &ctx.bead_id,
+            &ctx.run_id,
+            grove_types::EscalationTier::FirstAttempt,
+            &now,
+        );
+        let _ = db.write_event_log(
+            grove_types::EventKind::EscalationTierReset,
+            Some(&ctx.bead_id),
+            Some(&ctx.run_id),
+            Some(&ctx.session_id),
+            &serde_json::json!({"reset_to": "FirstAttempt"}),
+            &now,
+        );
+    }
 
     for record in reaction_eval.records {
         let _ = db.write_event_log(
@@ -698,36 +699,37 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                     }
 
                     if outcome.run.status == grove_types::RunStatus::Succeeded
-                        && let Some(handoff) = outcome.handoff.as_ref() {
-                            match br.mirror_handoff(&ctx.bead_id, handoff, true) {
-                                Ok(()) => {
-                                    eprintln!(
-                                        "grove dispatch: mirrored {} to br",
-                                        ctx.bead_id.as_str()
-                                    );
-                                }
-                                Err(error) => {
-                                    eprintln!(
-                                        "grove dispatch: mirror failed for {}: {error}",
-                                        ctx.bead_id.as_str()
-                                    );
-                                    let _ = db.enqueue_mirror_outbox(
-                                        &ctx.bead_id,
-                                        &ctx.run_id,
-                                        handoff,
-                                        true,
-                                    );
-                                    apply_reaction_side_effects(
-                                        db,
-                                        &config,
-                                        &ctx,
-                                        Some(&outcome),
-                                        Some(&error.to_string()),
-                                        true,
-                                    );
-                                }
+                        && let Some(handoff) = outcome.handoff.as_ref()
+                    {
+                        match br.mirror_handoff(&ctx.bead_id, handoff, true) {
+                            Ok(()) => {
+                                eprintln!(
+                                    "grove dispatch: mirrored {} to br",
+                                    ctx.bead_id.as_str()
+                                );
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "grove dispatch: mirror failed for {}: {error}",
+                                    ctx.bead_id.as_str()
+                                );
+                                let _ = db.enqueue_mirror_outbox(
+                                    &ctx.bead_id,
+                                    &ctx.run_id,
+                                    handoff,
+                                    true,
+                                );
+                                apply_reaction_side_effects(
+                                    db,
+                                    &config,
+                                    &ctx,
+                                    Some(&outcome),
+                                    Some(&error.to_string()),
+                                    true,
+                                );
                             }
                         }
+                    }
                 }
                 Err(error) => {
                     apply_reaction_side_effects(db, &config, &ctx, None, Some(&error), false);
@@ -764,26 +766,28 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
         }
 
         if let Some(limit) = loop_config.max_poll_cycles
-            && poll_cycles > limit {
-                let exit_reason = DispatchExitReason::MaxPollCycles { limit };
-                return Ok(DispatchLoopOutcome {
-                    dispatched_count,
-                    poll_cycles,
-                    exit_reason: exit_reason.clone(),
-                    stop_reason: exit_reason.to_stop_reason(),
-                });
-            }
+            && poll_cycles > limit
+        {
+            let exit_reason = DispatchExitReason::MaxPollCycles { limit };
+            return Ok(DispatchLoopOutcome {
+                dispatched_count,
+                poll_cycles,
+                exit_reason: exit_reason.clone(),
+                stop_reason: exit_reason.to_stop_reason(),
+            });
+        }
 
         if let Some(max_runs) = loop_config.max_total_runs
-            && dispatched_count >= max_runs {
-                let exit_reason = DispatchExitReason::MaxRunsReached;
-                return Ok(DispatchLoopOutcome {
-                    dispatched_count,
-                    poll_cycles,
-                    exit_reason: exit_reason.clone(),
-                    stop_reason: exit_reason.to_stop_reason(),
-                });
-            }
+            && dispatched_count >= max_runs
+        {
+            let exit_reason = DispatchExitReason::MaxRunsReached;
+            return Ok(DispatchLoopOutcome {
+                dispatched_count,
+                poll_cycles,
+                exit_reason: exit_reason.clone(),
+                stop_reason: exit_reason.to_stop_reason(),
+            });
+        }
 
         let now = chrono::Utc::now();
         match LeaderLeaseManager::heartbeat(db, lease_config, now)? {
@@ -1704,11 +1708,13 @@ mod tests {
             capsule.capsule.outcome,
             grove_types::RecoveryCapsuleOutcome::Failed
         );
-        assert!(capsule
-            .capsule
-            .strongest_evidence
-            .iter()
-            .any(|entry| entry.contains("mirror sync failed")));
+        assert!(
+            capsule
+                .capsule
+                .strongest_evidence
+                .iter()
+                .any(|entry| entry.contains("mirror sync failed"))
+        );
         Ok(())
     }
 }

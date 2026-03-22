@@ -8,11 +8,11 @@
 use chrono::Utc;
 use grove_db::Database;
 use grove_types::{
+    AgentActivity, BeadId, EscalationTier, FailureClass, RunId, RunStatus, SessionOutcome,
     reaction::{
         ReactionAction, ReactionContextSnapshot, ReactionOutcome, ReactionRecord, ReactionRule,
         ReactionTrigger,
     },
-    AgentActivity, BeadId, EscalationTier, FailureClass, RunId, RunStatus, SessionOutcome,
 };
 
 /// Runtime state snapshot used to evaluate triggers.
