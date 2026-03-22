@@ -48,14 +48,18 @@ impl RunningSession {
     }
 }
 
+/// Sentinel: when `default_model` in config is `"default"`, Grove does not pass `--model`
+/// so the Claude CLI uses its own default model.
+pub const DEFAULT_MODEL_OMIT_FLAG: &str = "default";
+
 impl ClaudeBackend for CliClaudeBackend {
     fn start(&self, req: StartSessionRequest) -> Result<RunningSession> {
         let mut command = Command::new(&self.claude_bin);
+        command.arg("-p").arg(&req.prompt);
+        if req.model != DEFAULT_MODEL_OMIT_FLAG {
+            command.arg("--model").arg(&req.model);
+        }
         command
-            .arg("-p")
-            .arg(&req.prompt)
-            .arg("--model")
-            .arg(&req.model)
             .current_dir(req.working_dir.as_std_path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -89,7 +93,9 @@ impl ClaudeBackend for CliClaudeBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaudeBackend, CliClaudeBackend, StartSessionRequest};
+    use super::{
+        ClaudeBackend, CliClaudeBackend, DEFAULT_MODEL_OMIT_FLAG, StartSessionRequest,
+    };
     use camino::Utf8PathBuf;
     use std::{error::Error, fs, time::Duration};
     use tempfile::tempdir;
@@ -181,6 +187,43 @@ printf 'stderr line\n' >&2
             fs::read_to_string(&pwd_file)?.trim(),
             workspace_dir.display().to_string()
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_backend_omits_model_flag_when_default_sentinel() -> TestResult {
+        let dir = tempdir()?;
+        let workspace_dir = dir.path().join("workspace");
+        fs::create_dir_all(&workspace_dir)?;
+
+        let script_path = dir.path().join("fake-claude");
+        write_fake_claude_script(&script_path)?;
+
+        let args_file = dir.path().join("args.txt");
+
+        let working_dir = Utf8PathBuf::from_path_buf(workspace_dir.clone())
+            .map_err(|_| std::io::Error::other("workspace dir must be valid UTF-8"))?;
+        let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+        let mut session = backend.start(StartSessionRequest {
+            model: DEFAULT_MODEL_OMIT_FLAG.to_owned(),
+            prompt: "write code while you sleep".to_owned(),
+            working_dir,
+            timeout: Duration::from_secs(90),
+            env: vec![(
+                "ARGS_FILE".to_owned(),
+                args_file.to_string_lossy().into_owned(),
+            )],
+        })?;
+
+        let _ = session.stdout.next();
+        let _ = session.stderr.next();
+        let status = session.child.wait()?;
+        assert!(status.success());
+
+        let recorded_args = fs::read_to_string(&args_file)?;
+        let args: Vec<_> = recorded_args.lines().collect();
+        assert_eq!(args, vec!["-p", "write code while you sleep"]);
         Ok(())
     }
 

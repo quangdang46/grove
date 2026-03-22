@@ -21,6 +21,7 @@ pub struct GroveConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub claude_bin: String,
+    /// Use `"default"` to let the Claude CLI pick the model (Grove omits `--model`).
     pub default_model: String,
     pub workspace_root: String,
     pub timeout_minutes: u64,
@@ -31,7 +32,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             claude_bin: "claude".to_owned(),
-            default_model: "sonnet".to_owned(),
+            default_model: "default".to_owned(),
             workspace_root: ".".to_owned(),
             timeout_minutes: 60,
             env_passthrough: Vec::new(),

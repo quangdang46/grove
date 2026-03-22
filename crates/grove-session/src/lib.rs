@@ -17,7 +17,9 @@ pub use analyzer::{
     analyze_session_outcome, classify_session_outcome, classify_session_outcome_with_policy,
     evaluate_exit_policy, evaluate_outcome_exit_policy, update_circuit_breaker,
 };
-pub use backend::{ClaudeBackend, CliClaudeBackend, RunningSession, StartSessionRequest};
+pub use backend::{
+    ClaudeBackend, CliClaudeBackend, DEFAULT_MODEL_OMIT_FLAG, RunningSession, StartSessionRequest,
+};
 pub use exit_policy::{ExitDecision, ExitPolicy};
 pub use grove_types::EscalationContext;
 pub use materializer::{

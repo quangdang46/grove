@@ -317,7 +317,7 @@ GROVE_EXIT: false
 
 [runtime]
 claude_bin = "claude"
-default_model = "sonnet"
+default_model = "default"   # omit --model; use a concrete name (e.g. "sonnet") to force --model
 workspace_root = "."
 timeout_minutes = 60
 

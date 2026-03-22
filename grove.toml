@@ -1,6 +1,6 @@
 [runtime]
 claude_bin = "claude"
-default_model = "sonnet"
+default_model = "default"
 workspace_root = "."
 timeout_minutes = 60
 
