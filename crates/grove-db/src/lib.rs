@@ -168,7 +168,7 @@ const PRAGMAS: &[&str] = &[
     "PRAGMA foreign_keys = ON;",
     "PRAGMA synchronous = NORMAL;",
     "PRAGMA temp_store = MEMORY;",
-    "PRAGMA busy_timeout = 5000;",
+    "PRAGMA busy_timeout = 60000;", // 30 seconds to handle concurrent worker writes
 ];
 
 const MIGRATION_MANIFEST: &[Migration<'_>] = &[

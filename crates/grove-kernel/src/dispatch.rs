@@ -1,11 +1,13 @@
 use crate::{
     AcquireReservationInput, DispatchEligibilityContext, LeaderLeaseConfig, LeaderLeaseManager,
-    PersistedTaskRunOutcome, ReservationManager, execute_persisted_single_task_session,
+    PersistedTaskRunOutcome, ReservationManager,
+    execute_persisted_single_task_session_after_run_started,
 };
+use crate::RunStartInput;
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use grove_br::BrClient;
-use grove_config::GroveConfig;
+use grove_config::{GroveConfig, DEFAULT_CHECKPOINTS_DIR_NAME, DEFAULT_GROVE_DIR_NAME};
 use grove_db::Database;
 use grove_session::{
     ClaudeBackend, ContextMonitor, ExitPolicy, SessionShutdownConfig, SingleTaskSessionRequest,
@@ -1092,6 +1094,28 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                 )),
             };
 
+            // Record run start on main thread BEFORE spawning worker to avoid
+            // concurrent SQLite writes from multiple worker threads.
+            let started_at = chrono::Utc::now();
+            let checkpoint_root = loop_config
+                .working_dir
+                .join(DEFAULT_GROVE_DIR_NAME)
+                .join(DEFAULT_CHECKPOINTS_DIR_NAME);
+            if let Err(error) = db.record_run_started(RunStartInput {
+                run_id: run_id.clone(),
+                bead_id: bead_id.clone(),
+                attempt_no,
+                started_at,
+                escalation_tier: request.escalation_tier,
+            }) {
+                eprintln!(
+                    "grove dispatch: {} failed to record run start: {error}",
+                    bead_id.as_str()
+                );
+                excluded_ids.insert(bead_id);
+                continue;
+            }
+
             eprintln!(
                 "grove dispatch: dispatching {} (attempt {}) as run {}",
                 bead_id.as_str(),
@@ -1113,6 +1137,12 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                 );
             }
 
+            // Capture values needed by worker thread before spawning
+            let worker_bead_id = bead_id.clone();
+            let worker_run_id = run_id.clone();
+            let worker_session_id = session_id.clone();
+            let worker_checkpoint_root = checkpoint_root.clone();
+
             let worker_ctx = DispatchedWorkerContext {
                 bead_id: bead_id.clone(),
                 run_id: run_id.clone(),
@@ -1128,12 +1158,16 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                     let mut worker_db =
                         Database::open(&worker_db_path).map_err(|error| error.to_string())?;
                     worker_db.migrate().map_err(|error| error.to_string())?;
-                    execute_persisted_single_task_session(
+                    execute_persisted_single_task_session_after_run_started(
                         &mut worker_db,
                         &worker_backend,
                         request,
                         attempt_no,
                         &worker_config,
+                        worker_bead_id,
+                        worker_run_id,
+                        worker_session_id,
+                        worker_checkpoint_root.into_std_path_buf(),
                     )
                     .map_err(|error| error.to_string())
                 })();

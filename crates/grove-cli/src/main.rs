@@ -332,8 +332,10 @@ fn handle_inspect(bead_id: &BeadId, json_mode: bool) -> Result<()> {
 fn handle_run(json_mode: bool) -> Result<()> {
     let (loaded, mut db, br) = open_runtime()?;
     let owner_label = format!("{}:{}", loaded.paths.workspace_root(), std::process::id());
+    // Use 5x poll interval for lease TTL to give main thread enough time
+    // to heartbeat even when workers are doing concurrent DB operations
     let lease_ttl = chrono::Duration::milliseconds(
-        cmp::max(1, loaded.config.scheduler.poll_interval_ms as i64) * 2,
+        cmp::max(1, loaded.config.scheduler.poll_interval_ms as i64) * 5,
     );
     let lease_config = LeaderLeaseConfig {
         owner_label,

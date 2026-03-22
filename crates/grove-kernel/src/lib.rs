@@ -91,12 +91,40 @@ pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
         escalation_tier,
     })?;
 
+    execute_persisted_single_task_session_after_run_started(
+        db,
+        backend,
+        request,
+        attempt_no,
+        config,
+        bead_id,
+        run_id,
+        session_id,
+        checkpoint_root.into_std_path_buf(),
+    )
+}
+
+/// Execute a persisted single task session when the run has already been recorded.
+/// This is used by the dispatch loop to avoid concurrent SQLite writes by recording
+/// the run start on the main thread before spawning workers.
+pub fn execute_persisted_single_task_session_after_run_started<B: ClaudeBackend>(
+    db: &mut Database,
+    backend: &B,
+    request: SingleTaskSessionRequest,
+    _attempt_no: i32,
+    config: &GroveConfig,
+    bead_id: BeadId,
+    run_id: RunId,
+    session_id: grove_types::SessionId,
+    checkpoint_root: PathBuf,
+) -> Result<PersistedTaskRunOutcome> {
+
     let mut hooks = DbSessionLifecycleHooks::new(
         db,
         bead_id.clone(),
         run_id.clone(),
         session_id,
-        PathBuf::from(checkpoint_root.as_std_path()),
+        checkpoint_root,
     );
     let result = execute_single_task_session_with_hooks(backend, request, &mut hooks);
 
