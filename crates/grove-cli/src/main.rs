@@ -875,7 +875,7 @@ impl LiveAuditState {
             self.transcript_lines = vec![
                 "No running sessions.".to_owned(),
                 "Use Status to review ready and failed beads.".to_owned(),
-                "Press q to hide/show the live UI.".to_owned(),
+                "Press q to hide the live UI while Grove keeps running.".to_owned(),
             ];
             return Ok(());
         }
@@ -1161,48 +1161,44 @@ fn run_dispatch_loop_with_live_ui(
             terminal.draw(|frame| draw_live_audit(frame, &state))?;
         }
 
-        if event::poll(Duration::from_millis(150))?
-            && let CEvent::Key(key) = event::read()?
-        {
-            match key.code {
-                KeyCode::Char('q') => {
-                    if live_hidden {
-                        terminal = enter_live_terminal()?;
-                        live_hidden = false;
-                    } else {
+        if !live_hidden {
+            if event::poll(Duration::from_millis(150))?
+                && let CEvent::Key(key) = event::read()?
+            {
+                match key.code {
+                    KeyCode::Char('q') => {
                         leave_live_terminal(&mut terminal)?;
                         if let Some(result) = completed.take() {
                             return Ok(result);
                         }
                         live_hidden = true;
                     }
-                }
-                KeyCode::Tab if !live_hidden => {
-                    state.tab = match state.tab {
-                        LiveTab::Status => LiveTab::Live,
-                        LiveTab::Live => LiveTab::Status,
-                    };
-                }
-                KeyCode::Right if !live_hidden => state.tab = LiveTab::Live,
-                KeyCode::Left if !live_hidden => state.tab = LiveTab::Status,
-                KeyCode::Down if !live_hidden => {
-                    if !state.running.is_empty() {
-                        state.selected = (state.selected + 1).min(state.running.len() - 1);
+                    KeyCode::Tab => {
+                        state.tab = match state.tab {
+                            LiveTab::Status => LiveTab::Live,
+                            LiveTab::Live => LiveTab::Status,
+                        };
                     }
-                }
-                KeyCode::Up if !live_hidden => {
-                    if state.selected > 0 {
-                        state.selected -= 1;
+                    KeyCode::Right => state.tab = LiveTab::Live,
+                    KeyCode::Left => state.tab = LiveTab::Status,
+                    KeyCode::Down => {
+                        if !state.running.is_empty() {
+                            state.selected = (state.selected + 1).min(state.running.len() - 1);
+                        }
                     }
+                    KeyCode::Up => {
+                        if state.selected > 0 {
+                            state.selected -= 1;
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-
-        if live_hidden {
+        } else {
             if let Some(result) = completed.take() {
                 return Ok(result);
             }
+            thread::sleep(Duration::from_millis(150));
         }
     }
 }
