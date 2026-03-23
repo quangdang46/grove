@@ -13,7 +13,9 @@ use camino::Utf8PathBuf;
 use chrono::{DateTime, Utc};
 use grove_config::GroveConfig;
 use grove_db::{Database, RunFinishInput, RunStartInput};
-use grove_kernel::{DispatchExitReason, ShutdownSignal, execute_persisted_single_task_session};
+use grove_kernel::{
+    DispatchExitReason, ShutdownSignal, execute_persisted_single_task_session, init_trace_logging,
+};
 use grove_session::{
     CliClaudeBackend, ContextMonitor, ExitPolicy, SessionLifecycleHooks, SessionShutdownConfig,
     SingleTaskSessionRequest, execute_single_task_session_with_hooks,
@@ -291,12 +293,13 @@ fn persisted_session_records_live_idle_transition_in_run_state_and_event_log() -
     fs::create_dir_all(&workspace_dir)?;
     let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
         .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+    init_trace_logging(&workspace_dir, true)?;
 
     let script_path = dir.path().join("fake-claude");
     write_fake_claude_script(&script_path)?;
     let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
 
-    let mut request = sample_request(workspace_dir);
+    let mut request = sample_request(workspace_dir.clone());
     request.env = vec![
         ("PRE_OUTPUT_SLEEP_SECS".to_owned(), "0.05".to_owned()),
         (
@@ -346,6 +349,14 @@ fn persisted_session_records_live_idle_transition_in_run_state_and_event_log() -
         blocked_event.is_some(),
         "expected a durable Blocked activity event tagged stderr"
     );
+
+    let trace_path = workspace_dir
+        .join(".grove")
+        .join("logs")
+        .join("runtime.jsonl");
+    let trace = fs::read_to_string(trace_path.as_std_path())?;
+    assert!(trace.contains("session.activity_changed"));
+    assert!(trace.contains("session.finished"));
     Ok(())
 }
 

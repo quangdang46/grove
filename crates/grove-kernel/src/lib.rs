@@ -8,9 +8,12 @@ pub mod scoring;
 pub mod status_view;
 
 use anyhow::{Context, Result};
+use camino::Utf8Path;
 use grove_br::{BrClient, BrDependencySnapshot};
 use grove_bv::BvTriageOutput;
-use grove_config::{DEFAULT_CHECKPOINTS_DIR_NAME, DEFAULT_GROVE_DIR_NAME, GroveConfig};
+use grove_config::{
+    DEFAULT_CHECKPOINTS_DIR_NAME, DEFAULT_GROVE_DIR_NAME, DEFAULT_LOGS_DIR_NAME, GroveConfig,
+};
 use grove_db::{
     Database, HandoffWriteInput, InterruptedRunRecovery, LeaderLeaseAcquireInput,
     RecoveredReservation, RecoveryCapsuleWriteInput, ReservationAcquireOutcome, ReservationRequest,
@@ -28,7 +31,9 @@ use grove_types::{
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 pub use dispatch::{
@@ -38,6 +43,8 @@ pub use inspect_view::BeadInspectView;
 pub use status_view::WorkspaceStatusView;
 
 pub const CRATE_PURPOSE: &str = "Core Grove runtime domain and service boundaries.";
+
+static TRACE_LOGGER: OnceLock<Mutex<Option<fs::File>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct PersistedTaskRunOutcome {
@@ -65,6 +72,76 @@ impl std::fmt::Display for CheckpointFilePersistError {
 }
 
 impl std::error::Error for CheckpointFilePersistError {}
+
+pub fn init_trace_logging(workspace_root: &Utf8Path, enabled: bool) -> Result<()> {
+    let logger = TRACE_LOGGER.get_or_init(|| Mutex::new(None));
+    let mut guard = logger
+        .lock()
+        .map_err(|_| anyhow::anyhow!("trace logger mutex poisoned"))?;
+
+    if !enabled {
+        *guard = None;
+        return Ok(());
+    }
+
+    let logs_dir = workspace_root
+        .join(DEFAULT_GROVE_DIR_NAME)
+        .join(DEFAULT_LOGS_DIR_NAME);
+    fs::create_dir_all(&logs_dir)
+        .with_context(|| format!("create logs directory {}", logs_dir.as_str()))?;
+    let log_path = logs_dir.join("runtime.jsonl");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path.as_std_path())
+        .with_context(|| format!("open runtime trace log {}", log_path.as_str()))?;
+    *guard = Some(file);
+    Ok(())
+}
+
+fn write_trace_event(payload: serde_json::Value) {
+    let Some(logger) = TRACE_LOGGER.get() else {
+        return;
+    };
+    let Ok(mut guard) = logger.lock() else {
+        return;
+    };
+    let Some(file) = guard.as_mut() else {
+        return;
+    };
+    let mut line = payload;
+    if let serde_json::Value::Object(ref mut object) = line {
+        object.insert("ts".to_owned(), serde_json::json!(chrono::Utc::now()));
+    }
+    if let Ok(encoded) = serde_json::to_vec(&line) {
+        let _ = file.write_all(&encoded);
+        let _ = file.write_all(b"\n");
+        let _ = file.flush();
+    }
+}
+
+fn trace_session_event(
+    event: &str,
+    bead_id: &BeadId,
+    run_id: &RunId,
+    session_id: &grove_types::SessionId,
+    fields: serde_json::Value,
+) {
+    write_trace_event(serde_json::json!({
+        "event": event,
+        "bead_id": bead_id.as_str(),
+        "run_id": run_id.as_str(),
+        "session_id": session_id.as_str(),
+        "fields": fields,
+    }));
+}
+
+pub fn trace_runtime_event(event: &str, fields: serde_json::Value) {
+    write_trace_event(serde_json::json!({
+        "event": event,
+        "fields": fields,
+    }));
+}
 
 pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
     db: &mut Database,
@@ -123,13 +200,25 @@ pub fn execute_persisted_single_task_session_after_run_started<B: ClaudeBackend>
         db,
         bead_id.clone(),
         run_id.clone(),
-        session_id,
+        session_id.clone(),
         checkpoint_root,
     );
     let result = execute_single_task_session_with_hooks(backend, request, &mut hooks);
 
     match result {
         Ok(result) => {
+            trace_session_event(
+                "session.run_result",
+                &bead_id,
+                &run_id,
+                &session_id,
+                serde_json::json!({
+                    "session_status": format!("{:?}", result.outcome.session.status),
+                    "terminal_class": format!("{:?}", result.outcome.terminal_class),
+                    "stop_reason": result.outcome.session.stop_reason.map(|reason| format!("{:?}", reason)),
+                    "exit_code": result.outcome.session.exit_code,
+                }),
+            );
             let checkpoint = hooks.take_checkpoint();
             let run =
                 finalize_persisted_run(hooks.db_mut(), &bead_id, &result.outcome, None, config)?;
@@ -142,6 +231,16 @@ pub fn execute_persisted_single_task_session_after_run_started<B: ClaudeBackend>
             })
         }
         Err(error) => {
+            trace_session_event(
+                "session.run_error",
+                &bead_id,
+                &run_id,
+                &session_id,
+                serde_json::json!({
+                    "error": error.to_string(),
+                    "had_latest_outcome": hooks.latest_outcome().is_some(),
+                }),
+            );
             if let Some(outcome) = hooks.latest_outcome() {
                 let _ = finalize_persisted_run(
                     hooks.db_mut(),
@@ -244,6 +343,17 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
         session: &grove_types::ClaudeSessionRecord,
     ) -> anyhow::Result<()> {
         self.db.record_session_started(&self.bead_id, session)?;
+        trace_session_event(
+            "session.started",
+            &self.bead_id,
+            &self.run_id,
+            &self.session_id,
+            serde_json::json!({
+                "status": format!("{:?}", session.status),
+                "ordinal_in_run": session.ordinal_in_run,
+                "transcript_path": session.transcript_path.clone(),
+            }),
+        );
         Ok(())
     }
 
@@ -268,6 +378,17 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
                 &at,
             )?;
         }
+        trace_session_event(
+            "session.activity_changed",
+            &self.bead_id,
+            &self.run_id,
+            &self.session_id,
+            serde_json::json!({
+                "activity": format!("{:?}", activity),
+                "detail": detail,
+                "at": at,
+            }),
+        );
         Ok(())
     }
 
@@ -285,6 +406,15 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
             }),
             &chrono::Utc::now(),
         )?;
+        trace_session_event(
+            "session.shutdown_requested",
+            &self.bead_id,
+            &self.run_id,
+            &self.session_id,
+            serde_json::json!({
+                "grace_period_ms": grace_period.map(|duration| duration.as_millis() as u64),
+            }),
+        );
         Ok(())
     }
 
@@ -297,12 +427,36 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
             &serde_json::json!({"forced": true}),
             &chrono::Utc::now(),
         )?;
+        trace_session_event(
+            "session.shutdown_forced",
+            &self.bead_id,
+            &self.run_id,
+            &self.session_id,
+            serde_json::json!({"forced": true}),
+        );
         Ok(())
     }
 
     fn on_session_finished(&mut self, result: &SingleTaskSessionResult) -> anyhow::Result<()> {
         self.db
             .record_session_finished(&self.bead_id, &result.outcome.session)?;
+        trace_session_event(
+            "session.finished",
+            &self.bead_id,
+            &self.run_id,
+            &self.session_id,
+            serde_json::json!({
+                "session_status": format!("{:?}", result.outcome.session.status),
+                "terminal_class": format!("{:?}", result.outcome.terminal_class),
+                "stop_reason": result.outcome.session.stop_reason.map(|reason| format!("{:?}", reason)),
+                "exit_code": result.outcome.session.exit_code,
+                "result_summary": result.protocol_state.result_summary.clone(),
+                "artifacts": result.protocol_state.artifacts.clone(),
+                "lessons": result.protocol_state.lessons.clone(),
+                "decisions": result.protocol_state.decisions.clone(),
+                "warnings": result.protocol_state.warnings.clone(),
+            }),
+        );
 
         if let Some(payload) = result.protocol_state.latest_checkpoint.clone() {
             let checkpoint_id = CheckpointId::new(format!(
@@ -326,6 +480,16 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
             let checkpoint_path = self.checkpoint_path(&checkpoint_id);
             if let Err(error) = persist_checkpoint_file(&checkpoint_path, &checkpoint) {
                 self.latest_outcome = Some(result.outcome.clone());
+                trace_session_event(
+                    "session.checkpoint_persist_error",
+                    &self.bead_id,
+                    &self.run_id,
+                    &self.session_id,
+                    serde_json::json!({
+                        "path": checkpoint_path.display().to_string(),
+                        "error": error.to_string(),
+                    }),
+                );
                 return Err(CheckpointFilePersistError {
                     path: checkpoint_path,
                     source: error.to_string(),
@@ -380,6 +544,21 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
         self.latest_outcome = Some(result.outcome.clone());
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn read_trace_log_lines(workspace_dir: &camino::Utf8Path) -> Result<Vec<serde_json::Value>> {
+    let path = workspace_dir
+        .join(DEFAULT_GROVE_DIR_NAME)
+        .join(DEFAULT_LOGS_DIR_NAME)
+        .join("runtime.jsonl");
+    let content = fs::read_to_string(path.as_std_path())?;
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn finalize_persisted_run(
@@ -1694,6 +1873,64 @@ exit "${EXIT_CODE:-0}"
                 .summary,
             "runtime persistence wired"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_runner_writes_trace_log_for_successful_session() -> TestResult {
+        use std::{fs, io};
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let workspace_dir = dir.path().join("workspace");
+        fs::create_dir_all(&workspace_dir)?;
+        let workspace_dir = camino::Utf8PathBuf::from_path_buf(workspace_dir)
+            .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| io::Error::other("db path must be valid UTF-8"))?;
+
+        init_trace_logging(&workspace_dir, true)?;
+
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+        insert_bead_cache_row(&db, "grove-life", "Lifecycle bead")?;
+
+        let script_path = dir.path().join("fake-claude");
+        write_fake_claude_script(&script_path)?;
+        let backend =
+            grove_session::CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+        let mut request = sample_session_request(workspace_dir.clone());
+        request.env = vec![
+            (
+                "STDOUT_SCRIPT".to_owned(),
+                concat!(
+                    "working through the task\n",
+                    "GROVE_RESULT: runtime persistence wired\n",
+                    "GROVE_ARTIFACTS: [\"crates/grove-kernel/src/lib.rs\"]\n",
+                    "GROVE_EXIT: true\n",
+                    "all tasks complete\n",
+                    "implementation complete\n"
+                )
+                .to_owned(),
+            ),
+            ("STDERR_SCRIPT".to_owned(), String::new()),
+            ("EXIT_CODE".to_owned(), "0".to_owned()),
+        ];
+
+        let _persisted = execute_persisted_single_task_session(
+            &mut db,
+            &backend,
+            request,
+            1,
+            &GroveConfig::default(),
+        )?;
+
+        let lines = read_trace_log_lines(&workspace_dir)?;
+        assert!(lines.iter().any(|line| line["event"] == "session.started"));
+        assert!(lines.iter().any(|line| line["event"] == "session.finished"));
+        assert!(lines.iter().any(|line| line["event"] == "session.run_result"));
         Ok(())
     }
 

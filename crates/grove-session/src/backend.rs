@@ -55,7 +55,11 @@ pub const DEFAULT_MODEL_OMIT_FLAG: &str = "default";
 impl ClaudeBackend for CliClaudeBackend {
     fn start(&self, req: StartSessionRequest) -> Result<RunningSession> {
         let mut command = Command::new(&self.claude_bin);
-        command.arg("-p").arg(&req.prompt);
+        command
+            .arg("-p")
+            .arg(&req.prompt)
+            .arg("--permission-mode")
+            .arg("bypassPermissions");
         if req.model != DEFAULT_MODEL_OMIT_FLAG {
             command.arg("--model").arg(&req.model);
         }
@@ -178,7 +182,14 @@ printf 'stderr line\n' >&2
         let args: Vec<_> = recorded_args.lines().collect();
         assert_eq!(
             args,
-            vec!["-p", "write code while you sleep", "--model", "sonnet"]
+            vec![
+                "-p",
+                "write code while you sleep",
+                "--permission-mode",
+                "bypassPermissions",
+                "--model",
+                "sonnet"
+            ]
         );
         assert_eq!(fs::read_to_string(&env_file)?, "backend-env");
         assert_eq!(
@@ -221,7 +232,15 @@ printf 'stderr line\n' >&2
 
         let recorded_args = fs::read_to_string(&args_file)?;
         let args: Vec<_> = recorded_args.lines().collect();
-        assert_eq!(args, vec!["-p", "write code while you sleep"]);
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "write code while you sleep",
+                "--permission-mode",
+                "bypassPermissions"
+            ]
+        );
         Ok(())
     }
 

@@ -16,7 +16,8 @@ use grove_db::Database;
 use grove_kernel::{
     BeadInspectView, DispatchLoopConfig, DispatchLoopOutcome, LeaderLeaseConfig, LeaderLeaseManager,
     ShutdownSignal, StartupRecoveryReport, WorkspaceStatusView, acquire_startup_coordinator,
-    load_bead_inspect_view, load_workspace_status_view, run_dispatch_loop,
+    init_trace_logging, load_bead_inspect_view, load_workspace_status_view, run_dispatch_loop,
+    trace_runtime_event,
 };
 use grove_session::replay_transcript;
 use grove_types::{
@@ -355,6 +356,17 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
     }
 
     let (loaded, mut db, br) = open_runtime()?;
+    init_trace_logging(loaded.paths.workspace_root(), loaded.config.logging.persist_jsonl)?;
+    trace_runtime_event(
+        "coordinator.run_started",
+        serde_json::json!({
+            "workspace_root": loaded.paths.workspace_root().as_str(),
+            "live": live,
+            "json_mode": json_mode,
+            "configured_max_parallel": loaded.config.scheduler.max_parallel,
+            "persist_jsonl": loaded.config.logging.persist_jsonl,
+        }),
+    );
     let owner_label = format!("{}:{}", loaded.paths.workspace_root(), std::process::id());
     // Use 5x poll interval for lease TTL to give main thread enough time
     // to heartbeat even when workers are doing concurrent DB operations
@@ -368,6 +380,14 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
     let now = chrono::Utc::now();
     let startup = acquire_startup_coordinator(&mut db, &lease_config, None, now)
         .map_err(|error| anyhow!(error.to_string()))?;
+
+    trace_runtime_event(
+        "coordinator.lease_acquired",
+        serde_json::json!({
+            "owner_label": lease_config.owner_label.clone(),
+            "lease_ttl_ms": lease_config.lease_ttl.num_milliseconds(),
+        }),
+    );
 
     run_startup_checks(&mut db, &lease_config, startup)?;
     if !json_mode && !live {
@@ -406,9 +426,25 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
     let release_result =
         LeaderLeaseManager::release(&mut db, &lease_config.owner_label, release_at)
             .context("release leader lease after dispatch loop")?;
+    trace_runtime_event(
+        "coordinator.lease_released",
+        serde_json::json!({
+            "owner_label": lease_config.owner_label.clone(),
+            "released": release_result.is_some(),
+        }),
+    );
 
     match dispatch_result {
         Ok(outcome) => {
+            trace_runtime_event(
+                "coordinator.run_stopped",
+                serde_json::json!({
+                    "exit_reason": outcome.exit_reason.to_string(),
+                    "stop_reason": outcome.stop_reason.as_str(),
+                    "dispatched_count": outcome.dispatched_count,
+                    "poll_cycles": outcome.poll_cycles,
+                }),
+            );
             let _ = db.write_event_log(
                 grove_types::EventKind::CoordinatorStopped,
                 None,
@@ -450,6 +486,13 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
         }
         Err(error) => {
             let error_message = error.to_string();
+            trace_runtime_event(
+                "coordinator.run_error",
+                serde_json::json!({
+                    "error": error_message,
+                    "leader_lease_released": release_result.is_some(),
+                }),
+            );
             let _ = db.write_event_log(
                 grove_types::EventKind::CoordinatorStopped,
                 None,

@@ -974,6 +974,7 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
             .max_parallel
             .saturating_sub(inflight_workers.len());
         if available_slots == 0 {
+            consecutive_empty_polls = 0;
             std::thread::sleep(poll_sleep);
             continue;
         }
@@ -990,11 +991,12 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                         stop_reason: exit_reason.to_stop_reason(),
                     });
                 }
+            } else {
+                consecutive_empty_polls = 0;
             }
             std::thread::sleep(poll_sleep);
             continue;
         }
-        consecutive_empty_polls = 0;
 
         let ready_ids: HashSet<BeadId> = ready_beads
             .iter()
@@ -1220,7 +1222,37 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
         }
 
         if !launched_any {
+            let any_dispatchable = beads.iter().any(|bead| {
+                ready_ids.contains(&bead.bead.id)
+                    && !excluded_ids.contains(&bead.bead.id)
+                    && crate::evaluate_dispatch_eligibility(
+                        bead,
+                        &crate::DispatchEligibilityContext {
+                            ready_in_br: true,
+                            circuit_state: crate::circuit_state_for_bead(bead),
+                            reservation_conflicts: Vec::new(),
+                            now,
+                        },
+                    )
+                    .dispatchable_in_grove
+            });
+            if inflight_workers.is_empty() && !any_dispatchable {
+                consecutive_empty_polls += 1;
+                if consecutive_empty_polls >= 3 {
+                    let exit_reason = DispatchExitReason::QueueEmpty;
+                    return Ok(DispatchLoopOutcome {
+                        dispatched_count,
+                        poll_cycles,
+                        exit_reason: exit_reason.clone(),
+                        stop_reason: exit_reason.to_stop_reason(),
+                    });
+                }
+            } else {
+                consecutive_empty_polls = 0;
+            }
             std::thread::sleep(poll_sleep);
+        } else {
+            consecutive_empty_polls = 0;
         }
     }
 }
@@ -1540,6 +1572,51 @@ mod tests {
             |row| row.get::<_, i64>(0),
         )?;
         assert!(runs >= 1, "expected at least 1 persisted run, got {}", runs);
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_loop_exits_queue_empty_when_ready_beads_are_all_locally_suppressed() -> TestResult {
+        let dir = tempdir()?;
+        let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let suppressed = bead_summary("grove-failed", BeadPriority::P0)?;
+        db.upsert_bead_cache(&suppressed)?;
+        db.set_grove_status(&suppressed.id, GroveBeadStatus::Failed)?;
+
+        let br = TestBrClient {
+            ready: vec![suppressed.clone()],
+            open: vec![suppressed],
+            fail_mirror: false,
+        };
+        let mut config = GroveConfig::default();
+        config.scheduler.max_parallel = 1;
+        config.scheduler.poll_interval_ms = 10;
+        let lease_config = LeaderLeaseConfig {
+            owner_label: "test-owner".to_owned(),
+            lease_ttl: chrono::Duration::seconds(1),
+        };
+        let now = chrono::Utc::now();
+        let _ = LeaderLeaseManager::acquire(&mut db, &lease_config, None, now)?;
+        let loop_config = DispatchLoopConfig {
+            max_total_runs: None,
+            max_poll_cycles: Some(10),
+            working_dir: Utf8PathBuf::from_path_buf(dir.path().join("workspace"))
+                .map_err(|_| std::io::Error::other("workspace dir must be valid UTF-8"))?,
+            shutdown_signal: ShutdownSignal::new(),
+            db_path,
+        };
+        std::fs::create_dir_all(loop_config.working_dir.join(".grove"))?;
+
+        let backend = CliClaudeBackend::new("/bin/true".to_owned());
+        let outcome =
+            run_dispatch_loop(&mut db, &backend, &br, &config, &lease_config, &loop_config)?;
+
+        assert_eq!(outcome.exit_reason, DispatchExitReason::QueueEmpty);
+        assert_eq!(outcome.dispatched_count, 0);
         Ok(())
     }
 

@@ -187,18 +187,24 @@ fn verification_mode_inferred_from_contract_and_workspace() -> TestResult {
     let mode = VerificationMode::infer(ExecutionContract::SingleTask, utf8_dir);
     assert_eq!(mode, VerificationMode::ProtocolComplete);
 
-    // With Cargo.toml
+    // SingleTask keeps verification protocol-only even inside buildable workspaces.
     std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
-    let mode_rust = VerificationMode::infer(ExecutionContract::SingleTask, utf8_dir);
-    assert_eq!(mode_rust, VerificationMode::RustCompileCheck);
+    let mode_single_task_rust = VerificationMode::infer(ExecutionContract::SingleTask, utf8_dir);
+    assert_eq!(mode_single_task_rust, VerificationMode::ProtocolComplete);
+
+    let mode_implement_rust = VerificationMode::infer(ExecutionContract::Implement, utf8_dir);
+    assert_eq!(mode_implement_rust, VerificationMode::RustCompileCheck);
 
     // Clean up
     std::fs::remove_file(dir.path().join("Cargo.toml")).unwrap();
 
     // With package.json
     std::fs::write(dir.path().join("package.json"), "{}").unwrap();
-    let mode_node = VerificationMode::infer(ExecutionContract::SingleTask, utf8_dir);
-    assert_eq!(mode_node, VerificationMode::NodeBuildCheck);
+    let mode_single_task_node = VerificationMode::infer(ExecutionContract::SingleTask, utf8_dir);
+    assert_eq!(mode_single_task_node, VerificationMode::ProtocolComplete);
+
+    let mode_implement_node = VerificationMode::infer(ExecutionContract::Implement, utf8_dir);
+    assert_eq!(mode_implement_node, VerificationMode::NodeBuildCheck);
 
     Ok(())
 }

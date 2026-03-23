@@ -23,10 +23,7 @@ impl VerificationMode {
     /// Select a verification mode based on the execution contract and project environment.
     pub fn infer(contract: ExecutionContract, workspace_dir: &camino::Utf8Path) -> Self {
         match contract {
-            ExecutionContract::Implement
-            | ExecutionContract::SingleTask
-            | ExecutionContract::RetryRescue
-            | ExecutionContract::Resume => {
+            ExecutionContract::Implement => {
                 if workspace_dir.join("Cargo.toml").exists() {
                     Self::RustCompileCheck
                 } else if workspace_dir.join("package.json").exists() {
@@ -35,6 +32,9 @@ impl VerificationMode {
                     Self::ProtocolComplete
                 }
             }
+            ExecutionContract::SingleTask
+            | ExecutionContract::RetryRescue
+            | ExecutionContract::Resume => Self::ProtocolComplete,
         }
     }
 }
