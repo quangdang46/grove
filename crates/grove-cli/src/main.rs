@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use clap::{ArgAction, Parser, Subcommand};
 use crossterm::{
     event::{self, Event as CEvent, KeyCode},
@@ -21,7 +21,7 @@ use grove_kernel::{
 };
 use grove_session::replay_transcript;
 use grove_types::{
-    AgentActivity, BeadId, BeadPriority, GroveBeadRecord, GroveBeadStatus,
+    AgentActivity, BeadId, BeadPriority, EventKind, GroveBeadRecord, GroveBeadStatus,
     LeaderLeaseRecord, ProtocolEvent, RunReport, RunStatus, TranscriptEvent,
 };
 use rusqlite::OptionalExtension;
@@ -48,7 +48,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Init,
+    Init {
+        #[arg(long, action = ArgAction::SetTrue)]
+        force: bool,
+    },
     Status,
     Inspect { bead_id: String },
     Log { bead_id: String },
@@ -63,7 +66,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Init) => run_json_command("init", cli.json, || handle_init(cli.json)),
+        Some(Command::Init { force }) => {
+            run_json_command("init", cli.json, || handle_init(cli.json, force))
+        }
         Some(Command::Status) => handle_status(cli.json),
         Some(Command::Inspect { bead_id }) => handle_inspect(&BeadId::new(bead_id), cli.json),
         Some(Command::Log { bead_id }) => handle_log(&BeadId::new(bead_id), cli.json),
@@ -113,9 +118,23 @@ fn format_error_chain(error: &anyhow::Error) -> Vec<String> {
     error.chain().map(|cause| cause.to_string()).collect()
 }
 
-fn handle_init(json_mode: bool) -> Result<()> {
+fn handle_init(json_mode: bool, force: bool) -> Result<()> {
     let workspace_root = current_workspace_root()?;
     let config_path = workspace_root.join("grove.toml");
+    let paths = resolve_init_paths(&workspace_root, &config_path)?;
+    let existing_artifacts = existing_init_artifacts(&paths);
+
+    if !existing_artifacts.is_empty() {
+        if !force {
+            bail!(
+                "Grove is already initialized in {}. Existing managed artifacts: {}. Re-run `grove init --force` to reset Grove-managed state.",
+                workspace_root,
+                existing_artifacts.join(", ")
+            );
+        }
+        reset_managed_init_state(&paths)?;
+    }
+
     let wrote_default_config = if config_path.exists() {
         false
     } else {
@@ -152,6 +171,7 @@ fn handle_init(json_mode: bool) -> Result<()> {
 
     if json_mode {
         let notes = [
+            force.then_some("Forced reset requested; Grove-managed runtime state was cleared before initialization."),
             (!br_capability.beads_dir_exists).then_some(
                 "No .beads directory detected yet; run `br init` before `grove status` or `grove run`.",
             ),
@@ -173,6 +193,7 @@ fn handle_init(json_mode: bool) -> Result<()> {
                 "transcript_dir": loaded.paths.transcript_dir().as_str(),
                 "checkpoints_dir": loaded.paths.checkpoints_dir().as_str(),
                 "wrote_default_config": wrote_default_config,
+                "forced_reset": force,
                 "synced_beads": synced_beads,
                 "tooling": {
                     "claude": render_tool_line(&tooling.claude.binary, tooling.claude.version.as_deref()),
@@ -190,6 +211,9 @@ fn handle_init(json_mode: bool) -> Result<()> {
         return Ok(());
     }
 
+    if force {
+        println!("Reset existing Grove-managed state before initialization.");
+    }
     println!("Initialized grove workspace.");
     println!("- database: {}", loaded.paths.db_path());
     println!("- config: {}", loaded.paths.config_path());
@@ -216,8 +240,11 @@ fn handle_init(json_mode: bool) -> Result<()> {
         render_tool_line("bv", bv_capability.version.as_deref())
     );
 
-    if !br_capability.beads_dir_exists || !bv_capability.beads_dir_exists {
+    if !br_capability.beads_dir_exists || !bv_capability.beads_dir_exists || force {
         println!("\nNotes:");
+        if force {
+            println!("- Forced reset requested; Grove-managed runtime state was cleared before initialization.");
+        }
         if !br_capability.beads_dir_exists {
             println!(
                 "- No .beads directory detected yet; run `br init` before `grove status` or `grove run`."
@@ -482,7 +509,7 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
                 println!("Total runs dispatched: {}", outcome.dispatched_count);
                 println!("Total poll cycles: {}", outcome.poll_cycles);
                 if outcome.exit_reason == DispatchExitReason::QueueEmpty {
-                    println!("No dispatchable work remained. Check `grove status` for suppressed or failed-awaiting-retry beads.");
+                    println!("No runnable beads remain right now. The project may still have unfinished work that is blocked locally; check `grove status` for active runs, checkpoints, retry backoff, failed-awaiting-manual-retry, reservation conflicts, or `dispatch:no` suppressions.");
                 }
                 print_run_startup_report(&loaded, &release_result);
             }
@@ -793,6 +820,7 @@ struct LiveAuditState {
     running: Vec<LiveSessionSummary>,
     selected: usize,
     tab: LiveTab,
+    live_scroll: u16,
     status_list_lines: Vec<String>,
     event_lines: Vec<String>,
     transcript_lines: Vec<String>,
@@ -807,6 +835,7 @@ impl LiveAuditState {
             running: Vec::new(),
             selected: 0,
             tab: LiveTab::Status,
+            live_scroll: 0,
             status_list_lines: vec!["Waiting for activity...".to_owned()],
             event_lines: vec!["Waiting for activity...".to_owned()],
             transcript_lines: vec!["Waiting for session output...".to_owned()],
@@ -872,6 +901,7 @@ impl LiveAuditState {
 
         if self.running.is_empty() {
             self.selected = 0;
+            self.live_scroll = 0;
             self.transcript_lines = vec![
                 "No running sessions.".to_owned(),
                 "Use Status to review ready and failed beads.".to_owned(),
@@ -882,15 +912,13 @@ impl LiveAuditState {
 
         if self.selected >= self.running.len() {
             self.selected = 0;
+            self.live_scroll = 0;
         }
 
         let selected = &self.running[self.selected];
-        self.transcript_lines = selected
-            .transcript_path
-            .as_deref()
-            .map(read_live_transcript_tail)
-            .transpose()?
-            .unwrap_or_else(|| vec!["Transcript not available yet.".to_owned()]);
+        self.transcript_lines = build_live_content_lines(&db, selected)?;
+        let max_scroll = self.transcript_lines.len().saturating_sub(1) as u16;
+        self.live_scroll = self.live_scroll.min(max_scroll);
         Ok(())
     }
 }
@@ -1007,25 +1035,25 @@ fn build_live_action_lines(db: &Database) -> Result<Vec<String>> {
     Ok(lines)
 }
 
-fn summarize_live_event(kind: &str, payload: &serde_json::Value) -> String {
+fn summarize_event_kind(kind: EventKind, payload: &serde_json::Value) -> String {
     match kind {
-        "LeaseAcquired" => "leader lease acquired".to_owned(),
-        "LeaseReleased" => "leader lease released".to_owned(),
-        "RunStarted" => "run started".to_owned(),
-        "RunSucceeded" => "run succeeded".to_owned(),
-        "RunFailed" => payload
+        EventKind::LeaseAcquired => "leader lease acquired".to_owned(),
+        EventKind::LeaseReleased => "leader lease released".to_owned(),
+        EventKind::RunStarted => "run started".to_owned(),
+        EventKind::RunSucceeded => "run succeeded".to_owned(),
+        EventKind::RunFailed => payload
             .get("failure_detail")
             .and_then(|v| v.as_str())
             .map(|s| format!("run failed: {s}"))
             .unwrap_or_else(|| "run failed".to_owned()),
-        "SessionStarted" => "session started".to_owned(),
-        "SessionSucceeded" => "session succeeded".to_owned(),
-        "SessionFailed" => payload
+        EventKind::SessionStarted => "session started".to_owned(),
+        EventKind::SessionSucceeded => "session succeeded".to_owned(),
+        EventKind::SessionFailed => payload
             .get("stop_reason")
             .and_then(|v| v.as_str())
             .map(|s| format!("session failed: {s}"))
             .unwrap_or_else(|| "session failed".to_owned()),
-        "ActivityStateChanged" => payload
+        EventKind::ActivityStateChanged => payload
             .get("activity")
             .and_then(|v| v.as_str())
             .map(|activity| {
@@ -1033,38 +1061,107 @@ fn summarize_live_event(kind: &str, payload: &serde_json::Value) -> String {
                 format!("activity → {activity} ({detail})")
             })
             .unwrap_or_else(|| "activity changed".to_owned()),
-        "RecoveryActionTaken" => payload
+        EventKind::RecoveryActionTaken => payload
             .get("action")
             .and_then(|v| v.as_str())
             .map(|s| format!("recovery: {s}"))
             .unwrap_or_else(|| "recovery action".to_owned()),
-        "CoordinatorStopped" => payload
+        EventKind::CoordinatorStopped => payload
             .get("stop_reason")
             .and_then(|v| v.as_str())
             .map(|s| format!("coordinator stopped: {s}"))
             .unwrap_or_else(|| "coordinator stopped".to_owned()),
-        "RecoveryCapsuleCreated" => payload
+        EventKind::RecoveryCapsuleCreated => payload
             .get("summary")
             .and_then(|v| v.as_str())
             .map(|s| format!("recovery capsule: {s}"))
             .unwrap_or_else(|| "recovery capsule created".to_owned()),
-        _ => kind
-            .to_string()
-            .replace("ActivityStateChanged", "activity changed")
-            .replace("SessionTerminationRequested", "session termination requested")
-            .replace("SessionTerminationForced", "session termination forced")
-            .replace("EscalationTierChanged", "escalation tier changed")
-            .replace("EscalationTierReset", "escalation tier reset")
-            .replace("RunStarted", "run started")
-            .replace("RunSucceeded", "run succeeded")
-            .replace("RunFailed", "run failed")
-            .replace("SessionStarted", "session started")
-            .replace("SessionSucceeded", "session succeeded")
-            .replace("SessionFailed", "session failed"),
+        EventKind::SessionTerminationRequested => "session termination requested".to_owned(),
+        EventKind::SessionTerminationForced => "session termination forced".to_owned(),
+        EventKind::EscalationTierChanged => "escalation tier changed".to_owned(),
+        EventKind::EscalationTierReset => "escalation tier reset".to_owned(),
+        EventKind::HandoffWritten => "handoff written".to_owned(),
+        EventKind::RunCheckpointed => "run checkpointed".to_owned(),
+        EventKind::SessionCheckpointed => "session checkpointed".to_owned(),
+        EventKind::ShutdownRequested => "shutdown requested".to_owned(),
+        EventKind::ReactionInvoked => "reaction invoked".to_owned(),
+        EventKind::ReservationGranted => "reservation granted".to_owned(),
+        EventKind::ReservationConflictDetected => "reservation conflict detected".to_owned(),
+        EventKind::ReservationExpired => "reservation expired".to_owned(),
+        EventKind::BrMirrorRequested => "br mirror requested".to_owned(),
+        EventKind::BrMirrorSucceeded => "br mirror succeeded".to_owned(),
+        EventKind::BrMirrorFailed => "br mirror failed".to_owned(),
+        EventKind::ArchiveIngested => "archive ingested".to_owned(),
+        EventKind::PlaybookBulletAdded => "playbook bullet added".to_owned(),
+        EventKind::PlaybookBulletPromoted => "playbook bullet promoted".to_owned(),
+        EventKind::PlaybookBulletDeprecated => "playbook bullet deprecated".to_owned(),
+        EventKind::BeadCacheSynced => "bead cache synced".to_owned(),
+        EventKind::DependencySnapshotSynced => "dependency snapshot synced".to_owned(),
+        EventKind::GroveStatusUpdated => "grove status updated".to_owned(),
+        EventKind::LeaseHeartbeat => "leader lease heartbeat".to_owned(),
     }
 }
 
-fn read_live_transcript_tail(path: &str) -> Result<Vec<String>> {
+fn summarize_live_event(kind: &str, payload: &serde_json::Value) -> String {
+    match kind {
+        "LeaseAcquired" => summarize_event_kind(EventKind::LeaseAcquired, payload),
+        "LeaseReleased" => summarize_event_kind(EventKind::LeaseReleased, payload),
+        "RunStarted" => summarize_event_kind(EventKind::RunStarted, payload),
+        "RunSucceeded" => summarize_event_kind(EventKind::RunSucceeded, payload),
+        "RunFailed" => summarize_event_kind(EventKind::RunFailed, payload),
+        "SessionStarted" => summarize_event_kind(EventKind::SessionStarted, payload),
+        "SessionSucceeded" => summarize_event_kind(EventKind::SessionSucceeded, payload),
+        "SessionFailed" => summarize_event_kind(EventKind::SessionFailed, payload),
+        "ActivityStateChanged" => summarize_event_kind(EventKind::ActivityStateChanged, payload),
+        "RecoveryActionTaken" => summarize_event_kind(EventKind::RecoveryActionTaken, payload),
+        "CoordinatorStopped" => summarize_event_kind(EventKind::CoordinatorStopped, payload),
+        "RecoveryCapsuleCreated" => summarize_event_kind(EventKind::RecoveryCapsuleCreated, payload),
+        "SessionTerminationRequested" => {
+            summarize_event_kind(EventKind::SessionTerminationRequested, payload)
+        }
+        "SessionTerminationForced" => summarize_event_kind(EventKind::SessionTerminationForced, payload),
+        "EscalationTierChanged" => summarize_event_kind(EventKind::EscalationTierChanged, payload),
+        "EscalationTierReset" => summarize_event_kind(EventKind::EscalationTierReset, payload),
+        "HandoffWritten" => summarize_event_kind(EventKind::HandoffWritten, payload),
+        _ => kind.to_ascii_lowercase().replace('_', " "),
+    }
+}
+
+fn build_live_content_lines(db: &Database, session: &LiveSessionSummary) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+
+    if let Some(path) = session.transcript_path.as_deref() {
+        lines.extend(read_live_transcript_lines(path)?);
+    } else {
+        lines.push("Transcript not available yet.".to_owned());
+    }
+
+    if let Some(run_id) = session.run_id.as_deref() {
+        let run_id = grove_types::RunId::new(run_id.to_owned());
+        let events = db.list_events_for_run(&run_id)?;
+        if !events.is_empty() {
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.push("---- Recent run events ----".to_owned());
+            for event in events.into_iter().rev().take(12).rev() {
+                lines.push(format!(
+                    "{} | {}",
+                    event.created_at,
+                    summarize_event_kind(event.kind, &event.payload)
+                ));
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push("No live content yet.".to_owned());
+    }
+
+    Ok(lines)
+}
+
+fn read_live_transcript_lines(path: &str) -> Result<Vec<String>> {
     let transcript_path = std::path::Path::new(path);
     if !transcript_path.exists() {
         return Ok(vec!["Transcript not available yet.".to_owned()]);
@@ -1108,8 +1205,7 @@ fn read_live_transcript_tail(path: &str) -> Result<Vec<String>> {
     if lines.is_empty() {
         lines.push("Transcript is empty.".to_owned());
     }
-    let start = lines.len().saturating_sub(40);
-    Ok(lines[start..].to_vec())
+    Ok(lines)
 }
 
 fn run_dispatch_loop_with_live_ui(
@@ -1194,14 +1290,46 @@ fn run_dispatch_loop_with_live_ui(
                         }
                         KeyCode::Right => state.tab = LiveTab::Live,
                         KeyCode::Left => state.tab = LiveTab::Status,
-                        KeyCode::Down => {
-                            if !state.running.is_empty() {
-                                state.selected = (state.selected + 1).min(state.running.len() - 1);
+                        KeyCode::Down => match state.tab {
+                            LiveTab::Status => {
+                                if !state.running.is_empty() {
+                                    state.selected = (state.selected + 1).min(state.running.len() - 1);
+                                    state.live_scroll = 0;
+                                }
+                            }
+                            LiveTab::Live => {
+                                state.live_scroll = state.live_scroll.saturating_add(1);
+                            }
+                        },
+                        KeyCode::Up => match state.tab {
+                            LiveTab::Status => {
+                                if state.selected > 0 {
+                                    state.selected -= 1;
+                                    state.live_scroll = 0;
+                                }
+                            }
+                            LiveTab::Live => {
+                                state.live_scroll = state.live_scroll.saturating_sub(1);
+                            }
+                        },
+                        KeyCode::PageDown => {
+                            if matches!(state.tab, LiveTab::Live) {
+                                state.live_scroll = state.live_scroll.saturating_add(10);
                             }
                         }
-                        KeyCode::Up => {
-                            if state.selected > 0 {
-                                state.selected -= 1;
+                        KeyCode::PageUp => {
+                            if matches!(state.tab, LiveTab::Live) {
+                                state.live_scroll = state.live_scroll.saturating_sub(10);
+                            }
+                        }
+                        KeyCode::Home => {
+                            if matches!(state.tab, LiveTab::Live) {
+                                state.live_scroll = 0;
+                            }
+                        }
+                        KeyCode::End => {
+                            if matches!(state.tab, LiveTab::Live) {
+                                state.live_scroll = u16::MAX;
                             }
                         }
                         _ => {}
@@ -1312,7 +1440,7 @@ fn draw_live_audit(frame: &mut Frame<'_>, state: &LiveAuditState) {
 fn draw_status_tab(frame: &mut Frame<'_>, area: Rect, state: &LiveAuditState) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(25), Constraint::Percentage(35)])
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
     let items = state
@@ -1327,17 +1455,12 @@ fn draw_status_tab(frame: &mut Frame<'_>, area: Rect, state: &LiveAuditState) {
         .block(Block::default().borders(Borders::ALL).title("Status"))
         .wrap(Wrap { trim: false });
     frame.render_widget(summary, chunks[1]);
-
-    let actions = Paragraph::new(state.action_lines.join("\n"))
-        .block(Block::default().borders(Borders::ALL).title("Recent Actions"))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(actions, chunks[2]);
 }
 
 fn draw_live_tab(frame: &mut Frame<'_>, area: Rect, state: &LiveAuditState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(10), Constraint::Min(8)])
+        .constraints([Constraint::Length(10), Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
     let details = state
@@ -1370,9 +1493,19 @@ fn draw_live_tab(frame: &mut Frame<'_>, area: Rect, state: &LiveAuditState) {
     frame.render_widget(details, chunks[0]);
 
     let transcript = Paragraph::new(state.transcript_lines.join("\n"))
-        .block(Block::default().borders(Borders::ALL).title("Live Content"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Live Content (↑/↓ scroll, PgUp/PgDn jump)"),
+        )
+        .scroll((state.live_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(transcript, chunks[1]);
+
+    let actions = Paragraph::new(state.action_lines.join("\n"))
+        .block(Block::default().borders(Borders::ALL).title("Recent Actions"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(actions, chunks[2]);
 }
 
 fn open_runtime() -> Result<(LoadedConfig, Database, CliBrClient)> {
@@ -1415,6 +1548,44 @@ fn current_workspace_root() -> Result<Utf8PathBuf> {
         .map_err(|path| anyhow::anyhow!("working directory is not valid UTF-8: {}", path.display()))
 }
 
+fn resolve_init_paths(workspace_root: &Utf8Path, config_path: &Utf8Path) -> Result<GrovePaths> {
+    if config_path.exists() {
+        return load_from_workspace(workspace_root)
+            .with_context(|| format!("load grove configuration from {config_path}"))
+            .map(|loaded| loaded.paths);
+    }
+
+    let config = grove_config::GroveConfig::default();
+    GrovePaths::from_config(&config, config_path).map_err(|error| anyhow!(error.to_string()))
+}
+
+fn existing_init_artifacts(paths: &GrovePaths) -> Vec<String> {
+    paths
+        .initialization_markers()
+        .into_iter()
+        .filter_map(|(label, path)| {
+            path.exists().then_some(format!("{label}={}", path.as_str()))
+        })
+        .collect()
+}
+
+fn reset_managed_init_state(paths: &GrovePaths) -> Result<()> {
+    for (_label, path) in paths.managed_reset_paths() {
+        let std_path = path.as_std_path();
+        if !std_path.exists() {
+            continue;
+        }
+        if std_path.is_dir() {
+            fs::remove_dir_all(std_path)
+                .with_context(|| format!("remove Grove-managed directory {}", path))?;
+        } else {
+            fs::remove_file(std_path)
+                .with_context(|| format!("remove Grove-managed file {}", path))?;
+        }
+    }
+    Ok(())
+}
+
 fn write_default_config(path: &Utf8PathBuf) -> Result<()> {
     let text = DEFAULT_INIT_GROVE_TOML.trim_end();
     fs::write(path, format!("{text}\n"))
@@ -1444,7 +1615,7 @@ mod tests {
             ),
         )?;
 
-        let lines = read_live_transcript_tail(path.to_str().unwrap())?;
+        let lines = read_live_transcript_lines(path.to_str().unwrap())?;
         assert_eq!(
             lines,
             vec![

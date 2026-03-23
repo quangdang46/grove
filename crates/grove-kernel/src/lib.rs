@@ -1153,7 +1153,6 @@ impl DispatchEligibility {
 #[derive(Debug, Clone)]
 pub enum LocalSuppressionReason {
     SuppressedByLabel { label: String },
-    NonExecutableIssueType { issue_type: String },
     ActiveRun { run_id: Option<RunId> },
     CheckpointPendingResume { run_id: Option<RunId> },
     RetryBackoffPending { retry_after: Option<Timestamp> },
@@ -1168,7 +1167,6 @@ impl LocalSuppressionReason {
     pub fn code(&self) -> &'static str {
         match self {
             Self::SuppressedByLabel { .. } => "suppressed_by_label",
-            Self::NonExecutableIssueType { .. } => "non_executable_issue_type",
             Self::ActiveRun { .. } => "active_run",
             Self::CheckpointPendingResume { .. } => "checkpoint_pending_resume",
             Self::RetryBackoffPending { .. } => "retry_backoff_pending",
@@ -1204,14 +1202,6 @@ pub fn dispatch_suppression_label(labels: &[String]) -> Option<String> {
 }
 
 #[must_use]
-pub fn is_non_executable_issue_type(issue_type: &str) -> bool {
-    matches!(
-        issue_type.trim().to_ascii_lowercase().as_str(),
-        "epic" | "tracking"
-    )
-}
-
-#[must_use]
 pub fn circuit_state_for_bead(bead: &GroveBeadRecord) -> CircuitState {
     bead.circuit_breaker_state
         .as_ref()
@@ -1227,12 +1217,6 @@ fn collect_local_suppressions(
 
     if let Some(label) = dispatch_suppression_label(&bead.bead.labels) {
         reasons.push(LocalSuppressionReason::SuppressedByLabel { label });
-    }
-
-    if is_non_executable_issue_type(&bead.bead.issue_type) {
-        reasons.push(LocalSuppressionReason::NonExecutableIssueType {
-            issue_type: bead.bead.issue_type.clone(),
-        });
     }
 
     match bead.grove_status {
@@ -1315,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn label_and_issue_type_can_both_suppress_dispatch() -> TestResult {
+    fn dispatch_label_suppresses_epics_and_tasks_the_same_way() -> TestResult {
         let bead = sample_bead(GroveBeadStatus::Ready, "epic", &["dispatch:no"], None, None)?;
         let context = sample_context(true, CircuitState::Closed, Vec::new())?;
 
@@ -1324,7 +1308,7 @@ mod tests {
 
         assert!(!eligibility.dispatchable_in_grove);
         assert!(reason_codes.contains(&"suppressed_by_label"));
-        assert!(reason_codes.contains(&"non_executable_issue_type"));
+        assert_eq!(reason_codes.len(), 1);
         Ok(())
     }
 

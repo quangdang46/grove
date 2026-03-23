@@ -102,6 +102,35 @@ impl GrovePaths {
             ("tmp_dir", self.tmp_dir()),
         ]
     }
+
+    #[must_use]
+    pub fn managed_reset_paths(&self) -> Vec<(&'static str, Utf8PathBuf)> {
+        let mut paths = vec![
+            ("memory.db_path", self.db_path.clone()),
+            ("memory.db_path_wal", Utf8PathBuf::from(format!("{}-wal", self.db_path))),
+            ("memory.db_path_shm", Utf8PathBuf::from(format!("{}-shm", self.db_path))),
+            (
+                "memory.db_path_journal",
+                Utf8PathBuf::from(format!("{}-journal", self.db_path)),
+            ),
+            ("memory.transcript_dir", self.transcript_dir.clone()),
+            ("prompts_dir", self.prompts_dir()),
+            ("checkpoints_dir", self.checkpoints_dir()),
+            ("artifacts_dir", self.artifacts_dir()),
+            ("logs_dir", self.logs_dir()),
+            ("tmp_dir", self.tmp_dir()),
+        ];
+        paths.sort_by(|a, b| b.1.as_str().len().cmp(&a.1.as_str().len()));
+        paths.dedup_by(|a, b| a.1 == b.1);
+        paths
+    }
+
+    #[must_use]
+    pub fn initialization_markers(&self) -> Vec<(&'static str, Utf8PathBuf)> {
+        let mut markers = vec![("grove_dir", self.grove_dir.clone())];
+        markers.extend(self.managed_reset_paths());
+        markers
+    }
 }
 
 fn resolve_against(base: &Utf8Path, value: &str) -> Utf8PathBuf {

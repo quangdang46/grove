@@ -240,15 +240,6 @@ impl SuppressionReasonView {
                 issue_type: None,
                 conflict: None,
             },
-            LocalSuppressionReason::NonExecutableIssueType { issue_type } => Self {
-                code: reason.code(),
-                summary: format!("non-executable issue type {issue_type}"),
-                run_id: None,
-                retry_after: None,
-                label: None,
-                issue_type: Some(issue_type.clone()),
-                conflict: None,
-            },
             LocalSuppressionReason::ActiveRun { run_id } => Self {
                 code: reason.code(),
                 summary: "active run already owns this bead".to_owned(),

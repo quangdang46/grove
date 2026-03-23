@@ -8,7 +8,7 @@
 // These tests cover:
 // 1. Init-time dependency validation and DB creation
 // 2. Bead cache sync correctness
-// 3. Executable-bead suppression (epic/tracking issues, dispatch:no label)
+// 3. Dispatch eligibility and Grove-local suppression
 // 4. Status/inspect correctness against authoritative br state
 // 5. BV augments information rather than replacing br as source of truth
 
@@ -368,39 +368,29 @@ fn sync_bead_cache_counts_removed_non_running_beads() -> TestResult {
 // ============================================================================
 
 #[test]
-fn epic_issue_type_is_not_dispatchable() -> TestResult {
+fn epic_issue_type_is_dispatchable_when_ready() -> TestResult {
     let bead = sample_bead_record(GroveBeadStatus::Ready, "epic", &[]);
 
     let context = sample_context(true, CircuitState::Closed, vec![]);
     let eligibility = evaluate_dispatch_eligibility(&bead, &context);
 
     assert!(eligibility.ready_in_br);
-    assert!(!eligibility.dispatchable_in_grove);
-    assert!(
-        eligibility
-            .local_suppression_reasons
-            .iter()
-            .any(|r| matches!(r, LocalSuppressionReason::NonExecutableIssueType { .. }))
-    );
+    assert!(eligibility.dispatchable_in_grove);
+    assert!(eligibility.local_suppression_reasons.is_empty());
 
     Ok(())
 }
 
 #[test]
-fn tracking_issue_type_is_not_dispatchable() -> TestResult {
+fn tracking_issue_type_is_dispatchable_when_ready() -> TestResult {
     let bead = sample_bead_record(GroveBeadStatus::Ready, "tracking", &[]);
 
     let context = sample_context(true, CircuitState::Closed, vec![]);
     let eligibility = evaluate_dispatch_eligibility(&bead, &context);
 
     assert!(eligibility.ready_in_br);
-    assert!(!eligibility.dispatchable_in_grove);
-    assert!(
-        eligibility
-            .local_suppression_reasons
-            .iter()
-            .any(|r| matches!(r, LocalSuppressionReason::NonExecutableIssueType { .. }))
-    );
+    assert!(eligibility.dispatchable_in_grove);
+    assert!(eligibility.local_suppression_reasons.is_empty());
 
     Ok(())
 }
@@ -753,11 +743,11 @@ fn dependency_snapshot_accepts_valid_edges() -> TestResult {
 #[test]
 fn init_tolerates_missing_beads_and_prints_guidance() -> TestResult {
     let harness = CliHarness::new()?;
-    let output = harness.run(["init"])?;
+    let output = harness.run(["init", "--force"])?;
 
     assert!(
         output.status.success(),
-        "init should succeed without .beads: {}",
+        "init --force should succeed without .beads: {}",
         output_text(&output)
     );
     let stdout = String::from_utf8(output.stdout)?;
@@ -771,13 +761,88 @@ fn init_tolerates_missing_beads_and_prints_guidance() -> TestResult {
 }
 
 #[test]
+fn init_refuses_when_workspace_is_already_initialized() -> TestResult {
+    let harness = CliHarness::new()?;
+    fs::create_dir_all(harness.workspace_root.join(".grove/logs"))?;
+
+    let output = harness.run(["init"])?;
+    assert!(!output.status.success(), "second init should fail");
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("Grove is already initialized"));
+    assert!(stderr.contains("grove init --force"));
+    Ok(())
+}
+
+#[test]
+fn init_json_reports_initialized_workspace_as_machine_readable_failure() -> TestResult {
+    let harness = CliHarness::new()?;
+    fs::create_dir_all(harness.workspace_root.join(".grove/logs"))?;
+
+    let output = harness.run(["--json", "init"])?;
+    assert!(output.status.success(), "json failure payload should still exit successfully");
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let payload: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["command"], "init");
+    let errors = payload["error"].as_array().expect("error array");
+    assert!(errors.iter().any(|v| v.as_str().is_some_and(|s| s.contains("already initialized"))));
+    Ok(())
+}
+
+#[test]
+fn init_force_resets_runtime_state_but_preserves_config() -> TestResult {
+    let harness = CliHarness::new()?;
+    harness.enable_beads()?;
+    harness.seed_runtime_bead(GroveBeadStatus::Running)?;
+    fs::create_dir_all(harness.workspace_root.join(".grove/logs"))?;
+    fs::create_dir_all(harness.workspace_root.join(".grove/prompts"))?;
+    fs::write(harness.workspace_root.join(".grove/logs/runtime.jsonl"), "old-log\n")?;
+    fs::write(harness.workspace_root.join(".grove/prompts/keep-me.txt"), "stale prompt")?;
+    fs::write(harness.workspace_root.join("unrelated.txt"), "keep this")?;
+    let original_config = fs::read_to_string(harness.workspace_root.join("grove.toml"))?;
+
+    let output = harness.run(["init", "--force"])?;
+    assert!(output.status.success(), "init --force should succeed: {}", output_text(&output));
+
+    let db = Database::open(&harness.workspace_root.join(".grove/grove.db"))?;
+    let bead_count: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM bead_cache", [], |row| row.get(0))?;
+    assert_eq!(bead_count, 1, "bead cache should be re-synced after force init");
+
+    let run_count: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM task_runs", [], |row| row.get(0))?;
+    assert_eq!(run_count, 0, "runtime task runs should be cleared by force init");
+
+    assert_eq!(
+        fs::read_to_string(harness.workspace_root.join("grove.toml"))?,
+        original_config,
+        "force init should preserve grove.toml"
+    );
+    assert_eq!(
+        fs::read_to_string(harness.workspace_root.join("unrelated.txt"))?,
+        "keep this",
+        "force init should not touch unrelated files"
+    );
+    assert!(
+        !harness.workspace_root.join(".grove/prompts/keep-me.txt").exists(),
+        "force init should clear Grove-managed prompt artifacts"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn init_json_emits_machine_readable_output() -> TestResult {
     let harness = CliHarness::new()?;
-    let output = harness.run(["--json", "init"])?;
+    let output = harness.run(["--json", "init", "--force"])?;
 
     assert!(
         output.status.success(),
-        "init --json should succeed: {}",
+        "init --json --force should succeed: {}",
         output_text(&output)
     );
     let stdout = String::from_utf8(output.stdout)?;
@@ -789,6 +854,7 @@ fn init_json_emits_machine_readable_output() -> TestResult {
     assert!(payload["tooling"].is_object());
     assert!(payload["notes"].is_array());
     assert!(payload["next_steps"].is_array());
+    assert_eq!(payload["forced_reset"], true);
 
     Ok(())
 }
