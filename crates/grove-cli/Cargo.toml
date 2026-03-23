@@ -26,6 +26,7 @@ grove-kernel = { path = "../grove-kernel" }
 grove-session = { path = "../grove-session" }
 grove-types = { path = "../grove-types" }
 ratatui = "0.29"
+rusqlite.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

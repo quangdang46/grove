@@ -21,9 +21,10 @@ use grove_kernel::{
 };
 use grove_session::replay_transcript;
 use grove_types::{
-    BeadId, BeadPriority, GroveBeadRecord, GroveBeadStatus, LeaderLeaseRecord, ProtocolEvent,
-    RunReport, TranscriptEvent,
+    AgentActivity, BeadId, BeadPriority, GroveBeadRecord, GroveBeadStatus,
+    LeaderLeaseRecord, ProtocolEvent, RunReport, RunStatus, TranscriptEvent,
 };
+use rusqlite::OptionalExtension;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -780,6 +781,9 @@ struct LiveSessionSummary {
     session_id: Option<String>,
     transcript_path: Option<String>,
     started_at: Option<String>,
+    run_status: Option<RunStatus>,
+    activity: Option<AgentActivity>,
+    failure_detail: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -792,6 +796,7 @@ struct LiveAuditState {
     status_list_lines: Vec<String>,
     event_lines: Vec<String>,
     transcript_lines: Vec<String>,
+    action_lines: Vec<String>,
 }
 
 impl LiveAuditState {
@@ -805,6 +810,7 @@ impl LiveAuditState {
             status_list_lines: vec!["Waiting for activity...".to_owned()],
             event_lines: vec!["Waiting for activity...".to_owned()],
             transcript_lines: vec!["Waiting for session output...".to_owned()],
+            action_lines: vec!["Waiting for runtime actions...".to_owned()],
         }
     }
 
@@ -845,6 +851,12 @@ impl LiveAuditState {
                     session_id: latest_session.as_ref().map(|session| session.id.to_string()),
                     transcript_path: latest_session.as_ref().map(|session| session.transcript_path.clone()),
                     started_at: latest_session.as_ref().map(|session| session.started_at.to_rfc3339()),
+                    run_status: bead.last_run_id.as_ref().and_then(|run_id| db.generate_run_report(run_id).ok().flatten().map(|report| report.status)),
+                    activity: bead
+                        .last_run_id
+                        .as_ref()
+                        .and_then(|run_id| run_activity(&db, run_id.as_str()).ok().flatten()),
+                    failure_detail: bead.last_failure_detail.clone(),
                 }
             })
             .collect();
@@ -856,12 +868,14 @@ impl LiveAuditState {
             format!("Checkpointed: {checkpointed_count}"),
             format!("Failed: {}", failed.len()),
         ];
+        self.action_lines = build_live_action_lines(&db)?;
 
         if self.running.is_empty() {
             self.selected = 0;
             self.transcript_lines = vec![
                 "No running sessions.".to_owned(),
                 "Use Status to review ready and failed beads.".to_owned(),
+                "Press q to hide/show the live UI.".to_owned(),
             ];
             return Ok(());
         }
@@ -940,6 +954,114 @@ fn minimal_status_list_lines(beads: &[GroveBeadRecord], failed: &[&GroveBeadReco
     }
 
     lines
+}
+
+fn run_activity(db: &Database, run_id: &str) -> Result<Option<AgentActivity>> {
+    db.connection()
+        .query_row(
+            "SELECT activity FROM task_runs WHERE id = ?1",
+            [run_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .context("query run activity")?
+        .flatten()
+        .map(|activity: String| match activity.to_ascii_lowercase().as_str() {
+            "active" => Ok(AgentActivity::Active),
+            "ready" => Ok(AgentActivity::Ready),
+            "idle" => Ok(AgentActivity::Idle),
+            "blocked" => Ok(AgentActivity::Blocked),
+            "exited" => Ok(AgentActivity::Exited),
+            other => bail!("unknown activity value {other}"),
+        })
+        .transpose()
+}
+
+fn build_live_action_lines(db: &Database) -> Result<Vec<String>> {
+    let mut stmt = db.connection().prepare(
+        "SELECT kind, bead_id, run_id, payload_json, created_at FROM event_log WHERE kind NOT IN ('LeaseHeartbeat') ORDER BY id DESC LIMIT 12",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+
+    let mut lines = Vec::new();
+    for row in rows {
+        let (kind, bead_id, run_id, payload_json, created_at) = row?;
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload_json).unwrap_or(serde_json::Value::Null);
+        let bead = bead_id.unwrap_or_else(|| "-".to_owned());
+        let run = run_id.unwrap_or_else(|| "-".to_owned());
+        let summary = summarize_live_event(&kind, &payload);
+        lines.push(format!("{created_at} | {bead} | {run} | {summary}"));
+    }
+    if lines.is_empty() {
+        lines.push("No runtime actions yet.".to_owned());
+    }
+    Ok(lines)
+}
+
+fn summarize_live_event(kind: &str, payload: &serde_json::Value) -> String {
+    match kind {
+        "LeaseAcquired" => "leader lease acquired".to_owned(),
+        "LeaseReleased" => "leader lease released".to_owned(),
+        "RunStarted" => "run started".to_owned(),
+        "RunSucceeded" => "run succeeded".to_owned(),
+        "RunFailed" => payload
+            .get("failure_detail")
+            .and_then(|v| v.as_str())
+            .map(|s| format!("run failed: {s}"))
+            .unwrap_or_else(|| "run failed".to_owned()),
+        "SessionStarted" => "session started".to_owned(),
+        "SessionSucceeded" => "session succeeded".to_owned(),
+        "SessionFailed" => payload
+            .get("stop_reason")
+            .and_then(|v| v.as_str())
+            .map(|s| format!("session failed: {s}"))
+            .unwrap_or_else(|| "session failed".to_owned()),
+        "ActivityStateChanged" => payload
+            .get("activity")
+            .and_then(|v| v.as_str())
+            .map(|activity| {
+                let detail = payload.get("detail").and_then(|v| v.as_str()).unwrap_or("-");
+                format!("activity → {activity} ({detail})")
+            })
+            .unwrap_or_else(|| "activity changed".to_owned()),
+        "RecoveryActionTaken" => payload
+            .get("action")
+            .and_then(|v| v.as_str())
+            .map(|s| format!("recovery: {s}"))
+            .unwrap_or_else(|| "recovery action".to_owned()),
+        "CoordinatorStopped" => payload
+            .get("stop_reason")
+            .and_then(|v| v.as_str())
+            .map(|s| format!("coordinator stopped: {s}"))
+            .unwrap_or_else(|| "coordinator stopped".to_owned()),
+        "RecoveryCapsuleCreated" => payload
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(|s| format!("recovery capsule: {s}"))
+            .unwrap_or_else(|| "recovery capsule created".to_owned()),
+        _ => kind
+            .to_string()
+            .replace("ActivityStateChanged", "activity changed")
+            .replace("SessionTerminationRequested", "session termination requested")
+            .replace("SessionTerminationForced", "session termination forced")
+            .replace("EscalationTierChanged", "escalation tier changed")
+            .replace("EscalationTierReset", "escalation tier reset")
+            .replace("RunStarted", "run started")
+            .replace("RunSucceeded", "run succeeded")
+            .replace("RunFailed", "run failed")
+            .replace("SessionStarted", "session started")
+            .replace("SessionSucceeded", "session succeeded")
+            .replace("SessionFailed", "session failed"),
+    }
 }
 
 fn read_live_transcript_tail(path: &str) -> Result<Vec<String>> {
@@ -1037,43 +1159,50 @@ fn run_dispatch_loop_with_live_ui(
         if !live_hidden {
             state.refresh(loaded, br)?;
             terminal.draw(|frame| draw_live_audit(frame, &state))?;
-            if event::poll(Duration::from_millis(150))?
-                && let CEvent::Key(key) = event::read()?
-            {
-                match key.code {
-                    KeyCode::Char('q') => {
+        }
+
+        if event::poll(Duration::from_millis(150))?
+            && let CEvent::Key(key) = event::read()?
+        {
+            match key.code {
+                KeyCode::Char('q') => {
+                    if live_hidden {
+                        terminal = enter_live_terminal()?;
+                        live_hidden = false;
+                    } else {
                         leave_live_terminal(&mut terminal)?;
                         if let Some(result) = completed.take() {
                             return Ok(result);
                         }
                         live_hidden = true;
                     }
-                    KeyCode::Tab => {
-                        state.tab = match state.tab {
-                            LiveTab::Status => LiveTab::Live,
-                            LiveTab::Live => LiveTab::Status,
-                        };
-                    }
-                    KeyCode::Right => state.tab = LiveTab::Live,
-                    KeyCode::Left => state.tab = LiveTab::Status,
-                    KeyCode::Down => {
-                        if !state.running.is_empty() {
-                            state.selected = (state.selected + 1).min(state.running.len() - 1);
-                        }
-                    }
-                    KeyCode::Up => {
-                        if state.selected > 0 {
-                            state.selected -= 1;
-                        }
-                    }
-                    _ => {}
                 }
+                KeyCode::Tab if !live_hidden => {
+                    state.tab = match state.tab {
+                        LiveTab::Status => LiveTab::Live,
+                        LiveTab::Live => LiveTab::Status,
+                    };
+                }
+                KeyCode::Right if !live_hidden => state.tab = LiveTab::Live,
+                KeyCode::Left if !live_hidden => state.tab = LiveTab::Status,
+                KeyCode::Down if !live_hidden => {
+                    if !state.running.is_empty() {
+                        state.selected = (state.selected + 1).min(state.running.len() - 1);
+                    }
+                }
+                KeyCode::Up if !live_hidden => {
+                    if state.selected > 0 {
+                        state.selected -= 1;
+                    }
+                }
+                _ => {}
             }
-        } else {
+        }
+
+        if live_hidden {
             if let Some(result) = completed.take() {
                 return Ok(result);
             }
-            thread::sleep(Duration::from_millis(150));
         }
     }
 }
@@ -1127,7 +1256,7 @@ fn draw_live_audit(frame: &mut Frame<'_>, state: &LiveAuditState) {
 fn draw_status_tab(frame: &mut Frame<'_>, area: Rect, state: &LiveAuditState) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(25), Constraint::Percentage(35)])
         .split(area);
 
     let items = state
@@ -1142,25 +1271,36 @@ fn draw_status_tab(frame: &mut Frame<'_>, area: Rect, state: &LiveAuditState) {
         .block(Block::default().borders(Borders::ALL).title("Status"))
         .wrap(Wrap { trim: false });
     frame.render_widget(summary, chunks[1]);
+
+    let actions = Paragraph::new(state.action_lines.join("\n"))
+        .block(Block::default().borders(Borders::ALL).title("Recent Actions"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(actions, chunks[2]);
 }
 
 fn draw_live_tab(frame: &mut Frame<'_>, area: Rect, state: &LiveAuditState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(8)])
+        .constraints([Constraint::Length(10), Constraint::Min(8)])
         .split(area);
 
     let details = state
         .running
         .get(state.selected)
         .map(|session| {
-            vec![
+            let mut lines = vec![
                 Line::from(format!("bead: {}", session.bead_id)),
                 Line::from(format!("title: {}", session.title)),
                 Line::from(format!("run: {}", session.run_id.as_deref().unwrap_or("-"))),
                 Line::from(format!("session: {}", session.session_id.as_deref().unwrap_or("-"))),
                 Line::from(format!("started: {}", session.started_at.as_deref().unwrap_or("-"))),
-            ]
+                Line::from(format!("run status: {}", display_option(session.run_status.map(|status| format!("{status:?}"))))),
+                Line::from(format!("activity: {}", display_option(session.activity.map(|activity| format!("{activity:?}"))))),
+            ];
+            if let Some(detail) = session.failure_detail.as_deref() {
+                lines.push(Line::from(format!("detail: {detail}")));
+            }
+            lines
         })
         .unwrap_or_else(|| {
             vec![
