@@ -588,6 +588,7 @@ fn build_session_request(
         shutdown: SessionShutdownConfig::default(),
         escalation_tier,
         mutation_strategy: escalation_tier.default_mutation(),
+        idle_grace_period: Duration::from_secs(300),
     }
 }
 

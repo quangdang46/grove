@@ -72,6 +72,7 @@ fn sample_request(workspace_dir: Utf8PathBuf) -> SingleTaskSessionRequest {
         shutdown: SessionShutdownConfig::default(),
         escalation_tier: EscalationTier::FirstAttempt,
         mutation_strategy: None,
+        idle_grace_period: Duration::from_secs(300),
     }
 }
 

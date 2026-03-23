@@ -1776,6 +1776,7 @@ exit "${EXIT_CODE:-0}"
             shutdown: grove_session::SessionShutdownConfig::default(),
             escalation_tier: grove_types::EscalationTier::FirstAttempt,
             mutation_strategy: None,
+            idle_grace_period: std::time::Duration::from_secs(300),
         }
     }
 

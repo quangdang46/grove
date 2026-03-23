@@ -73,6 +73,7 @@ pub struct SingleTaskSessionRequest {
     pub shutdown: SessionShutdownConfig,
     pub escalation_tier: EscalationTier,
     pub mutation_strategy: Option<MutationStrategy>,
+    pub idle_grace_period: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +295,7 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
     let mut stdout_lines = Vec::new();
     let mut stderr_lines = Vec::new();
     let mut last_activity = AgentActivity::Active;
+    let mut last_stream_activity_at = Instant::now();
 
     let result = (|| {
         let mut running = backend.start(StartSessionRequest {
@@ -321,6 +323,7 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
                 Ok(StreamMessage::Line(StreamSource::Stdout, line)) => {
                     let line = line.map_err(SingleTaskSessionRunnerError::ReadStdout)?;
                     let ts = Utc::now();
+                    last_stream_activity_at = Instant::now();
                     transcript.append_stdout_line(line.clone(), ts)?;
                     match parser.parse_stdout_line(&line) {
                         ParserLineKind::Protocol(event) => {
@@ -352,6 +355,7 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
                 Ok(StreamMessage::Line(StreamSource::Stderr, line)) => {
                     let line = line.map_err(SingleTaskSessionRunnerError::ReadStderr)?;
                     let ts = Utc::now();
+                    last_stream_activity_at = Instant::now();
                     transcript.append_stderr_line(line.clone(), ts)?;
                     if let ParserLineKind::PlainStderr(text) = parser.parse_stderr_line(&line) {
                         let next_activity =
@@ -373,7 +377,9 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
                 Ok(StreamMessage::Closed(StreamSource::Stderr)) => stderr_closed = true,
                 Err(RecvTimeoutError::Timeout) => {
                     let ts = Utc::now();
-                    if last_activity != AgentActivity::Idle {
+                    if last_activity != AgentActivity::Idle
+                        && last_stream_activity_at.elapsed() >= request.idle_grace_period
+                    {
                         hooks
                             .on_activity_changed(AgentActivity::Idle, Some("stream_timeout"), ts)
                             .map_err(SingleTaskSessionRunnerError::LifecycleHook)?;
@@ -784,6 +790,7 @@ exit "${EXIT_CODE:-0}"
             shutdown: SessionShutdownConfig::default(),
             escalation_tier: EscalationTier::FirstAttempt,
             mutation_strategy: None,
+            idle_grace_period: Duration::from_secs(300),
         }
     }
 

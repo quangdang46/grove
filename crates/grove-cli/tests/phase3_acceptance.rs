@@ -80,6 +80,7 @@ fn sample_request(workspace_dir: Utf8PathBuf) -> SingleTaskSessionRequest {
         shutdown: SessionShutdownConfig::default(),
         escalation_tier: EscalationTier::FirstAttempt,
         mutation_strategy: None,
+        idle_grace_period: Duration::from_secs(300),
     }
 }
 
@@ -212,6 +213,7 @@ fn live_session_hooks_expose_idle_blocked_and_ready_activity_transitions() -> Te
     let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
 
     let mut request = sample_request(workspace_dir);
+    request.idle_grace_period = Duration::from_millis(20);
     request.env = vec![
         ("PRE_OUTPUT_SLEEP_SECS".to_owned(), "0.05".to_owned()),
         (
@@ -267,6 +269,41 @@ fn live_session_hooks_expose_idle_blocked_and_ready_activity_transitions() -> Te
 }
 
 #[test]
+fn slow_starting_session_does_not_flip_idle_before_first_output() -> TestResult {
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    fs::create_dir_all(&workspace_dir)?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+
+    let script_path = dir.path().join("fake-claude");
+    write_fake_claude_script(&script_path)?;
+    let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+    let mut request = sample_request(workspace_dir);
+    request.env = vec![
+        ("PRE_OUTPUT_SLEEP_SECS".to_owned(), "0.05".to_owned()),
+        (
+            "STDOUT_SCRIPT".to_owned(),
+            "working through the task\nGROVE_EXIT: true\nall tasks complete\nimplementation complete\n"
+                .to_owned(),
+        ),
+        ("STDERR_SCRIPT".to_owned(), String::new()),
+        ("EXIT_CODE".to_owned(), "0".to_owned()),
+    ];
+
+    let mut hooks = ActivityRecordingHooks::default();
+    let _result = execute_single_task_session_with_hooks(&backend, request, &mut hooks)?;
+
+    let changes = hooks.changes.lock().expect("lock activity changes");
+    assert!(
+        !changes.iter().any(|(activity, _, _)| *activity == AgentActivity::Idle),
+        "default idle grace period should not mark a session idle before its first delayed output"
+    );
+    Ok(())
+}
+
+#[test]
 fn persisted_session_records_live_idle_transition_in_run_state_and_event_log() -> TestResult {
     let dir = tempdir()?;
     let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
@@ -300,6 +337,7 @@ fn persisted_session_records_live_idle_transition_in_run_state_and_event_log() -
     let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
 
     let mut request = sample_request(workspace_dir.clone());
+    request.idle_grace_period = Duration::from_millis(20);
     request.env = vec![
         ("PRE_OUTPUT_SLEEP_SECS".to_owned(), "0.05".to_owned()),
         (
