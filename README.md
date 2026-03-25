@@ -268,7 +268,7 @@ GROVE_EXIT: false
 
 ## Config
 
-Besides `grove.toml`, Grove also uses a user-owned startup prompt file at `.grove/startup_prompt.md`. That file is created by `grove init`, can be edited freely, and is injected into every new Claude session before task-specific context. It is separate from `.grove/prompts/`, which stores Grove-generated rendered prompt manifests for dispatched sessions.
+Besides `grove.toml`, Grove also uses a user-owned startup prompt file. By default it lives at `.grove/startup_prompt.md`, but you can override that path with `runtime.startup_prompt_path` in `grove.toml`. The file is created by `grove init`, can be edited freely, and is injected into every new Claude session before task-specific context. It is separate from `.grove/prompts/`, which stores Grove-generated rendered prompt manifests for dispatched sessions.
 
 ```toml
 # grove.toml
@@ -278,6 +278,7 @@ claude_bin = "claude"
 default_model = "default"   # omit --model; use a concrete name (e.g. "sonnet") to force --model
 workspace_root = "."
 timeout_minutes = 60
+startup_prompt_path = ".grove/startup_prompt.md"  # override to use a different startup prompt file
 env_passthrough = []         # optional env vars forwarded to Claude sessions
 
 [scheduler]
@@ -333,7 +334,7 @@ level = "info"
 persist_jsonl = true
 ```
 
-`grove init` writes a smaller default `grove.toml`; omitted keys keep their built-in defaults. The full schema above reflects the current config model.
+`grove init` writes a smaller default `grove.toml`; omitted keys keep their built-in defaults. The full schema above reflects the current config model. If you want Grove to load a different startup prompt file, set `runtime.startup_prompt_path` to another relative or absolute path.
 
 ---
 
