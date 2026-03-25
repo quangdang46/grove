@@ -16,6 +16,8 @@ default_model = "default"
 workspace_root = "."
 # Kill the session if it runs longer than this many minutes.
 timeout_minutes = 60
+# Workspace-local Markdown prepended to every Grove session prompt.
+startup_prompt_path = ".grove/startup_prompt.md"
 
 [scheduler]
 # Maximum concurrent Claude sessions (still subject to reservation safety).

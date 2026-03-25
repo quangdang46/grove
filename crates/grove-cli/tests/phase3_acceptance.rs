@@ -56,6 +56,7 @@ fn sample_request(workspace_dir: Utf8PathBuf) -> SingleTaskSessionRequest {
         prompt_id: PromptId::new("prompt-activity-proof"),
         task_title: "Prove live activity transitions".to_owned(),
         task_description: "Acceptance proof for observable activity transitions.".to_owned(),
+        startup_prompt: None,
         contract: ExecutionContract::SingleTask,
         model: "sonnet".to_owned(),
         working_dir: workspace_dir,

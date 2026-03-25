@@ -796,6 +796,10 @@ fn init_force_resets_runtime_state_but_preserves_config() -> TestResult {
     fs::create_dir_all(harness.workspace_root.join(".grove/prompts"))?;
     fs::write(harness.workspace_root.join(".grove/logs/runtime.jsonl"), "old-log\n")?;
     fs::write(harness.workspace_root.join(".grove/prompts/keep-me.txt"), "stale prompt")?;
+    fs::write(
+        harness.workspace_root.join(".grove/startup_prompt.md"),
+        "custom startup instructions\n",
+    )?;
     fs::write(harness.workspace_root.join("unrelated.txt"), "keep this")?;
     let original_config = fs::read_to_string(harness.workspace_root.join("grove.toml"))?;
 
@@ -823,6 +827,11 @@ fn init_force_resets_runtime_state_but_preserves_config() -> TestResult {
         "keep this",
         "force init should not touch unrelated files"
     );
+    assert_eq!(
+        fs::read_to_string(harness.workspace_root.join(".grove/startup_prompt.md"))?,
+        "custom startup instructions\n",
+        "force init should preserve the user-owned startup prompt file"
+    );
     assert!(
         !harness.workspace_root.join(".grove/prompts/keep-me.txt").exists(),
         "force init should clear Grove-managed prompt artifacts"
@@ -847,6 +856,7 @@ fn init_json_emits_machine_readable_output() -> TestResult {
     assert!(payload["workspace_root"].as_str().is_some());
     assert!(payload["db_path"].as_str().is_some());
     assert!(payload["config_path"].as_str().is_some());
+    assert!(payload["startup_prompt_path"].as_str().is_some());
     assert!(payload["tooling"].is_object());
     assert!(payload["notes"].is_array());
     assert!(payload["next_steps"].is_array());

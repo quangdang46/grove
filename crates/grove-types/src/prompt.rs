@@ -26,6 +26,7 @@ impl ExecutionContract {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PromptSegmentKind {
+    StartupPrompt,
     Task,
     Reservation,
     ParentHandoff,
@@ -42,6 +43,7 @@ impl PromptSegmentKind {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::StartupPrompt => "startup_prompt",
             Self::Task => "task",
             Self::Reservation => "reservation",
             Self::ParentHandoff => "parent_handoff",

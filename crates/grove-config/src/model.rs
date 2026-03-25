@@ -1,4 +1,6 @@
-use crate::defaults::{DEFAULT_DB_PATH, DEFAULT_TRANSCRIPT_DIR};
+use crate::defaults::{
+    DEFAULT_DB_PATH, DEFAULT_STARTUP_PROMPT_PATH, DEFAULT_TRANSCRIPT_DIR,
+};
 use grove_types::{ReactionRule, default_reactions};
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +27,7 @@ pub struct RuntimeConfig {
     pub default_model: String,
     pub workspace_root: String,
     pub timeout_minutes: u64,
+    pub startup_prompt_path: String,
     pub env_passthrough: Vec<String>,
 }
 
@@ -35,6 +38,7 @@ impl Default for RuntimeConfig {
             default_model: "default".to_owned(),
             workspace_root: ".".to_owned(),
             timeout_minutes: 60,
+            startup_prompt_path: DEFAULT_STARTUP_PROMPT_PATH.to_owned(),
             env_passthrough: Vec::new(),
         }
     }

@@ -254,6 +254,7 @@ fn test_phase6_curation_is_explainable_and_compact() {
         contract: grove_types::ExecutionContract::SingleTask,
         task_title: "Compact prompt".to_string(),
         task_description: "Keep playbook injection bounded.".to_string(),
+        startup_prompt: None,
         reservation_hints: vec![],
         parent_handoffs: vec![],
         checkpoint: None,

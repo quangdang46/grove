@@ -26,6 +26,7 @@ pub struct PromptMaterializationInput {
     pub contract: ExecutionContract,
     pub task_title: String,
     pub task_description: String,
+    pub startup_prompt: Option<String>,
     pub reservation_hints: Vec<String>,
     pub parent_handoffs: Vec<String>,
     pub checkpoint: Option<CheckpointPromptInput>,
@@ -48,7 +49,11 @@ pub struct CheckpointPromptInput {
 }
 
 pub fn materialize_prompt(input: PromptMaterializationInput) -> PromptMaterialization {
-    let mut sections = vec![build_contract_section(input.contract)];
+    let mut sections = Vec::new();
+    if let Some(startup_prompt) = input.startup_prompt.as_deref() {
+        sections.push(build_startup_prompt_section(startup_prompt));
+    }
+    sections.push(build_contract_section(input.contract));
     sections.push(build_task_section(
         &input.task_title,
         &input.task_description,
@@ -257,6 +262,15 @@ fn apply_budget(sections: Vec<PromptSegment>, token_budget: Option<u32>) -> Budg
     }
 }
 
+fn build_startup_prompt_section(text: &str) -> PromptSegment {
+    build_text_section(
+        PromptSegmentKind::StartupPrompt,
+        0,
+        "Startup prompt",
+        text,
+    )
+}
+
 fn build_contract_section(contract: ExecutionContract) -> PromptSegment {
     let text = match contract {
         ExecutionContract::Implement => {
@@ -390,6 +404,7 @@ mod tests {
             contract,
             task_title: "Implement prompt materialization".to_owned(),
             task_description: "Build the prompt from ordered context segments.".to_owned(),
+            startup_prompt: Some("Custom startup instructions".to_owned()),
             reservation_hints: vec!["crates/grove-session/src/materializer.rs".to_owned()],
             parent_handoffs: vec!["Parent run established the session contract.".to_owned()],
             checkpoint: Some(CheckpointPromptInput {
@@ -423,6 +438,7 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
+                PromptSegmentKind::StartupPrompt,
                 PromptSegmentKind::Contract,
                 PromptSegmentKind::Task,
                 PromptSegmentKind::Reservation,
@@ -495,6 +511,27 @@ mod tests {
         )));
         assert!(materialized.rendered_prompt.contains("[CHECKPOINT]"));
         assert!(materialized.rendered_prompt.contains("[GROVE PROTOCOL]"));
+    }
+
+    #[test]
+    fn materializer_includes_startup_prompt_first_and_never_trims_it() {
+        let mut input = sample_input(ExecutionContract::Implement);
+        input.startup_prompt = Some("First read ALL of AGENTS.md and README.md carefully.".to_owned());
+        input.token_budget = Some(10);
+
+        let materialized = materialize_prompt(input);
+        let startup = materialized
+            .manifest
+            .sections
+            .iter()
+            .find(|section| section.kind == PromptSegmentKind::StartupPrompt)
+            .expect("missing startup prompt section");
+
+        assert!(startup.included);
+        assert_eq!(startup.trim_reason, None);
+        assert!(materialized
+            .rendered_prompt
+            .starts_with("First read ALL of AGENTS.md and README.md carefully."));
     }
 
     #[test]

@@ -273,6 +273,7 @@ fn handle_init(json_mode: bool, force: bool) -> Result<()> {
         )
     })?;
     ensure_workspace_layout(&loaded.paths)?;
+    let wrote_startup_prompt = ensure_startup_prompt_file(&loaded.paths)?;
 
     let tooling = detect_required_tooling(&loaded.config);
     ensure_required_tooling(&tooling)?;
@@ -316,7 +317,9 @@ fn handle_init(json_mode: bool, force: bool) -> Result<()> {
                 "config_path": loaded.paths.config_path().as_str(),
                 "transcript_dir": loaded.paths.transcript_dir().as_str(),
                 "checkpoints_dir": loaded.paths.checkpoints_dir().as_str(),
+                "startup_prompt_path": loaded.paths.startup_prompt_path().as_str(),
                 "wrote_default_config": wrote_default_config,
+                "wrote_startup_prompt": wrote_startup_prompt,
                 "forced_reset": force,
                 "synced_beads": synced_beads,
                 "tooling": {
@@ -343,8 +346,12 @@ fn handle_init(json_mode: bool, force: bool) -> Result<()> {
     println!("- config: {}", loaded.paths.config_path());
     println!("- transcripts: {}", loaded.paths.transcript_dir());
     println!("- checkpoints: {}", loaded.paths.checkpoints_dir());
+    println!("- startup prompt: {}", loaded.paths.startup_prompt_path());
     if wrote_default_config {
         println!("- wrote default config: {}", loaded.paths.config_path());
+    }
+    if wrote_startup_prompt {
+        println!("- wrote startup prompt template: {}", loaded.paths.startup_prompt_path());
     }
     if br_capability.beads_dir_exists {
         println!("- bead cache synced: {synced_beads} bead(s)");
@@ -1751,6 +1758,19 @@ fn write_default_config(path: &Utf8PathBuf) -> Result<()> {
     fs::write(path, format!("{text}\n"))
         .with_context(|| format!("write default config to {path}"))?;
     Ok(())
+}
+
+fn ensure_startup_prompt_file(paths: &GrovePaths) -> Result<bool> {
+    let path = paths.startup_prompt_path();
+    if path.exists() {
+        return Ok(false);
+    }
+
+    let text = concat!(
+        "First read ALL of the AGENTS.md file and README.md file super carefully and understand ALL of both! Then use your code investigation agent mode to fully understand the code, and technical architecture and purpose of the project. Then register with MCP Agent Mail and introduce yourself to the other agents. Be sure to check your agent mail and to promptly respond if needed to any messages; then proceed meticulously with your next assigned beads, working on the tasks systematically and meticulously and tracking your progress via beads and agent mail messages. Don't get stuck in \"communication purgatory\" where nothing is getting done; be proactive about starting tasks that need to be done, but inform your fellow agents via messages when you do so and mark beads appropriately. When you're not sure what to do next, use the bv tool mentioned in AGENTS.md to prioritize the best beads to work on next; pick the next one that you can usefully work on and get started. Make sure to acknowledge all communication requests from other agents and that you are aware of all active agents and their names. Use /effort max.\n"
+    );
+    fs::write(path, text).with_context(|| format!("write startup prompt template to {path}"))?;
+    Ok(true)
 }
 
 #[cfg(test)]

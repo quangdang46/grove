@@ -21,6 +21,7 @@ use grove_types::{
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -830,6 +831,22 @@ fn select_best_candidate_excluding<'a>(
 }
 
 /// Build a `SingleTaskSessionRequest` from a dispatched bead.
+fn load_startup_prompt(config: &GroveConfig, working_dir: &Utf8Path) -> Option<String> {
+    let path = if Utf8Path::new(&config.runtime.startup_prompt_path).is_absolute() {
+        Utf8PathBuf::from(config.runtime.startup_prompt_path.as_str())
+    } else {
+        working_dir.join(&config.runtime.startup_prompt_path)
+    };
+
+    let text = fs::read_to_string(path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
 fn build_session_request(
     bead: &GroveBeadRecord,
     config: &GroveConfig,
@@ -839,6 +856,7 @@ fn build_session_request(
     parent_handoffs: Vec<String>,
     escalation_tier: EscalationTier,
 ) -> SingleTaskSessionRequest {
+    let startup_prompt = load_startup_prompt(config, working_dir);
     let prompt_id = PromptId::new(format!("prompt-{}", run_id.as_str()));
     let transcript_path = Utf8PathBuf::from(format!(
         ".grove/transcripts/{}/{}.jsonl",
@@ -855,6 +873,7 @@ fn build_session_request(
         prompt_id,
         task_title: bead.bead.title.clone(),
         task_description: bead.bead.description.clone().unwrap_or_default(),
+        startup_prompt,
         contract: ExecutionContract::SingleTask,
         model: config.runtime.default_model.clone(),
         working_dir: working_dir.to_owned(),

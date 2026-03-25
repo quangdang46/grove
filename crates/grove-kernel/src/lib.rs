@@ -1871,6 +1871,7 @@ exit "${EXIT_CODE:-0}"
             prompt_id: grove_types::PromptId::new("prompt-life"),
             task_title: "Persist runtime lifecycle".to_owned(),
             task_description: "Wire session lifecycle into the runtime DB.".to_owned(),
+            startup_prompt: None,
             contract: grove_types::ExecutionContract::SingleTask,
             model: "sonnet".to_owned(),
             working_dir: workspace_dir,

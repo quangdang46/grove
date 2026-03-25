@@ -46,6 +46,7 @@ fn sample_request(workspace_dir: Utf8PathBuf) -> SingleTaskSessionRequest {
         task_title: "Phase 2 acceptance coverage".to_owned(),
         task_description: "Prove one-task execution semantics before Phase 3 depends on them."
             .to_owned(),
+        startup_prompt: None,
         contract: ExecutionContract::SingleTask,
         model: "sonnet".to_owned(),
         working_dir: workspace_dir,
@@ -165,6 +166,7 @@ fn single_task_prompt_discourages_plan_approval_stops() -> TestResult {
         contract: request.contract,
         task_title: request.task_title.clone(),
         task_description: request.task_description.clone(),
+        startup_prompt: request.startup_prompt.clone(),
         reservation_hints: request.reservation_hints.clone(),
         parent_handoffs: request.parent_handoffs.clone(),
         checkpoint: None,
@@ -211,6 +213,7 @@ fn retry_rescue_prompt_discourages_plan_approval_stops() -> TestResult {
         contract: request.contract,
         task_title: request.task_title.clone(),
         task_description: request.task_description.clone(),
+        startup_prompt: request.startup_prompt.clone(),
         reservation_hints: request.reservation_hints.clone(),
         parent_handoffs: request.parent_handoffs.clone(),
         checkpoint: None,

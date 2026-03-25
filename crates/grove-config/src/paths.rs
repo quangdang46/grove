@@ -15,6 +15,7 @@ pub struct GrovePaths {
     grove_dir: Utf8PathBuf,
     db_path: Utf8PathBuf,
     transcript_dir: Utf8PathBuf,
+    startup_prompt_path: Utf8PathBuf,
 }
 
 impl GrovePaths {
@@ -30,6 +31,8 @@ impl GrovePaths {
         let grove_dir = workspace_root.join(DEFAULT_GROVE_DIR_NAME);
         let db_path = resolve_against(&workspace_root, &config.memory.db_path);
         let transcript_dir = resolve_against(&workspace_root, &config.memory.transcript_dir);
+        let startup_prompt_path =
+            resolve_against(&workspace_root, &config.runtime.startup_prompt_path);
 
         Ok(Self {
             config_path: config_path.to_owned(),
@@ -37,6 +40,7 @@ impl GrovePaths {
             grove_dir,
             db_path,
             transcript_dir,
+            startup_prompt_path,
         })
     }
 
@@ -71,6 +75,11 @@ impl GrovePaths {
     }
 
     #[must_use]
+    pub fn startup_prompt_path(&self) -> &Utf8Path {
+        &self.startup_prompt_path
+    }
+
+    #[must_use]
     pub fn checkpoints_dir(&self) -> Utf8PathBuf {
         self.grove_dir.join(DEFAULT_CHECKPOINTS_DIR_NAME)
     }
@@ -95,6 +104,7 @@ impl GrovePaths {
         vec![
             ("memory.db_path", self.db_path.clone()),
             ("memory.transcript_dir", self.transcript_dir.clone()),
+            ("runtime.startup_prompt_path", self.startup_prompt_path.clone()),
             ("prompts_dir", self.prompts_dir()),
             ("checkpoints_dir", self.checkpoints_dir()),
             ("artifacts_dir", self.artifacts_dir()),

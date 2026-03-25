@@ -144,6 +144,7 @@ fn pure_db_no_external_memory_tool_in_prompt_assembly() -> TestResult {
         contract: ExecutionContract::SingleTask,
         task_title: "Test".to_string(),
         task_description: "Do the task".to_string(),
+        startup_prompt: None,
         reservation_hints: vec![],
         parent_handoffs: vec![],
         checkpoint: None,
