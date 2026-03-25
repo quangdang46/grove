@@ -37,6 +37,7 @@ use std::{
 };
 
 pub use dispatch::{
+    BlockedReasonCount, BlockedSampleBead, BlockedSampleReason, DispatchBlockedSummary,
     DispatchExitReason, DispatchLoopConfig, DispatchLoopOutcome, ShutdownSignal, run_dispatch_loop,
 };
 pub use inspect_view::BeadInspectView;

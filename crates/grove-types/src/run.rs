@@ -136,6 +136,8 @@ pub enum CoordinatorStopReason {
     Interrupted,
     /// No more dispatchable beads remain.
     QueueEmpty,
+    /// Ready work remained, but local Grove state blocked dispatch.
+    DispatchBlocked,
     /// Reached the maximum number of total dispatches.
     MaxRunsReached,
     /// Leader lease was contested/lost.
@@ -154,6 +156,7 @@ impl CoordinatorStopReason {
             Self::UserStopped => "user_stopped",
             Self::Interrupted => "interrupted",
             Self::QueueEmpty => "queue_empty",
+            Self::DispatchBlocked => "dispatch_blocked",
             Self::MaxRunsReached => "max_runs_reached",
             Self::LeaderContested => "leader_contested",
             Self::MaxPollCycles => "max_poll_cycles",
@@ -172,7 +175,11 @@ impl CoordinatorStopReason {
     pub const fn is_clean(self) -> bool {
         matches!(
             self,
-            Self::UserStopped | Self::QueueEmpty | Self::MaxRunsReached | Self::MaxPollCycles
+            Self::UserStopped
+                | Self::QueueEmpty
+                | Self::DispatchBlocked
+                | Self::MaxRunsReached
+                | Self::MaxPollCycles
         )
     }
 }
@@ -183,6 +190,7 @@ impl std::fmt::Display for CoordinatorStopReason {
             Self::UserStopped => write!(f, "user stopped (signal received)"),
             Self::Interrupted => write!(f, "interrupted during dispatch"),
             Self::QueueEmpty => write!(f, "no dispatchable beads remain"),
+            Self::DispatchBlocked => write!(f, "ready beads are blocked by local Grove state"),
             Self::MaxRunsReached => write!(f, "reached max total runs"),
             Self::LeaderContested => write!(f, "leader lease contested"),
             Self::MaxPollCycles => write!(f, "exceeded max poll cycles"),

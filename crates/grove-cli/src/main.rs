@@ -14,10 +14,11 @@ use grove_config::{
 };
 use grove_db::Database;
 use grove_kernel::{
-    BeadInspectView, DispatchExitReason, DispatchLoopConfig, DispatchLoopOutcome,
-    LeaderLeaseConfig, LeaderLeaseManager, ShutdownSignal, StartupRecoveryReport,
-    WorkspaceStatusView, acquire_startup_coordinator, init_trace_logging,
-    load_bead_inspect_view, load_workspace_status_view, run_dispatch_loop, trace_runtime_event,
+    BeadInspectView, DispatchBlockedSummary, DispatchExitReason, DispatchLoopConfig,
+    DispatchLoopOutcome, LeaderLeaseConfig, LeaderLeaseManager, ShutdownSignal,
+    StartupRecoveryReport, WorkspaceStatusView, acquire_startup_coordinator,
+    init_trace_logging, load_bead_inspect_view, load_workspace_status_view, run_dispatch_loop,
+    trace_runtime_event,
 };
 use grove_session::replay_transcript;
 use grove_types::{
@@ -116,6 +117,126 @@ where
 
 fn format_error_chain(error: &anyhow::Error) -> Vec<String> {
     error.chain().map(|cause| cause.to_string()).collect()
+}
+
+fn print_dispatch_blocked_summary(
+    blocked_summary: Option<&DispatchBlockedSummary>,
+    autonomous_recovery_attempted: bool,
+) {
+    println!(
+        "Ready work remains, but Grove cannot dispatch it because local runtime state is blocking every ready bead."
+    );
+
+    let Some(summary) = blocked_summary else {
+        println!("Check `grove status` for the blocked ready queue and local suppression reasons.");
+        return;
+    };
+
+    println!("Blocked ready beads: {}", summary.blocked_ready_count);
+    if let Some(top_reason) = summary.reason_counts.iter().max_by_key(|reason| reason.count) {
+        println!(
+            "Top blocker: {} ({})",
+            top_reason.summary, top_reason.count
+        );
+    }
+    if let Some(sample) = summary.sample_beads.first() {
+        println!("Sample blocked bead: {}", sample.bead_id.as_str());
+        if !sample.reasons.is_empty() {
+            println!(
+                "  suppressions: {}",
+                sample
+                    .reasons
+                    .iter()
+                    .map(|reason| reason.summary.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let needs_manual_retry = sample
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "failed_awaiting_manual_retry");
+        if autonomous_recovery_attempted {
+            println!(
+                "Grove already attempted one autonomous recovery in this run and stopped to avoid a retry loop."
+            );
+        } else if needs_manual_retry {
+            println!(
+                "Next action: run `grove retry {}` and then `grove run`.",
+                sample.bead_id.as_str()
+            );
+        } else {
+            println!(
+                "Next action: inspect the blocked bead with `grove inspect {}` or review `grove status`.",
+                sample.bead_id.as_str()
+            );
+        }
+    } else {
+        println!("Check `grove status` for the blocked ready queue and local suppression reasons.");
+    }
+}
+
+fn should_autonomously_reset_blocked_bead(
+    bead: &GroveBeadRecord,
+    blocked_summary: &DispatchBlockedSummary,
+) -> bool {
+    blocked_summary.blocked_ready_count == 1
+        && blocked_summary.sample_beads.len() == 1
+        && blocked_summary.sample_beads[0].bead_id == bead.bead.id
+        && blocked_summary.sample_beads[0].reasons.len() == 1
+        && blocked_summary.sample_beads[0].reasons[0].code == "failed_awaiting_manual_retry"
+        && bead.grove_status == GroveBeadStatus::Failed
+        && bead.last_failure_class == Some(grove_types::FailureClass::ClaudeCrashed)
+}
+
+fn try_autonomous_dispatch_blocked_recovery(
+    db: &mut Database,
+    br: &CliBrClient,
+    blocked_summary: Option<&DispatchBlockedSummary>,
+) -> Result<Option<BeadId>> {
+    let Some(summary) = blocked_summary else {
+        return Ok(None);
+    };
+    let Some(sample) = summary.sample_beads.first() else {
+        return Ok(None);
+    };
+
+    let ready_ids = br
+        .ready()
+        .context("load br ready set for autonomous blocked recovery")?
+        .into_iter()
+        .map(|bead| bead.id)
+        .collect::<std::collections::HashSet<_>>();
+    if !ready_ids.contains(&sample.bead_id) {
+        return Ok(None);
+    }
+
+    let bead = db
+        .get_bead_record(&sample.bead_id)?
+        .ok_or_else(|| anyhow!("blocked bead {} missing from local cache", sample.bead_id.as_str()))?;
+    if !should_autonomously_reset_blocked_bead(&bead, summary) {
+        return Ok(None);
+    }
+
+    let has_active_run = db
+        .list_task_runs_for_bead(&sample.bead_id)?
+        .into_iter()
+        .any(|run| run.status == RunStatus::Active);
+    if has_active_run {
+        return Ok(None);
+    }
+
+    let now = chrono::Utc::now();
+    db.reset_bead_for_retry_with_action(
+        &sample.bead_id,
+        &now,
+        serde_json::json!({
+            "action": "autonomous_retry_reset",
+            "trigger": "dispatch_blocked",
+            "previous_failure_class": "claude_crashed"
+        }),
+    )?;
+    Ok(Some(sample.bead_id.clone()))
 }
 
 fn handle_init(json_mode: bool, force: bool) -> Result<()> {
@@ -383,6 +504,7 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
     }
 
     let (loaded, mut db, br) = open_runtime()?;
+    let mut autonomous_recovery_attempted = false;
     init_trace_logging(loaded.paths.workspace_root(), loaded.config.logging.persist_jsonl)?;
     trace_runtime_event(
         "coordinator.run_started",
@@ -436,7 +558,7 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
         db_path: loaded.paths.db_path().to_owned(),
     };
 
-    let dispatch_result = if live {
+    let mut dispatch_result = if live {
         run_dispatch_loop_with_live_ui(&loaded, &br, &lease_config, &loop_config)?
     } else {
         run_dispatch_loop(
@@ -448,6 +570,30 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
             &loop_config,
         )
     };
+
+    if !live
+        && let Ok(outcome) = &dispatch_result
+        && outcome.exit_reason == DispatchExitReason::DispatchBlocked
+        && !autonomous_recovery_attempted
+        && let Some(recovered_bead_id) =
+            try_autonomous_dispatch_blocked_recovery(&mut db, &br, outcome.blocked_summary.as_ref())?
+    {
+        autonomous_recovery_attempted = true;
+        if !json_mode {
+            println!(
+                "Autonomously recovered blocked bead {} and retrying dispatch once.",
+                recovered_bead_id.as_str()
+            );
+        }
+        dispatch_result = run_dispatch_loop(
+            &mut db,
+            &backend,
+            &br,
+            &loaded.config,
+            &lease_config,
+            &loop_config,
+        );
+    }
 
     let release_at = chrono::Utc::now();
     let release_result =
@@ -500,6 +646,7 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
                         "poll_cycles": outcome.poll_cycles,
                         "leader_lease_released": release_result.is_some(),
                         "configured_max_parallel": loaded.config.scheduler.max_parallel,
+                        "blocked_summary": outcome.blocked_summary,
                     }))?
                 );
             } else {
@@ -507,8 +654,17 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
                 println!("Stop reason: {}", outcome.stop_reason);
                 println!("Total runs dispatched: {}", outcome.dispatched_count);
                 println!("Total poll cycles: {}", outcome.poll_cycles);
-                if outcome.exit_reason == DispatchExitReason::QueueEmpty {
-                    println!("No runnable beads remain right now. The project may still have unfinished work that is blocked locally; check `grove status` for active runs, checkpoints, retry backoff, failed-awaiting-manual-retry, reservation conflicts, or `dispatch:no` suppressions.");
+                match outcome.exit_reason {
+                    DispatchExitReason::QueueEmpty => {
+                        println!("No runnable beads remain right now. The project may still have unfinished work that is blocked locally; check `grove status` for active runs, checkpoints, retry backoff, failed-awaiting-manual-retry, reservation conflicts, or `dispatch:no` suppressions.");
+                    }
+                    DispatchExitReason::DispatchBlocked => {
+                        print_dispatch_blocked_summary(
+                            outcome.blocked_summary.as_ref(),
+                            autonomous_recovery_attempted,
+                        );
+                    }
+                    _ => {}
                 }
                 print_run_startup_report(&loaded, &release_result);
             }
@@ -1592,6 +1748,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use grove_kernel::{BlockedReasonCount, BlockedSampleBead, BlockedSampleReason};
+    use grove_types::{BeadRef, RunId, Timestamp};
     use std::error::Error;
     use tempfile::tempdir;
 
@@ -1618,6 +1776,80 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn dispatch_blocked_summary_prints_retry_guidance() {
+        let summary = DispatchBlockedSummary {
+            blocked_ready_count: 1,
+            reason_counts: vec![BlockedReasonCount {
+                code: "failed_awaiting_manual_retry",
+                summary: "failed and awaiting manual retry".to_owned(),
+                count: 1,
+            }],
+            sample_beads: vec![BlockedSampleBead {
+                bead_id: BeadId::new("saw-1rb"),
+                reasons: vec![BlockedSampleReason {
+                    code: "failed_awaiting_manual_retry",
+                    summary: "failed and awaiting manual retry".to_owned(),
+                }],
+            }],
+        };
+
+        let payload = serde_json::to_value(summary).expect("blocked summary should serialize");
+        assert_eq!(payload["blocked_ready_count"], 1);
+        assert_eq!(payload["reason_counts"][0]["code"], "failed_awaiting_manual_retry");
+        assert_eq!(payload["sample_beads"][0]["bead_id"], "saw-1rb");
+    }
+
+    #[test]
+    fn should_autonomously_reset_only_single_crashed_manual_retry_bead() {
+        let updated_at: Timestamp = chrono::Utc::now();
+        let bead = GroveBeadRecord {
+            bead: BeadRef {
+                id: BeadId::new("saw-1rb"),
+                title: "blocked root".to_owned(),
+                description: None,
+                priority: BeadPriority::P3,
+                issue_type: "epic".to_owned(),
+                br_status: "open".to_owned(),
+                assignee: None,
+                labels: vec!["release".to_owned()],
+                created_at: updated_at,
+                updated_at,
+            },
+            grove_status: GroveBeadStatus::Failed,
+            declared_paths: vec![],
+            metadata: serde_json::json!({}),
+            last_run_id: Some(RunId::new("run-saw-1rb")),
+            retry_after: None,
+            last_failure_class: Some(grove_types::FailureClass::ClaudeCrashed),
+            last_failure_detail: Some("session ended with Crash".to_owned()),
+            circuit_breaker_state: None,
+            synced_at: updated_at,
+            runtime_updated_at: updated_at,
+        };
+        let summary = DispatchBlockedSummary {
+            blocked_ready_count: 1,
+            reason_counts: vec![BlockedReasonCount {
+                code: "failed_awaiting_manual_retry",
+                summary: "failed and awaiting manual retry".to_owned(),
+                count: 1,
+            }],
+            sample_beads: vec![BlockedSampleBead {
+                bead_id: BeadId::new("saw-1rb"),
+                reasons: vec![BlockedSampleReason {
+                    code: "failed_awaiting_manual_retry",
+                    summary: "failed and awaiting manual retry".to_owned(),
+                }],
+            }],
+        };
+
+        assert!(should_autonomously_reset_blocked_bead(&bead, &summary));
+
+        let mut bead = bead;
+        bead.last_failure_class = Some(grove_types::FailureClass::PermissionDenied);
+        assert!(!should_autonomously_reset_blocked_bead(&bead, &summary));
     }
 }
 

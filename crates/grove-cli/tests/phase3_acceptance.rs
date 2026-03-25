@@ -149,6 +149,16 @@ fn empty_queue_maps_to_clean_stop_reason() {
 }
 
 #[test]
+fn blocked_queue_maps_to_clean_stop_reason() {
+    let exit_reason = DispatchExitReason::DispatchBlocked;
+    let stop_reason = exit_reason.to_stop_reason();
+
+    assert_eq!(stop_reason, CoordinatorStopReason::DispatchBlocked);
+    assert!(stop_reason.is_clean());
+    assert!(!stop_reason.is_user_initiated());
+}
+
+#[test]
 fn leader_contested_maps_to_uncle_fast_fail_reason() {
     let exit_reason = DispatchExitReason::LeaderContested;
     let stop_reason = exit_reason.to_stop_reason();

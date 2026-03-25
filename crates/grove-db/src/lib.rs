@@ -1685,6 +1685,15 @@ impl Database {
         bead_id: &BeadId,
         now: &chrono::DateTime<Utc>,
     ) -> Result<()> {
+        self.reset_bead_for_retry_with_action(bead_id, now, serde_json::json!({"action": "retry_reset"}))
+    }
+
+    pub fn reset_bead_for_retry_with_action(
+        &mut self,
+        bead_id: &BeadId,
+        now: &chrono::DateTime<Utc>,
+        action_payload: serde_json::Value,
+    ) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1708,7 +1717,7 @@ impl Database {
             Some(bead_id),
             None,
             None,
-            &serde_json::json!({"action": "retry_reset"}),
+            &action_payload,
             now,
         )?;
 
@@ -4150,6 +4159,55 @@ mod tests {
             db.connection()
                 .query_row("SELECT COUNT(*) FROM bead_cache", [], |row| row.get(0))?;
         assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn reset_bead_for_retry_with_action_records_custom_recovery_event() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| anyhow::anyhow!("temp path was not valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let bead = sample_issue("grove-reset", "reset bead", vec![], vec![])?;
+        db.upsert_bead_cache(&bead)?;
+        let now = Utc::now();
+        db.set_grove_status(&bead.id, GroveBeadStatus::Failed)?;
+        db.connection().execute(
+            "UPDATE bead_runtime SET retry_after = ?2, circuit_breaker_json = ?3 WHERE bead_id = ?1",
+            rusqlite::params![
+                bead.id.as_str(),
+                now.to_rfc3339(),
+                serde_json::json!({"state":"open"}).to_string()
+            ],
+        )?;
+
+        db.reset_bead_for_retry_with_action(
+            &bead.id,
+            &now,
+            serde_json::json!({
+                "action": "autonomous_retry_reset",
+                "trigger": "dispatch_blocked",
+                "previous_failure_class": "claude_crashed"
+            }),
+        )?;
+
+        let runtime = db
+            .get_bead_record(&bead.id)?
+            .expect("bead runtime should exist after reset");
+        assert_eq!(runtime.grove_status, GroveBeadStatus::Ready);
+        assert_eq!(runtime.retry_after, None);
+        assert_eq!(runtime.circuit_breaker_state, None);
+
+        let payload_json: String = db.connection().query_row(
+            "SELECT payload_json FROM event_log WHERE kind = ?1 ORDER BY id DESC LIMIT 1",
+            [super::encode_event_kind(EventKind::RecoveryActionTaken)],
+            |row| row.get(0),
+        )?;
+        let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
+        assert_eq!(payload["action"], "autonomous_retry_reset");
+        assert_eq!(payload["trigger"], "dispatch_blocked");
         Ok(())
     }
 

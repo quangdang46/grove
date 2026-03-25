@@ -1,6 +1,7 @@
+use crate::status_view::{SuppressionReasonView, find_reservation_conflicts};
 use crate::{
     AcquireReservationInput, DispatchEligibilityContext, LeaderLeaseConfig, LeaderLeaseManager,
-    PersistedTaskRunOutcome, ReservationManager,
+    LocalSuppressionReason, PersistedTaskRunOutcome, ReservationManager,
     execute_persisted_single_task_session_after_run_started,
 };
 use crate::RunStartInput;
@@ -15,9 +16,11 @@ use grove_session::{
 };
 use grove_types::{
     BeadId, CoordinatorStopReason, EscalationTier, ExecutionContract, GroveBeadRecord,
-    GroveBeadStatus, PromptId, ReservationMode, RunId, SessionId, Timestamp,
+    GroveBeadStatus, PromptId, ReservationConflict, ReservationMode, RunId, SessionId,
+    Timestamp,
 };
-use std::collections::{HashMap, HashSet};
+use serde::Serialize;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -90,6 +93,34 @@ pub struct DispatchLoopOutcome {
     pub exit_reason: DispatchExitReason,
     /// Durable stop reason for post-mortem analysis.
     pub stop_reason: CoordinatorStopReason,
+    /// Compact summary when ready work exists but local Grove state blocks dispatch.
+    pub blocked_summary: Option<DispatchBlockedSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DispatchBlockedSummary {
+    pub blocked_ready_count: usize,
+    pub reason_counts: Vec<BlockedReasonCount>,
+    pub sample_beads: Vec<BlockedSampleBead>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockedReasonCount {
+    pub code: &'static str,
+    pub summary: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockedSampleBead {
+    pub bead_id: BeadId,
+    pub reasons: Vec<BlockedSampleReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockedSampleReason {
+    pub code: &'static str,
+    pub summary: String,
 }
 
 /// Why the dispatch loop stopped.
@@ -97,6 +128,8 @@ pub struct DispatchLoopOutcome {
 pub enum DispatchExitReason {
     /// No more dispatchable beads remain.
     QueueEmpty,
+    /// Ready beads exist, but all are blocked by local Grove state.
+    DispatchBlocked,
     /// Reached the maximum number of total dispatches.
     MaxRunsReached,
     /// Leader lease was contested/lost.
@@ -111,6 +144,7 @@ impl std::fmt::Display for DispatchExitReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::QueueEmpty => write!(f, "no dispatchable beads remain"),
+            Self::DispatchBlocked => write!(f, "ready beads are blocked by local Grove state"),
             Self::MaxRunsReached => write!(f, "reached max total runs"),
             Self::LeaderContested => write!(f, "leader lease contested"),
             Self::MaxPollCycles { limit } => write!(f, "exceeded max poll cycles ({limit})"),
@@ -125,12 +159,110 @@ impl DispatchExitReason {
     pub fn to_stop_reason(&self) -> CoordinatorStopReason {
         match self {
             Self::QueueEmpty => CoordinatorStopReason::QueueEmpty,
+            Self::DispatchBlocked => CoordinatorStopReason::DispatchBlocked,
             Self::MaxRunsReached => CoordinatorStopReason::MaxRunsReached,
             Self::LeaderContested => CoordinatorStopReason::LeaderContested,
             Self::MaxPollCycles { .. } => CoordinatorStopReason::MaxPollCycles,
             Self::ShutdownRequested => CoordinatorStopReason::UserStopped,
         }
     }
+}
+
+fn dispatch_loop_outcome(
+    dispatched_count: u32,
+    poll_cycles: u32,
+    exit_reason: DispatchExitReason,
+    blocked_summary: Option<DispatchBlockedSummary>,
+) -> DispatchLoopOutcome {
+    let stop_reason = exit_reason.to_stop_reason();
+    DispatchLoopOutcome {
+        dispatched_count,
+        poll_cycles,
+        exit_reason,
+        stop_reason,
+        blocked_summary,
+    }
+}
+
+fn summarize_blocked_ready_beads(
+    beads: &[GroveBeadRecord],
+    ready_ids: &HashSet<BeadId>,
+    reservation_conflicts: &[ReservationConflict],
+    now: Timestamp,
+) -> Option<DispatchBlockedSummary> {
+    let mut reason_counts = BTreeMap::<(&'static str, String), usize>::new();
+    let mut sample_beads = Vec::new();
+    let mut blocked_ready_count = 0usize;
+
+    for bead in beads.iter().filter(|bead| ready_ids.contains(&bead.bead.id)) {
+        let eligibility = crate::evaluate_dispatch_eligibility(
+            bead,
+            &DispatchEligibilityContext {
+                ready_in_br: true,
+                circuit_state: crate::circuit_state_for_bead(bead),
+                reservation_conflicts: reservation_conflicts_for_bead(
+                    bead,
+                    reservation_conflicts,
+                ),
+                now,
+            },
+        );
+        if eligibility.local_suppression_reasons.is_empty() {
+            continue;
+        }
+
+        blocked_ready_count += 1;
+        for reason in &eligibility.local_suppression_reasons {
+            let view = SuppressionReasonView::from_reason(reason);
+            *reason_counts
+                .entry((view.code, view.summary.clone()))
+                .or_default() += 1;
+        }
+        if sample_beads.len() < 3 {
+            sample_beads.push(BlockedSampleBead {
+                bead_id: bead.bead.id.clone(),
+                reasons: eligibility
+                    .local_suppression_reasons
+                    .iter()
+                    .map(blocked_sample_reason_from_reason)
+                    .collect(),
+            });
+        }
+    }
+
+    (blocked_ready_count > 0).then(|| DispatchBlockedSummary {
+        blocked_ready_count,
+        reason_counts: reason_counts
+            .into_iter()
+            .map(|((code, summary), count)| BlockedReasonCount {
+                code,
+                summary,
+                count,
+            })
+            .collect(),
+        sample_beads,
+    })
+}
+
+fn blocked_sample_reason_from_reason(reason: &LocalSuppressionReason) -> BlockedSampleReason {
+    let view = SuppressionReasonView::from_reason(reason);
+    BlockedSampleReason {
+        code: view.code,
+        summary: view.summary,
+    }
+}
+
+fn reservation_conflicts_for_bead(
+    bead: &GroveBeadRecord,
+    reservation_conflicts: &[ReservationConflict],
+) -> Vec<ReservationConflict> {
+    reservation_conflicts
+        .iter()
+        .filter(|conflict| {
+            conflict.requested_by_bead == bead.bead.id || conflict.conflicting_bead == bead.bead.id
+        })
+        .cloned()
+        .collect()
 }
 
 /// Configuration for the dispatch loop beyond what `GroveConfig` provides.
@@ -829,12 +961,12 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
             if inflight_workers.is_empty() {
                 eprintln!("grove dispatch: shutdown signal detected, exiting gracefully");
                 let exit_reason = DispatchExitReason::ShutdownRequested;
-                return Ok(DispatchLoopOutcome {
+                return Ok(dispatch_loop_outcome(
                     dispatched_count,
                     poll_cycles,
-                    exit_reason: exit_reason.clone(),
-                    stop_reason: exit_reason.to_stop_reason(),
-                });
+                    exit_reason,
+                    None,
+                ));
             }
             std::thread::sleep(poll_sleep);
             continue;
@@ -844,12 +976,12 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
             && poll_cycles > limit
         {
             let exit_reason = DispatchExitReason::MaxPollCycles { limit };
-            return Ok(DispatchLoopOutcome {
+            return Ok(dispatch_loop_outcome(
                 dispatched_count,
                 poll_cycles,
-                exit_reason: exit_reason.clone(),
-                stop_reason: exit_reason.to_stop_reason(),
-            });
+                exit_reason,
+                None,
+            ));
         }
 
         if let Some(max_runs) = loop_config.max_total_runs
@@ -865,12 +997,12 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                 None,
             );
             let exit_reason = DispatchExitReason::MaxRunsReached;
-            return Ok(DispatchLoopOutcome {
+            return Ok(dispatch_loop_outcome(
                 dispatched_count,
                 poll_cycles,
-                exit_reason: exit_reason.clone(),
-                stop_reason: exit_reason.to_stop_reason(),
-            });
+                exit_reason,
+                None,
+            ));
         }
 
         let now = chrono::Utc::now();
@@ -890,12 +1022,12 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                     None,
                 );
                 let exit_reason = DispatchExitReason::LeaderContested;
-                return Ok(DispatchLoopOutcome {
+                return Ok(dispatch_loop_outcome(
                     dispatched_count,
                     poll_cycles,
-                    exit_reason: exit_reason.clone(),
-                    stop_reason: exit_reason.to_stop_reason(),
-                });
+                    exit_reason,
+                    None,
+                ));
             }
         }
 
@@ -933,12 +1065,12 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                 consecutive_empty_polls += 1;
                 if consecutive_empty_polls >= 3 {
                     let exit_reason = DispatchExitReason::QueueEmpty;
-                    return Ok(DispatchLoopOutcome {
+                    return Ok(dispatch_loop_outcome(
                         dispatched_count,
                         poll_cycles,
-                        exit_reason: exit_reason.clone(),
-                        stop_reason: exit_reason.to_stop_reason(),
-                    });
+                        exit_reason,
+                        None,
+                    ));
                 }
             } else {
                 consecutive_empty_polls = 0;
@@ -954,6 +1086,12 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
         let beads = db
             .list_bead_records()
             .context("list bead records for dispatch")?;
+        let active_reservations = db.list_active_reservations().unwrap_or_default();
+        let reservation_conflicts = if config.reservations.enabled {
+            find_reservation_conflicts(&active_reservations)
+        } else {
+            Vec::new()
+        };
         let now = chrono::Utc::now();
         let mut excluded_ids: HashSet<BeadId> = inflight_workers.keys().cloned().collect();
         let mut launched_any = false;
@@ -1206,7 +1344,10 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                         &crate::DispatchEligibilityContext {
                             ready_in_br: true,
                             circuit_state: crate::circuit_state_for_bead(bead),
-                            reservation_conflicts: Vec::new(),
+                            reservation_conflicts: reservation_conflicts_for_bead(
+                                bead,
+                                &reservation_conflicts,
+                            ),
                             now,
                         },
                     )
@@ -1215,13 +1356,23 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
             if inflight_workers.is_empty() && !any_dispatchable {
                 consecutive_empty_polls += 1;
                 if consecutive_empty_polls >= 3 {
-                    let exit_reason = DispatchExitReason::QueueEmpty;
-                    return Ok(DispatchLoopOutcome {
+                    let blocked_summary = summarize_blocked_ready_beads(
+                        &beads,
+                        &ready_ids,
+                        &reservation_conflicts,
+                        now,
+                    );
+                    let exit_reason = if blocked_summary.is_some() {
+                        DispatchExitReason::DispatchBlocked
+                    } else {
+                        DispatchExitReason::QueueEmpty
+                    };
+                    return Ok(dispatch_loop_outcome(
                         dispatched_count,
                         poll_cycles,
-                        exit_reason: exit_reason.clone(),
-                        stop_reason: exit_reason.to_stop_reason(),
-                    });
+                        exit_reason,
+                        blocked_summary,
+                    ));
                 }
             } else {
                 consecutive_empty_polls = 0;
@@ -1659,8 +1810,23 @@ mod tests {
         let outcome =
             run_dispatch_loop(&mut db, &backend, &br, &config, &lease_config, &loop_config)?;
 
-        assert_eq!(outcome.exit_reason, DispatchExitReason::QueueEmpty);
+        assert_eq!(outcome.exit_reason, DispatchExitReason::DispatchBlocked);
+        assert_eq!(outcome.stop_reason, CoordinatorStopReason::DispatchBlocked);
         assert_eq!(outcome.dispatched_count, 0);
+        let blocked_summary = outcome
+            .blocked_summary
+            .expect("blocked summary should be present for dispatch-blocked exit");
+        assert_eq!(blocked_summary.blocked_ready_count, 1);
+        assert_eq!(blocked_summary.reason_counts.len(), 1);
+        assert_eq!(
+            blocked_summary.reason_counts[0].code,
+            "failed_awaiting_manual_retry"
+        );
+        assert_eq!(blocked_summary.sample_beads.len(), 1);
+        assert_eq!(
+            blocked_summary.sample_beads[0].bead_id,
+            BeadId::new("grove-failed")
+        );
         Ok(())
     }
 
@@ -1669,6 +1835,10 @@ mod tests {
         assert_eq!(
             DispatchExitReason::QueueEmpty.to_string(),
             "no dispatchable beads remain"
+        );
+        assert_eq!(
+            DispatchExitReason::DispatchBlocked.to_string(),
+            "ready beads are blocked by local Grove state"
         );
         assert_eq!(
             DispatchExitReason::MaxRunsReached.to_string(),
