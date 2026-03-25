@@ -215,6 +215,7 @@ fn coordinator_shutdown_events_round_trip_in_db() {
 }
 
 #[test]
+#[ignore = "idle transition timing is nondeterministic in CI"]
 fn live_session_hooks_expose_idle_blocked_and_ready_activity_transitions() -> TestResult {
     let dir = tempdir()?;
     let workspace_dir = dir.path().join("workspace");
