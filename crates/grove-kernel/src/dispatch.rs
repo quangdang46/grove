@@ -1867,9 +1867,9 @@ mod tests {
         assert_eq!(outcome.exit_reason, DispatchExitReason::DispatchBlocked);
         assert_eq!(outcome.stop_reason, CoordinatorStopReason::DispatchBlocked);
         assert_eq!(outcome.dispatched_count, 0);
-        let blocked_summary = outcome
-            .blocked_summary
-            .expect("blocked summary should be present for dispatch-blocked exit");
+        let Some(blocked_summary) = outcome.blocked_summary else {
+            panic!("blocked summary should be present for dispatch-blocked exit");
+        };
         assert_eq!(blocked_summary.blocked_ready_count, 1);
         assert_eq!(blocked_summary.reason_counts.len(), 1);
         assert_eq!(

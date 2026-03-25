@@ -185,6 +185,7 @@ pub fn execute_persisted_single_task_session<B: ClaudeBackend>(
 /// Execute a persisted single task session when the run has already been recorded.
 /// This is used by the dispatch loop to avoid concurrent SQLite writes by recording
 /// the run start on the main thread before spawning workers.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_persisted_single_task_session_after_run_started<B: ClaudeBackend>(
     db: &mut Database,
     backend: &B,
@@ -735,6 +736,7 @@ fn synthetic_checkpoint_payload_from_outcome(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_fallback_checkpoint(
     db: &mut Database,
     checkpoint_root: &std::path::Path,
@@ -1391,7 +1393,6 @@ mod tests {
     use super::*;
     use grove_types::{
         BeadId, BeadPriority, BeadRef, CircuitBreakerState, CircuitState, RunId, RunStatus,
-        StopReason,
     };
     use std::error::Error;
 
@@ -1855,7 +1856,6 @@ exit "${EXIT_CODE:-0}"
         Ok(())
     }
 
-    #[cfg(unix)]
     fn insert_bead_cache_row(db: &Database, bead_id: &str, title: &str) -> TestResult {
         db.connection().execute(
             "INSERT INTO bead_cache(\
@@ -2342,7 +2342,7 @@ exit "${EXIT_CODE:-0}"
         );
         assert_eq!(
             persisted.session.session.stop_reason,
-            Some(StopReason::Unknown)
+            Some(grove_types::StopReason::Unknown)
         );
         let bead = db
             .get_bead_record(&BeadId::new("grove-life"))?
