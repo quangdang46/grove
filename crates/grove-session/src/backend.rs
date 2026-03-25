@@ -115,10 +115,12 @@ pwd > "$PWD_FILE"
 printf 'stdout line\n'
 printf 'stderr line\n' >&2
 "#;
-        fs::write(path, script)?;
-        let mut permissions = fs::metadata(path)?.permissions();
+        let temp_path = path.with_extension("tmp");
+        fs::write(&temp_path, script)?;
+        let mut permissions = fs::metadata(&temp_path)?.permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)?;
+        fs::set_permissions(&temp_path, permissions)?;
+        fs::rename(&temp_path, path)?;
         Ok(())
     }
 
