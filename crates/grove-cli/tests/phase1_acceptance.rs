@@ -1604,9 +1604,9 @@ impl CliHarness {
 
         fs::write(workspace_root.join("grove.toml"), DEFAULT_INIT_GROVE_TOML)?;
 
-        write_executable(&bin_dir.join("claude"), CLAUDE_STUB)?;
-        write_executable(&bin_dir.join("br"), BR_STUB)?;
-        write_executable(&bin_dir.join("bv"), BV_STUB)?;
+        write_executable(&stub_path(&bin_dir, "claude"), CLAUDE_STUB)?;
+        write_executable(&stub_path(&bin_dir, "br"), BR_STUB)?;
+        write_executable(&stub_path(&bin_dir, "bv"), BV_STUB)?;
 
         Ok(Self {
             _temp_dir: temp_dir,
@@ -1785,6 +1785,17 @@ impl CliHarness {
     }
 }
 
+fn stub_path(bin_dir: &camino::Utf8Path, name: &str) -> camino::Utf8PathBuf {
+    #[cfg(windows)]
+    {
+        return bin_dir.join(format!("{name}.cmd"));
+    }
+    #[cfg(not(windows))]
+    {
+        bin_dir.join(name)
+    }
+}
+
 fn write_executable(path: &camino::Utf8Path, content: &str) -> TestResult {
     fs::write(path, content)?;
     #[cfg(unix)]
@@ -1805,6 +1816,7 @@ fn output_text(output: &Output) -> String {
     )
 }
 
+#[cfg(not(windows))]
 const CLAUDE_STUB: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 if [[ "${1-}" == "--version" ]]; then
@@ -1815,15 +1827,22 @@ printf 'unexpected claude invocation: %s\n' "$*" >&2
 exit 1
 "#;
 
+#[cfg(windows)]
+const CLAUDE_STUB: &str = r#"@echo off
+if "%~1"=="--version" (
+  echo claude 1.0.0-test
+  exit /b 0
+)
+>&2 echo unexpected claude invocation: %*
+exit /b 1
+"#;
+
+#[cfg(not(windows))]
 const BR_STUB: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 if [[ "${1-}" == "--version" ]]; then
   echo "br 0.1.12-test"
   exit 0
-fi
-beads_exists=false
-if [[ -d .beads ]]; then
-  beads_exists=true
 fi
 case "$*" in
   "ready --json")
@@ -1857,6 +1876,41 @@ EOF
 esac
 "#;
 
+#[cfg(windows)]
+const BR_STUB: &str = r#"@echo off
+if "%~1"=="--version" (
+  echo br 0.1.12-test
+  exit /b 0
+)
+if "%*"=="ready --json" (
+  echo {"issues":[{"id":"grove-cli-test","title":"CLI inspect test","description":"Detailed CLI inspect description","priority":1,"issue_type":"task","status":"open","assignee":null,"labels":["area:test"],"created_at":"2026-03-17T00:00:00Z","updated_at":"2026-03-17T00:00:00Z","blocked_by":[],"blocks":[]}],"count":1}
+  exit /b 0
+)
+if "%*"=="list --json" (
+  echo [{"id":"grove-cli-test","title":"CLI inspect test","description":"Detailed CLI inspect description","priority":1,"issue_type":"task","status":"open","assignee":null,"labels":["area:test"],"created_at":"2026-03-17T00:00:00Z","updated_at":"2026-03-17T00:00:00Z","blocked_by":[],"blocks":[]}]
+  exit /b 0
+)
+if "%*"=="show grove-cli-test --json" (
+  echo {"id":"grove-cli-test","title":"CLI inspect test","description":"Detailed CLI inspect description","priority":1,"issue_type":"task","status":"open","assignee":null,"labels":["area:test"],"created_at":"2026-03-17T00:00:00Z","updated_at":"2026-03-17T00:00:00Z","blocked_by":[],"blocks":[],"comments":[]}
+  exit /b 0
+)
+if "%*"=="show grove-missing --json" (
+  echo []
+  exit /b 0
+)
+if "%*"=="dep list grove-cli-test --json" (
+  echo {"blocked_by":[],"blocks":[]}
+  exit /b 0
+)
+if "%*"=="dep list grove-missing --json" (
+  echo {"blocked_by":[],"blocks":[]}
+  exit /b 0
+)
+>&2 echo unexpected br invocation: %*
+exit /b 1
+"#;
+
+#[cfg(not(windows))]
 const BV_STUB: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 if [[ "${1-}" == "--version" ]]; then
@@ -1875,4 +1929,22 @@ EOF
 fi
 printf 'unexpected bv invocation: %s\n' "$*" >&2
 exit 1
+"#;
+
+#[cfg(windows)]
+const BV_STUB: &str = r#"@echo off
+if "%~1"=="--version" (
+  echo bv 0.1.12-test
+  exit /b 0
+)
+if "%*"=="--robot-triage" (
+  if defined GROVE_TEST_BV_TRIAGE_FAIL (
+    >&2 echo %GROVE_TEST_BV_TRIAGE_FAIL%
+    exit /b 1
+  )
+  echo {"generated_at":"2026-03-17T00:00:00Z","data_hash":"test-hash","triage":{"meta":{"version":"test","generated_at":"2026-03-17T00:00:00Z","phase2_ready":false,"issue_count":1,"compute_time_ms":1},"quick_ref":{"open_count":1,"actionable_count":1,"blocked_count":0,"in_progress_count":0,"top_picks":[{"id":"grove-cli-test","title":"CLI inspect test","score":1.0,"reasons":["ready"],"unblocks":0}]},"recommendations":[],"quick_wins":[],"blockers_to_clear":[],"project_health":{"counts":{"total":1,"open":1,"closed":0,"blocked":0,"actionable":1,"by_status":{"open":1},"by_type":{"task":1},"by_priority":{"P1":1}},"graph":{"node_count":1,"edge_count":0,"density":0.0,"has_cycles":false,"phase2_ready":false},"velocity":{"closed_last_7_days":0,"closed_last_30_days":0,"avg_days_to_close":null,"weekly":[]}},"commands":{"next":"bv --robot-next"}},"usage_hints":[]}
+  exit /b 0
+)
+>&2 echo unexpected bv invocation: %*
+exit /b 1
 "#;
