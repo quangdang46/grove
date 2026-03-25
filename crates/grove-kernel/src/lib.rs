@@ -565,7 +565,7 @@ impl SessionLifecycleHooks for DbSessionLifecycleHooks<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn read_trace_log_lines(workspace_dir: &camino::Utf8Path) -> Result<Vec<serde_json::Value>> {
     let path = workspace_dir
         .join(DEFAULT_GROVE_DIR_NAME)

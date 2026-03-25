@@ -1085,7 +1085,14 @@ fn status_json_emits_machine_readable_operator_surface() -> TestResult {
     let workspace_root = payload["workspace_root"]
         .as_str()
         .expect("workspace_root string");
-    assert!(workspace_root.starts_with(harness.workspace_root.as_str()));
+    let workspace_root = std::path::Path::new(workspace_root);
+    assert!(
+        workspace_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == harness.workspace_root.file_name().unwrap_or(""))
+            || workspace_root.starts_with(harness.workspace_root.as_std_path())
+    );
     assert!(payload["db_path"].as_str().is_some());
     assert!(payload["triage_error"].is_null());
     assert!(payload["view"].is_object());

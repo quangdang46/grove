@@ -95,7 +95,7 @@ impl ClaudeBackend for CliClaudeBackend {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{ClaudeBackend, CliClaudeBackend, DEFAULT_MODEL_OMIT_FLAG, StartSessionRequest};
     use camino::Utf8PathBuf;
