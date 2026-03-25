@@ -1759,7 +1759,8 @@ impl CliHarness {
             .args(args)
             .current_dir(current_dir)
             .env("PATH", &joined_path)
-            .env_remove("GROVE_TEST_BV_TRIAGE_FAIL");
+            .env_remove("GROVE_TEST_BV_TRIAGE_FAIL")
+            .env_remove("GROVE_RUNTIME__WORKSPACE_ROOT");
 
         for (key, value) in env_vars {
             command.env(key, value);

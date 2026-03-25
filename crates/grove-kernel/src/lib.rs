@@ -2347,8 +2347,9 @@ exit "${EXIT_CODE:-0}"
         let bead = db
             .get_bead_record(&BeadId::new("grove-life"))?
             .expect("bead runtime should persist");
-        assert_eq!(bead.grove_status, GroveBeadStatus::WaitingToRetry);
-        assert_eq!(bead.last_failure_class, Some(FailureClass::NoProgress));
+        assert_eq!(bead.grove_status, GroveBeadStatus::Checkpointed);
+        assert_eq!(bead.last_failure_class, None);
+        assert!(persisted.checkpoint.is_some());
         Ok(())
     }
 
@@ -2401,8 +2402,9 @@ exit "${EXIT_CODE:-0}"
         let bead = db
             .get_bead_record(&BeadId::new("grove-life"))?
             .expect("bead runtime should persist");
-        assert_eq!(bead.grove_status, GroveBeadStatus::WaitingToRetry);
-        assert_eq!(bead.last_failure_class, Some(FailureClass::NoProgress));
+        assert_eq!(bead.grove_status, GroveBeadStatus::Checkpointed);
+        assert_eq!(bead.last_failure_class, None);
+        assert!(persisted.checkpoint.is_some());
         Ok(())
     }
 
@@ -2459,8 +2461,9 @@ exit "${EXIT_CODE:-0}"
         let bead = db
             .get_bead_record(&BeadId::new("grove-life"))?
             .expect("bead runtime should persist");
-        assert_eq!(bead.grove_status, GroveBeadStatus::WaitingToRetry);
-        assert_eq!(bead.last_failure_class, Some(FailureClass::Interrupted));
+        assert_eq!(bead.grove_status, GroveBeadStatus::Checkpointed);
+        assert_eq!(bead.last_failure_class, None);
+        assert!(persisted.checkpoint.is_some());
         Ok(())
     }
 
