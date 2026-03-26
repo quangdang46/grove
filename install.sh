@@ -313,6 +313,7 @@ main() {
     local platform archive url bin_path expected actual
     platform=$(detect_platform)
 
+    log_info "Installing grove binary"
     if [ "$FROM_SOURCE" -eq 0 ]; then
         resolve_version
         archive=$(archive_name_for_platform "$platform")
@@ -335,6 +336,7 @@ main() {
         build_from_source
     fi
 
+    log_success "grove installed → $DEST/$BINARY_NAME"
     bootstrap_mcp_agent_mail
     maybe_add_path
 
