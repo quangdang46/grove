@@ -656,8 +656,8 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
         }),
     );
     let owner_label = format!("{}:{}", loaded.paths.workspace_root(), std::process::id());
-    // Keep the leader lease comfortably above a single scheduler cycle so
-    // normal DB / scoring / br work cannot self-expire the coordinator.
+    // Keep the leader lease comfortably above a scheduler cycle as safety
+    // headroom; the dispatch loop now renews during long synchronous work.
     let lease_ttl = chrono::Duration::seconds(30).max(chrono::Duration::milliseconds(
         cmp::max(1, loaded.config.scheduler.poll_interval_ms as i64) * 5,
     ));

@@ -5,7 +5,7 @@ use crate::{
     LocalSuppressionReason, PersistedTaskRunOutcome, ReservationManager,
     execute_persisted_single_task_session_after_run_started,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use grove_br::BrClient;
 use grove_config::{DEFAULT_CHECKPOINTS_DIR_NAME, DEFAULT_GROVE_DIR_NAME, GroveConfig};
@@ -335,6 +335,113 @@ struct CompletedWorker {
 
 struct InFlightWorker {
     handle: JoinHandle<()>,
+}
+
+enum LeaseMonitorEvent {
+    Contested,
+    Error(String),
+}
+
+struct LeaseMonitorGuard {
+    stop_flag: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for LeaseMonitorGuard {
+    fn drop(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn start_lease_monitor(
+    lease_config: &LeaderLeaseConfig,
+    loop_config: &DispatchLoopConfig,
+) -> (LeaseMonitorGuard, mpsc::Receiver<LeaseMonitorEvent>) {
+    let renew_interval = lease_renew_interval(lease_config.lease_ttl);
+    let (tx, rx) = mpsc::channel();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let thread_stop_flag = Arc::clone(&stop_flag);
+    let thread_lease_config = lease_config.clone();
+    let thread_db_path = loop_config.db_path.clone();
+    let thread_shutdown_signal = loop_config.shutdown_signal.clone();
+    let handle = std::thread::spawn(move || {
+        let mut db = match Database::open(&thread_db_path) {
+            Ok(db) => db,
+            Err(error) => {
+                let _ = tx.send(LeaseMonitorEvent::Error(error.to_string()));
+                thread_shutdown_signal.trigger();
+                return;
+            }
+        };
+
+        while !thread_stop_flag.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(
+                renew_interval.num_milliseconds().max(1) as u64,
+            ));
+            if thread_stop_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            match LeaderLeaseManager::heartbeat(&mut db, &thread_lease_config, chrono::Utc::now()) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let _ = tx.send(LeaseMonitorEvent::Contested);
+                    thread_shutdown_signal.trigger();
+                    break;
+                }
+                Err(error) => {
+                    let _ = tx.send(LeaseMonitorEvent::Error(error.to_string()));
+                    thread_shutdown_signal.trigger();
+                    break;
+                }
+            }
+        }
+    });
+
+    (
+        LeaseMonitorGuard {
+            stop_flag,
+            handle: Some(handle),
+        },
+        rx,
+    )
+}
+
+fn lease_renew_interval(lease_ttl: chrono::Duration) -> chrono::Duration {
+    chrono::Duration::milliseconds((lease_ttl.num_milliseconds() / 3).max(1))
+}
+
+fn handle_contested_leader_lease<C: BrClient>(
+    db: &mut Database,
+    br: &C,
+    config: &GroveConfig,
+    loop_config: &DispatchLoopConfig,
+    inflight_workers: &mut HashMap<BeadId, InFlightWorker>,
+    completed_rx: &mpsc::Receiver<CompletedWorker>,
+    poll_sleep: Duration,
+    dispatched_count: u32,
+    poll_cycles: u32,
+) -> DispatchLoopOutcome {
+    if !loop_config.shutdown_signal.is_triggered() {
+        loop_config.shutdown_signal.trigger();
+    }
+    drain_inflight_workers(
+        db,
+        br,
+        config,
+        inflight_workers,
+        completed_rx,
+        poll_sleep,
+        None,
+    );
+    dispatch_loop_outcome(
+        dispatched_count,
+        poll_cycles,
+        DispatchExitReason::LeaderContested,
+        None,
+    )
 }
 
 fn handle_completed_worker<C: BrClient>(
@@ -999,12 +1106,33 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
     let poll_sleep = Duration::from_millis(config.scheduler.poll_interval_ms);
     let mut inflight_workers: HashMap<BeadId, InFlightWorker> = HashMap::new();
     let (completed_tx, completed_rx) = mpsc::channel::<CompletedWorker>();
+    let (_lease_monitor, lease_monitor_rx) = start_lease_monitor(lease_config, loop_config);
 
     loop {
         poll_cycles += 1;
 
         while let Ok(completed) = completed_rx.try_recv() {
             handle_completed_worker(db, br, &config, &mut inflight_workers, completed);
+        }
+        while let Ok(event) = lease_monitor_rx.try_recv() {
+            match event {
+                LeaseMonitorEvent::Contested => {
+                    return Ok(handle_contested_leader_lease(
+                        db,
+                        br,
+                        &config,
+                        loop_config,
+                        &mut inflight_workers,
+                        &completed_rx,
+                        poll_sleep,
+                        dispatched_count,
+                        poll_cycles,
+                    ));
+                }
+                LeaseMonitorEvent::Error(error) => {
+                    return Err(anyhow!("leader lease monitor failed: {error}"));
+                }
+            }
         }
 
         if loop_config.shutdown_signal.is_triggered() {
@@ -1053,32 +1181,6 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                 exit_reason,
                 None,
             ));
-        }
-
-        let now = chrono::Utc::now();
-        match LeaderLeaseManager::heartbeat(db, lease_config, now)? {
-            Some(_) => {}
-            None => {
-                if !loop_config.shutdown_signal.is_triggered() {
-                    loop_config.shutdown_signal.trigger();
-                }
-                drain_inflight_workers(
-                    db,
-                    br,
-                    &config,
-                    &mut inflight_workers,
-                    &completed_rx,
-                    poll_sleep,
-                    None,
-                );
-                let exit_reason = DispatchExitReason::LeaderContested;
-                return Ok(dispatch_loop_outcome(
-                    dispatched_count,
-                    poll_cycles,
-                    exit_reason,
-                    None,
-                ));
-            }
         }
 
         if let Err(error) = process_mirror_outbox(db, br, &config) {
@@ -1514,6 +1616,7 @@ mod tests {
         ready: Vec<BrIssueSummary>,
         open: Vec<BrIssueSummary>,
         fail_mirror: bool,
+        mirror_delay: Duration,
     }
 
     impl BrClient for TestBrClient {
@@ -1578,6 +1681,9 @@ mod tests {
             _handoff: &grove_types::HandoffRecord,
             _close_bead: bool,
         ) -> Result<(), BrError> {
+            if !self.mirror_delay.is_zero() {
+                std::thread::sleep(self.mirror_delay);
+            }
             if self.fail_mirror {
                 Err(BrError::CommandFailed {
                     command: "mirror_handoff".to_owned(),
@@ -1714,6 +1820,7 @@ mod tests {
             ready: vec![bead_summary("grove-a", BeadPriority::P0)?],
             open: vec![bead_summary("grove-a", BeadPriority::P0)?],
             fail_mirror: false,
+            mirror_delay: Duration::ZERO,
         };
         let mut config = GroveConfig::default();
         config.scheduler.max_parallel = 1;
@@ -1748,6 +1855,65 @@ mod tests {
         let runs = db.list_task_runs_for_bead(&BeadId::new("grove-a"))?;
         assert_eq!(runs.len(), 1, "expected one persisted run");
         assert_ne!(runs[0].status, grove_types::RunStatus::Active);
+        Ok(())
+    }
+
+    #[test]
+    fn lease_renew_interval_uses_one_third_of_ttl() {
+        assert_eq!(
+            lease_renew_interval(chrono::Duration::milliseconds(90)),
+            chrono::Duration::milliseconds(30)
+        );
+        assert_eq!(
+            lease_renew_interval(chrono::Duration::milliseconds(2)),
+            chrono::Duration::milliseconds(1)
+        );
+    }
+
+    #[test]
+    fn process_mirror_outbox_can_take_longer_than_short_lease_ttl() -> TestResult {
+        let dir = tempdir()?;
+        let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let bead = bead_summary("grove-mirror-slow", BeadPriority::P1)?;
+        db.upsert_bead_cache(&bead)?;
+        db.set_grove_status(&bead.id, GroveBeadStatus::Succeeded)?;
+
+        let run_id = RunId::new("run-grove-mirror-slow-1");
+        db.record_run_started(grove_db::RunStartInput {
+            escalation_tier: grove_types::EscalationTier::FirstAttempt,
+            bead_id: bead.id.clone(),
+            run_id: run_id.clone(),
+            attempt_no: 1,
+            started_at: chrono::Utc::now(),
+        })?;
+
+        let handoff = grove_types::HandoffRecord {
+            bead_id: bead.id.clone(),
+            run_id: run_id.clone(),
+            summary: "mirror me slowly".into(),
+            artifacts: Vec::new(),
+            lessons: Vec::new(),
+            decisions: Vec::new(),
+            warnings: Vec::new(),
+            completed_at: chrono::Utc::now(),
+        };
+        db.enqueue_mirror_outbox(&bead.id, &run_id, &handoff, true)?;
+
+        let br = TestBrClient {
+            ready: Vec::new(),
+            open: vec![bead],
+            fail_mirror: false,
+            mirror_delay: Duration::from_millis(25),
+        };
+        let config = GroveConfig::default();
+
+        let started = std::time::Instant::now();
+        process_mirror_outbox(&mut db, &br, &config)?;
+        assert!(started.elapsed() >= Duration::from_millis(25));
         Ok(())
     }
 
@@ -1793,6 +1959,7 @@ mod tests {
                 bead_summary("grove-b", BeadPriority::P1)?,
             ],
             fail_mirror: false,
+            mirror_delay: Duration::ZERO,
         };
         let mut config = GroveConfig::default();
         config.scheduler.max_parallel = 2;
@@ -1843,6 +2010,7 @@ mod tests {
             ready: vec![suppressed.clone()],
             open: vec![suppressed],
             fail_mirror: false,
+            mirror_delay: Duration::ZERO,
         };
         let mut config = GroveConfig::default();
         config.scheduler.max_parallel = 1;
@@ -1935,6 +2103,85 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_loop_survives_slow_mirror_outbox_with_short_lease_ttl() -> TestResult {
+        let dir = tempdir()?;
+        let workspace_dir = dir.path().join("workspace");
+        std::fs::create_dir_all(workspace_dir.join(".grove"))?;
+        let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+            .map_err(|_| std::io::Error::other("workspace dir must be valid UTF-8"))?;
+        let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+            .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+        let mut db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let bead = bead_summary("grove-idle", BeadPriority::P1)?;
+        db.upsert_bead_cache(&bead)?;
+        db.set_grove_status(&bead.id, GroveBeadStatus::Idle)?;
+
+        let mirror_bead = BeadId::new("grove-mirror-slow-loop");
+        let run_id = RunId::new("run-grove-mirror-slow-loop-1");
+        db.upsert_bead_cache(&bead_summary(mirror_bead.as_str(), BeadPriority::P0)?)?;
+        db.set_grove_status(&mirror_bead, GroveBeadStatus::Succeeded)?;
+        db.record_run_started(grove_db::RunStartInput {
+            escalation_tier: grove_types::EscalationTier::FirstAttempt,
+            bead_id: mirror_bead.clone(),
+            run_id: run_id.clone(),
+            attempt_no: 1,
+            started_at: chrono::Utc::now(),
+        })?;
+        let handoff = grove_types::HandoffRecord {
+            bead_id: mirror_bead.clone(),
+            run_id: run_id.clone(),
+            summary: "slow mirror before queue check".into(),
+            artifacts: Vec::new(),
+            lessons: Vec::new(),
+            decisions: Vec::new(),
+            warnings: Vec::new(),
+            completed_at: chrono::Utc::now(),
+        };
+        db.enqueue_mirror_outbox(&mirror_bead, &run_id, &handoff, true)?;
+
+        let br = TestBrClient {
+            ready: Vec::new(),
+            open: vec![bead_summary(mirror_bead.as_str(), BeadPriority::P0)?],
+            fail_mirror: false,
+            mirror_delay: Duration::from_millis(25),
+        };
+        let mut config = GroveConfig::default();
+        config.scheduler.max_parallel = 1;
+        config.scheduler.poll_interval_ms = 10;
+        let lease_config = LeaderLeaseConfig {
+            owner_label: "test-owner".to_owned(),
+            lease_ttl: chrono::Duration::milliseconds(20),
+        };
+        let now = chrono::Utc::now();
+        let _ = LeaderLeaseManager::acquire(&mut db, &lease_config, None, now)?;
+        let loop_config = DispatchLoopConfig {
+            max_total_runs: None,
+            max_poll_cycles: Some(5),
+            working_dir: workspace_dir,
+            shutdown_signal: ShutdownSignal::new(),
+            db_path,
+        };
+
+        let outcome = run_dispatch_loop(
+            &mut db,
+            &CliClaudeBackend::new("/bin/true".to_owned()),
+            &br,
+            &config,
+            &lease_config,
+            &loop_config,
+        )?;
+
+        assert_eq!(outcome.exit_reason, DispatchExitReason::QueueEmpty);
+        let lease = db
+            .active_leader_lease(&chrono::Utc::now())?
+            .ok_or_else(|| std::io::Error::other("expected active leader lease"))?;
+        assert_eq!(lease.owner_label, lease_config.owner_label);
+        Ok(())
+    }
+
+    #[test]
     fn process_mirror_outbox_logs_reaction_for_mirror_failure() -> TestResult {
         let dir = tempdir()?;
         let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
@@ -1971,6 +2218,7 @@ mod tests {
             ready: Vec::new(),
             open: vec![bead],
             fail_mirror: true,
+            mirror_delay: Duration::ZERO,
         };
         let config = GroveConfig::default();
         process_mirror_outbox(&mut db, &br, &config)?;
