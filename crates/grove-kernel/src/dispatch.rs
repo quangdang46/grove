@@ -2128,7 +2128,7 @@ mod tests {
         config.scheduler.poll_interval_ms = 10;
         let lease_config = LeaderLeaseConfig {
             owner_label: "test-owner".to_owned(),
-            lease_ttl: chrono::Duration::milliseconds(20),
+            lease_ttl: chrono::Duration::milliseconds(60),
         };
         let now = chrono::Utc::now();
         let _ = LeaderLeaseManager::acquire(&mut db, &lease_config, None, now)?;
