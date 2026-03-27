@@ -776,7 +776,7 @@ fn init_refuses_when_workspace_is_already_initialized() -> TestResult {
     let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.contains("Grove is already initialized"));
     assert!(stderr.contains("Nothing was changed."));
-    assert!(stderr.contains("grove init --sync"));
+    assert!(stderr.contains("grove sync"));
     assert!(stderr.contains("grove init --force"));
     Ok(())
 }
@@ -1829,7 +1829,7 @@ fn write_executable(path: &camino::Utf8Path, content: &str) -> TestResult {
 }
 
 #[test]
-fn init_sync_preserves_runtime_state_and_refreshes_bead_cache() -> TestResult {
+fn sync_preserves_runtime_state_and_refreshes_bead_cache() -> TestResult {
     let harness = CliHarness::new()?;
     harness.enable_beads()?;
     harness.seed_runtime_bead(GroveBeadStatus::Succeeded)?;
@@ -1839,10 +1839,10 @@ fn init_sync_preserves_runtime_state_and_refreshes_bead_cache() -> TestResult {
         "keep-log\n",
     )?;
 
-    let output = harness.run(["init", "--sync"])?;
+    let output = harness.run(["sync"])?;
     assert!(
         output.status.success(),
-        "init --sync should succeed: {}",
+        "sync should succeed: {}",
         output_text(&output)
     );
 
@@ -1869,14 +1869,14 @@ fn init_sync_preserves_runtime_state_and_refreshes_bead_cache() -> TestResult {
 }
 
 #[test]
-fn init_sync_json_reports_sync_mode() -> TestResult {
+fn sync_json_reports_sync_mode() -> TestResult {
     let harness = CliHarness::new()?;
     harness.enable_beads()?;
 
-    let output = harness.run(["--json", "init", "--sync"])?;
+    let output = harness.run(["--json", "sync"])?;
     assert!(
         output.status.success(),
-        "init --json --sync should succeed: {}",
+        "sync --json should succeed: {}",
         output_text(&output)
     );
 
@@ -1884,7 +1884,6 @@ fn init_sync_json_reports_sync_mode() -> TestResult {
     let payload: serde_json::Value = serde_json::from_str(&stdout)?;
     assert_eq!(payload["ok"], true);
     assert_eq!(payload["mode"], "sync");
-    assert_eq!(payload["sync_requested"], true);
     assert!(payload["sync_result"].is_object());
 
     Ok(())

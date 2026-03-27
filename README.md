@@ -205,9 +205,11 @@ $EDITOR .grove/startup_prompt.md
 grove run
 ```
 
-`grove init` creates a user-owned startup prompt template at `.grove/startup_prompt.md` if it does not already exist. Edit that file to change the baseline instructions Grove injects into every freshly spawned Claude session. Re-running `grove init` will preserve your edited file unless you delete it yourself.
+`grove init` creates a user-owned startup prompt template at `.grove/startup_prompt.md` if it does not already exist. Edit that file to change the baseline instructions Grove injects into every freshly spawned Claude session. Re-running `grove init` will preserve your edited file unless you delete it yourself. If Grove is already initialized, use `grove sync` to refresh the bead cache instead of re-running `grove init`.
 
 If you pass `grove init --skills`, Grove also scaffolds the bundled `flywheel-beads` skill into `.agents/skills/flywheel-beads/SKILL.md`. That scaffold is create-if-missing and becomes user-owned immediately, so reruns (including `--force`) preserve any edits you make there.
+
+After initialization, use `grove sync` to reconcile the local Grove bead cache with the current open bead set from `br` without resetting Grove-managed runtime state.
 
 Grove handles everything from here. When it finishes, your beads are closed and mirrored back to `br`. If a mirror fails, grove preserves the local result and flags it for retry — run `grove status` to see what landed and what needs attention.
 
@@ -222,6 +224,9 @@ grove init
 # Init grove and scaffold the bundled flywheel-beads skill for Claude Code
 # into .agents/skills/flywheel-beads/SKILL.md
 grove init --skills
+
+# Refresh Grove's local bead cache from br without resetting local runtime state
+grove sync
 
 # Start orchestrator (the main command)
 grove run
