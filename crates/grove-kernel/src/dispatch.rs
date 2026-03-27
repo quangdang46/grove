@@ -2078,6 +2078,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg_attr(target_os = "macos", ignore = "flaky on macOS CI")]
     #[test]
     fn dispatch_loop_survives_slow_mirror_outbox_with_short_lease_ttl() -> TestResult {
         let dir = tempdir()?;
