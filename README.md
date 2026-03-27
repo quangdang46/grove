@@ -209,6 +209,46 @@ grove run
 
 If you pass `grove init --skills`, Grove scaffolds all bundled skills into `.agents/skills/<skill-name>/SKILL.md`. Each scaffold is create-if-missing and becomes user-owned immediately, so reruns (including `--force`) preserve any edits you make there.
 
+### Trick to fast to complete the plan
+
+If you want Grove to implement all tasks faster, follow the setup below.
+
+1. Enable Claude Code agent teams in your Claude settings:
+
+   ```json
+   {
+     "env": {
+       "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": 1
+     }
+   }
+   ```
+
+   Agent teams docs: https://code.claude.com/docs/en/agent-teams
+
+2. Initialize Grove with bundled swarm skills:
+
+   ```bash
+   grove init --skills
+   ```
+
+3. Change the Grove startup prompt template so new Claude sessions start with:
+
+   ```text
+   /flywheel-swarm
+   ```
+
+   Edit `.grove/startup_prompt.md` for this.
+
+4. Start Grove:
+
+   ```bash
+   grove run
+   ```
+
+This setup makes Grove implement all tasks faster because each new Claude session starts in the swarm workflow immediately. The trade-off is higher token usage.
+
+Always make sure `am` (MCP Agent Mail) is running before using this workflow.
+
 After initialization, use `grove sync` to reconcile the local Grove bead cache with the current open bead set from `br` without resetting Grove-managed runtime state.
 
 Grove handles everything from here. When it finishes, your beads are closed and mirrored back to `br`. If a mirror fails, grove preserves the local result and flags it for retry — run `grove status` to see what landed and what needs attention.
