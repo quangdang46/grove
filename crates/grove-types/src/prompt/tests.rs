@@ -1,4 +1,3 @@
-
 use super::{
     ExecutionContract, PromptManifest, PromptManifestSection, PromptSectionProvenance,
     PromptSegment, PromptSegmentKind, PromptTrimReason,

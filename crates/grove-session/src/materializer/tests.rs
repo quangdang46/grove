@@ -1,4 +1,3 @@
-
 use super::{CheckpointPromptInput, PromptMaterializationInput, materialize_prompt};
 use grove_types::{
     BeadId, CheckpointId, ExecutionContract, PromptId, PromptSegmentKind, PromptTrimReason, RunId,

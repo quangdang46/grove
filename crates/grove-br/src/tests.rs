@@ -1,4 +1,3 @@
-
 use super::*;
 use grove_types::{BeadPriority, HandoffRecord, Timestamp};
 use serde_json::json;

@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::status_view::SuppressionReasonView;
 use camino::Utf8PathBuf;

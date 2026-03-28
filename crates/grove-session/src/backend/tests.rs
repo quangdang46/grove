@@ -1,4 +1,3 @@
-
 use super::{ClaudeBackend, CliSessionBackend, DEFAULT_MODEL_OMIT_FLAG, StartSessionRequest};
 use camino::Utf8PathBuf;
 use grove_types::RuntimeProvider;

@@ -1,4 +1,3 @@
-
 use super::*;
 use grove_types::ProtocolState;
 use serde_json::json;

@@ -1,4 +1,3 @@
-
 use super::*;
 use grove_types::playbook::{
     BulletMaturity, BulletScope, BulletState, BulletType, FeedbackEventRecord, FeedbackKind,
