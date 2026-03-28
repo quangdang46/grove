@@ -1,4 +1,4 @@
-use crate::{BeadId, BeadPriority, CircuitBreakerState, RunId, Timestamp};
+use crate::{BeadId, BeadPriority, CircuitBreakerState, RunId, Timestamp, workflow::WorkflowState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -75,5 +75,10 @@ impl GroveBeadRecord {
                 | (Failed, Ready)
                 | (WaitingToRetry, Ready)
         )
+    }
+
+    #[must_use]
+    pub fn workflow_state(&self) -> Option<WorkflowState> {
+        WorkflowState::from_bead(self)
     }
 }

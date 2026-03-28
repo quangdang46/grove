@@ -406,9 +406,14 @@ impl InspectSnapshot {
             .into_iter()
             .map(PlaybookBulletView::from)
             .collect();
+        let workflow_phase = self
+            .bead
+            .workflow_state()
+            .map(|state| state.phase.as_str().to_owned());
 
         BeadInspectView {
             bead: self.bead,
+            workflow_phase,
             dependencies: self.dependencies,
             dependents: self.dependents,
             latest_dispatch: self.latest_dispatch,
@@ -432,6 +437,7 @@ impl InspectSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct BeadInspectView {
     pub bead: GroveBeadRecord,
+    pub workflow_phase: Option<String>,
     pub dependencies: Vec<DependencyEdgeView>,
     pub dependents: Vec<DependencyEdgeView>,
     pub latest_dispatch: Option<DispatchDecisionView>,

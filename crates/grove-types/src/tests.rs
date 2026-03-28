@@ -83,6 +83,39 @@ fn grove_bead_status_all_variants_serialize() -> TestResult {
 }
 
 #[test]
+fn workflow_phase_roundtrip_and_progression() -> TestResult {
+    let phase: WorkflowPhase = serde_json::from_str("\"validate\"")?;
+    assert_eq!(phase, WorkflowPhase::Validate);
+    assert_eq!(phase.next(), Some(WorkflowPhase::Execute));
+    assert_eq!(WorkflowPhase::Compound.next(), None);
+    Ok(())
+}
+
+#[test]
+fn workflow_state_can_be_inferred_from_labels_and_metadata() {
+    let labels = vec!["grove:workflow:review".to_owned()];
+    let inferred = WorkflowState::inferred_from_labels(&labels).expect("workflow label");
+    assert_eq!(inferred.phase, WorkflowPhase::Review);
+
+    let metadata = json!({
+        "grove": {
+            "workflow": {
+                "phase": "plan"
+            }
+        }
+    });
+    let from_metadata = WorkflowState::from_metadata(&metadata).expect("workflow metadata");
+    assert_eq!(from_metadata.phase, WorkflowPhase::Plan);
+}
+
+#[test]
+fn workflow_state_can_be_inferred_from_issue_type() {
+    let inferred = WorkflowState::inferred_from_issue_type("feature").expect("feature workflow");
+    assert_eq!(inferred.phase, WorkflowPhase::Explore);
+    assert!(WorkflowState::inferred_from_issue_type("task").is_none());
+}
+
+#[test]
 fn run_status_all_variants_serialize() -> TestResult {
     for status in [
         RunStatus::Active,

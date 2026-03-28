@@ -1182,6 +1182,34 @@ impl BrClient for FakeBrClient {
         })
     }
 
+    fn create_issue(&self, input: &grove_br::BrCreateIssueInput) -> Result<BrIssueDetail, BrError> {
+        Ok(BrIssueDetail {
+            summary: BrIssueSummary {
+                id: BeadId::new("bd-created"),
+                title: input.title.clone(),
+                description: input.description.clone(),
+                priority: input.priority,
+                issue_type: input.issue_type.clone(),
+                status: "open".to_owned(),
+                assignee: None,
+                labels: input.labels.clone(),
+                created_at: "2026-03-20T05:00:00Z".parse().expect("timestamp"),
+                updated_at: "2026-03-20T05:00:00Z".parse().expect("timestamp"),
+                blocked_by: Vec::new(),
+                blocks: Vec::new(),
+                raw_json: serde_json::json!({}),
+            },
+            closed_at: None,
+            close_reason: None,
+            comments: Vec::new(),
+            metadata: serde_json::json!({}),
+        })
+    }
+
+    fn add_dependency(&self, _issue: &BeadId, _depends_on: &BeadId) -> Result<(), BrError> {
+        Ok(())
+    }
+
     fn close_bead(&self, _id: &BeadId, _resolution: Option<&str>) -> Result<(), BrError> {
         // Fake implementation - always succeeds
         Ok(())

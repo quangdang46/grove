@@ -61,6 +61,16 @@ fn parse_show_empty_array_is_not_found() -> TestResult {
 }
 
 #[test]
+fn parse_created_issue_accepts_single_object_shape() -> TestResult {
+    let parsed = parse_created_issue_output(
+        r#"{"id":"bd-created","title":"Generated child","description":"Desc","priority":1,"issue_type":"task","status":"open","created_at":"2026-03-20T05:00:00Z","updated_at":"2026-03-20T05:00:00Z","labels":["grove:generated"]}"#,
+    )?;
+    assert_eq!(parsed.summary.id.as_str(), "bd-created");
+    assert_eq!(parsed.summary.priority, BeadPriority::P1);
+    Ok(())
+}
+
+#[test]
 fn parse_dep_rows_live_shape() -> TestResult {
     let bead_id = BeadId::new("grove-1j9.5.5");
     let parsed = parse_dep_list_output(

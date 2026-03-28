@@ -5,7 +5,7 @@ use anyhow::Result;
 use grove_types::{BeadId, GroveBeadStatus};
 use std::collections::{HashMap, HashSet};
 
-pub use client::{BrClient, BrError, CliBrClient};
+pub use client::{BrClient, BrCreateIssueInput, BrError, CliBrClient};
 pub use schema::{
     BrCapability, BrComment, BrDependencyRow, BrDependencySnapshot, BrIssueDetail, BrIssueSummary,
     BrVersion, ShowParseError,

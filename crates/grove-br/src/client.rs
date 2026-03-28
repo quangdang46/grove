@@ -1,8 +1,9 @@
 use crate::schema::{
     BrCapability, BrDependencySnapshot, BrIssueDetail, BrIssueSummary, BrVersion, ShowParseError,
-    parse_dep_list_output, parse_list_output, parse_ready_output, parse_show_output,
+    parse_created_issue_output, parse_dep_list_output, parse_list_output, parse_ready_output,
+    parse_show_output,
 };
-use grove_types::{BeadId, HandoffRecord};
+use grove_types::{BeadId, BeadPriority, HandoffRecord};
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -51,6 +52,8 @@ pub trait BrClient {
     fn show(&self, id: &BeadId) -> Result<BrIssueDetail, BrError>;
     fn dep_list(&self, id: &BeadId) -> Result<BrDependencySnapshot, BrError>;
     fn capability(&self) -> Result<BrCapability, BrError>;
+    fn create_issue(&self, input: &BrCreateIssueInput) -> Result<BrIssueDetail, BrError>;
+    fn add_dependency(&self, issue: &BeadId, depends_on: &BeadId) -> Result<(), BrError>;
 
     // Mirror outbox operations for grove-1j9.7.6
     fn close_bead(&self, id: &BeadId, reason: Option<&str>) -> Result<(), BrError>;
@@ -67,6 +70,15 @@ pub trait BrClient {
 pub struct CliBrClient {
     br_bin: String,
     working_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrCreateIssueInput {
+    pub title: String,
+    pub description: Option<String>,
+    pub priority: BeadPriority,
+    pub issue_type: String,
+    pub labels: Vec<String>,
 }
 
 impl CliBrClient {
@@ -180,6 +192,41 @@ impl BrClient for CliBrClient {
         })
     }
 
+    fn create_issue(&self, input: &BrCreateIssueInput) -> Result<BrIssueDetail, BrError> {
+        let mut owned_args = vec![
+            "create".to_owned(),
+            input.title.clone(),
+            "--type".to_owned(),
+            input.issue_type.clone(),
+            "--priority".to_owned(),
+            priority_arg(input.priority).to_owned(),
+        ];
+        if let Some(description) = &input.description {
+            owned_args.push("--description".to_owned());
+            owned_args.push(description.clone());
+        }
+        if !input.labels.is_empty() {
+            owned_args.push("--labels".to_owned());
+            owned_args.push(input.labels.join(","));
+        }
+        owned_args.push("--json".to_owned());
+
+        let arg_refs = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = self.run(&arg_refs)?;
+        parse_created_issue_output(&output.stdout).map_err(|source| BrError::ParseError {
+            command: format_command(&self.br_bin, &arg_refs),
+            source,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+    }
+
+    fn add_dependency(&self, issue: &BeadId, depends_on: &BeadId) -> Result<(), BrError> {
+        let args = ["dep", "add", issue.as_str(), depends_on.as_str()];
+        let _output = self.run(&args)?;
+        Ok(())
+    }
+
     // Mirror outbox operations (grove-1j9.7.6)
 
     fn close_bead(&self, id: &BeadId, reason: Option<&str>) -> Result<(), BrError> {
@@ -222,6 +269,16 @@ impl BrClient for CliBrClient {
         }
 
         Ok(())
+    }
+}
+
+fn priority_arg(priority: BeadPriority) -> &'static str {
+    match priority {
+        BeadPriority::P0 => "0",
+        BeadPriority::P1 => "1",
+        BeadPriority::P2 => "2",
+        BeadPriority::P3 => "3",
+        BeadPriority::P4 => "4",
     }
 }
 

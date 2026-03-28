@@ -14,6 +14,7 @@ mod run;
 mod session;
 mod task;
 mod time;
+mod workflow;
 
 pub use archive::{
     ConversationRecord, MessageRecord, MessageRole, RelevantSnippet, RetrievalBundle,
@@ -57,6 +58,7 @@ pub use session::{
 };
 pub use task::{BeadRef, BeadRuntimePatch, GroveBeadRecord, GroveBeadStatus};
 pub use time::Timestamp;
+pub use workflow::{WorkflowPhase, WorkflowState};
 
 pub const CRATE_PURPOSE: &str = "Shared Grove domain types and identifiers.";
 

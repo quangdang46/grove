@@ -5,8 +5,8 @@ use anyhow::Result;
 use camino::Utf8PathBuf;
 use chrono::Utc;
 use grove_br::{
-    BeadCacheStore, BrCapability, BrClient, BrDependencySnapshot, BrError, BrIssueDetail,
-    BrIssueSummary, BrVersion, sync_bead_cache,
+    BeadCacheStore, BrCapability, BrClient, BrCreateIssueInput, BrDependencySnapshot, BrError,
+    BrIssueDetail, BrIssueSummary, BrVersion, sync_bead_cache,
 };
 use grove_types::{
     BeadId, BeadPriority, CheckpointId, CheckpointPayload, CircuitBreakerState,
@@ -49,7 +49,7 @@ fn migrate_applies_manifest_once() -> Result<()> {
     db.migrate()?;
 
     let migrations = db.applied_migrations()?;
-    assert_eq!(migrations.len(), 12);
+    assert_eq!(migrations.len(), 13);
     assert_eq!(
         migrations[0],
         MigrationState {
@@ -132,6 +132,13 @@ fn migrate_applies_manifest_once() -> Result<()> {
         MigrationState {
             version: 12,
             name: "0012_session_provider.sql".into(),
+        }
+    );
+    assert_eq!(
+        migrations[12],
+        MigrationState {
+            version: 13,
+            name: "0013_multi_phase_handoffs.sql".into(),
         }
     );
     Ok(())
@@ -1430,6 +1437,34 @@ impl BrClient for FakeBrClient {
             }),
             beads_dir_exists: true,
         })
+    }
+
+    fn create_issue(&self, input: &BrCreateIssueInput) -> Result<BrIssueDetail, BrError> {
+        Ok(BrIssueDetail {
+            summary: BrIssueSummary {
+                id: BeadId::new("bd-created"),
+                title: input.title.clone(),
+                description: input.description.clone(),
+                priority: input.priority,
+                issue_type: input.issue_type.clone(),
+                status: "open".to_owned(),
+                assignee: None,
+                labels: input.labels.clone(),
+                created_at: "2026-03-20T05:00:00Z".parse().expect("timestamp"),
+                updated_at: "2026-03-20T05:00:00Z".parse().expect("timestamp"),
+                blocked_by: Vec::new(),
+                blocks: Vec::new(),
+                raw_json: json!({}),
+            },
+            closed_at: None,
+            close_reason: None,
+            comments: Vec::new(),
+            metadata: json!({}),
+        })
+    }
+
+    fn add_dependency(&self, _issue: &BeadId, _depends_on: &BeadId) -> Result<(), BrError> {
+        Ok(())
     }
 
     fn close_bead(&self, _id: &BeadId, _reason: Option<&str>) -> Result<(), BrError> {

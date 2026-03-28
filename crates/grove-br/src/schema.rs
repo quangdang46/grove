@@ -122,24 +122,26 @@ pub(crate) fn parse_show_output(
     text: &str,
     bead_id: &BeadId,
 ) -> Result<BrIssueDetail, ShowParseError> {
-    match serde_json::from_str::<IssueWire>(text) {
-        Ok(issue) => BrIssueDetail::try_from(issue).map_err(ShowParseError::Serde),
-        Err(object_error) => match serde_json::from_str::<Vec<IssueWire>>(text) {
-            Ok(mut issues) => {
-                if issues.is_empty() {
-                    Err(ShowParseError::NotFound(bead_id.clone()))
-                } else if issues.len() == 1 {
-                    BrIssueDetail::try_from(issues.remove(0)).map_err(ShowParseError::Serde)
-                } else {
-                    Err(ShowParseError::Cardinality {
-                        bead_id: bead_id.clone(),
-                        count: issues.len(),
-                    })
-                }
-            }
-            Err(_) => Err(ShowParseError::Serde(object_error)),
+    parse_single_issue_output(text).map_err(|error| match error {
+        SingleIssueParseError::Empty => ShowParseError::NotFound(bead_id.clone()),
+        SingleIssueParseError::Cardinality(count) => ShowParseError::Cardinality {
+            bead_id: bead_id.clone(),
+            count,
         },
-    }
+        SingleIssueParseError::Serde(source) => ShowParseError::Serde(source),
+    })
+}
+
+pub(crate) fn parse_created_issue_output(text: &str) -> Result<BrIssueDetail, serde_json::Error> {
+    parse_single_issue_output(text).map_err(|error| match error {
+        SingleIssueParseError::Empty => {
+            serde_json::Error::custom("expected created issue, found none")
+        }
+        SingleIssueParseError::Cardinality(count) => {
+            serde_json::Error::custom(format!("expected exactly one created issue, found {count}"))
+        }
+        SingleIssueParseError::Serde(source) => source,
+    })
 }
 
 pub(crate) fn parse_dep_list_output(
@@ -186,6 +188,30 @@ pub enum ShowParseError {
     Cardinality { bead_id: BeadId, count: usize },
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
+}
+
+enum SingleIssueParseError {
+    Empty,
+    Cardinality(usize),
+    Serde(serde_json::Error),
+}
+
+fn parse_single_issue_output(text: &str) -> Result<BrIssueDetail, SingleIssueParseError> {
+    match serde_json::from_str::<IssueWire>(text) {
+        Ok(issue) => BrIssueDetail::try_from(issue).map_err(SingleIssueParseError::Serde),
+        Err(object_error) => match serde_json::from_str::<Vec<IssueWire>>(text) {
+            Ok(mut issues) => {
+                if issues.is_empty() {
+                    Err(SingleIssueParseError::Empty)
+                } else if issues.len() == 1 {
+                    BrIssueDetail::try_from(issues.remove(0)).map_err(SingleIssueParseError::Serde)
+                } else {
+                    Err(SingleIssueParseError::Cardinality(issues.len()))
+                }
+            }
+            Err(_) => Err(SingleIssueParseError::Serde(object_error)),
+        },
+    }
 }
 
 #[derive(Debug, Deserialize)]

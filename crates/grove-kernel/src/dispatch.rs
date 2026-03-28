@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
-use grove_br::BrClient;
+use grove_br::{BeadCacheStore, BrClient};
 use grove_config::{
     DEFAULT_CHECKPOINTS_DIR_NAME, DEFAULT_GROVE_DIR_NAME, GroveConfig, build_provider_environment,
 };
@@ -461,7 +461,37 @@ fn handle_completed_worker<C: BrClient>(
                 );
             }
 
+            let terminal_success = if outcome.run.status == grove_types::RunStatus::Succeeded {
+                match crate::continue_workflow_after_success(
+                    db,
+                    br,
+                    &ctx.bead_id,
+                    &ctx.run_id,
+                    outcome.handoff.as_ref(),
+                ) {
+                    Ok(is_terminal) => is_terminal,
+                    Err(error) => {
+                        eprintln!(
+                            "grove dispatch: workflow continuation failed for {}: {error}",
+                            ctx.bead_id.as_str()
+                        );
+                        if let Err(reset_error) =
+                            db.set_grove_status(&ctx.bead_id, GroveBeadStatus::Ready)
+                        {
+                            eprintln!(
+                                "grove dispatch: failed to reset {} to ready after workflow error: {reset_error}",
+                                ctx.bead_id.as_str()
+                            );
+                        }
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+
             if outcome.run.status == grove_types::RunStatus::Succeeded
+                && terminal_success
                 && let Some(handoff) = outcome.handoff.as_ref()
             {
                 match br.mirror_handoff(&ctx.bead_id, handoff, true) {
@@ -899,7 +929,6 @@ fn select_best_candidate_excluding<'a>(
     candidates.into_iter().next()
 }
 
-/// Build a `SingleTaskSessionRequest` from a dispatched bead.
 fn load_startup_prompt(config: &GroveConfig, working_dir: &Utf8Path) -> Option<String> {
     let path = if Utf8Path::new(&config.runtime.startup_prompt_path).is_absolute() {
         Utf8PathBuf::from(config.runtime.startup_prompt_path.as_str())
@@ -913,6 +942,64 @@ fn load_startup_prompt(config: &GroveConfig, working_dir: &Utf8Path) -> Option<S
         None
     } else {
         Some(trimmed.to_owned())
+    }
+}
+
+fn workflow_phase_handoff_summary(db: &Database, bead: &GroveBeadRecord) -> Option<String> {
+    bead.workflow_state().and_then(|workflow_state| {
+        db.handoff_for_bead(&bead.bead.id)
+            .ok()
+            .flatten()
+            .map(|handoff| {
+                let mut lines = vec![format!(
+                    "Previous workflow phase for this task completed in run {} during `{}`: {}",
+                    handoff.run_id,
+                    workflow_state.phase.as_str(),
+                    handoff.summary
+                )];
+                if !handoff.artifacts.is_empty() {
+                    lines.push(format!("Artifacts: {}", handoff.artifacts.join(", ")));
+                }
+                if !handoff.decisions.is_empty() {
+                    lines.push(format!("Decisions: {}", handoff.decisions.join(" | ")));
+                }
+                if !handoff.lessons.is_empty() {
+                    lines.push(format!("Lessons: {}", handoff.lessons.join(" | ")));
+                }
+                if !handoff.warnings.is_empty() {
+                    lines.push(format!("Warnings: {}", handoff.warnings.join(" | ")));
+                }
+                lines.join("\n")
+            })
+    })
+}
+
+fn workflow_task_title(bead: &GroveBeadRecord) -> String {
+    bead.workflow_state()
+        .map(|workflow_state| {
+            format!(
+                "[{}] {}",
+                workflow_state.phase.title_label(),
+                bead.bead.title
+            )
+        })
+        .unwrap_or_else(|| bead.bead.title.clone())
+}
+
+fn workflow_task_description(bead: &GroveBeadRecord) -> String {
+    let base = bead.bead.description.clone().unwrap_or_default();
+    if let Some(workflow_state) = bead.workflow_state() {
+        if base.trim().is_empty() {
+            workflow_state.phase.description_preamble().to_owned()
+        } else {
+            format!(
+                "{}\n\n{}",
+                workflow_state.phase.description_preamble(),
+                base
+            )
+        }
+    } else {
+        base
     }
 }
 
@@ -935,6 +1022,7 @@ fn build_session_request(
     let prompt_manifest_path =
         Utf8PathBuf::from(format!(".grove/prompts/{}.json", prompt_id.as_str()));
     let current_env = std::env::vars().collect();
+    let workflow_state = bead.workflow_state();
 
     SingleTaskSessionRequest {
         bead_id: bead.bead.id.clone(),
@@ -942,10 +1030,12 @@ fn build_session_request(
         session_id: session_id.clone(),
         provider: config.runtime.provider,
         prompt_id,
-        task_title: bead.bead.title.clone(),
-        task_description: bead.bead.description.clone().unwrap_or_default(),
+        task_title: workflow_task_title(bead),
+        task_description: workflow_task_description(bead),
         startup_prompt,
-        contract: ExecutionContract::SingleTask,
+        contract: workflow_state
+            .map(|state| state.phase.execution_contract())
+            .unwrap_or(ExecutionContract::SingleTask),
         model: config.runtime.default_model.clone(),
         working_dir: working_dir.to_owned(),
         transcript_path,
@@ -1278,7 +1368,11 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                 }
             }
 
-            let parent_handoffs = crate::parent_handoff_summaries(db, &bead_id).unwrap_or_default();
+            let mut parent_handoffs =
+                crate::parent_handoff_summaries(db, &bead_id).unwrap_or_default();
+            if let Some(summary) = workflow_phase_handoff_summary(db, bead) {
+                parent_handoffs.push(summary);
+            }
 
             let escalation_tier = db
                 .list_task_runs_for_bead(&bead_id)

@@ -23,6 +23,11 @@ impl VerificationMode {
     /// Select a verification mode based on the execution contract and project environment.
     pub fn infer(contract: ExecutionContract, workspace_dir: &camino::Utf8Path) -> Self {
         match contract {
+            ExecutionContract::Explore
+            | ExecutionContract::Plan
+            | ExecutionContract::Validate
+            | ExecutionContract::Review
+            | ExecutionContract::Compound => Self::ProtocolComplete,
             ExecutionContract::Implement => {
                 if workspace_dir.join("Cargo.toml").exists() {
                     Self::RustCompileCheck

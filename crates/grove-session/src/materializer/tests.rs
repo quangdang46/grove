@@ -65,14 +65,41 @@ fn materializer_orders_sections_stably() {
 
 #[test]
 fn materializer_changes_contract_framing() {
+    let explore = materialize_prompt(sample_input(ExecutionContract::Explore));
+    let plan = materialize_prompt(sample_input(ExecutionContract::Plan));
+    let validate = materialize_prompt(sample_input(ExecutionContract::Validate));
     let implement = materialize_prompt(sample_input(ExecutionContract::Implement));
+    let review = materialize_prompt(sample_input(ExecutionContract::Review));
+    let compound = materialize_prompt(sample_input(ExecutionContract::Compound));
     let single = materialize_prompt(sample_input(ExecutionContract::SingleTask));
     let retry = materialize_prompt(sample_input(ExecutionContract::RetryRescue));
 
     assert!(
+        explore
+            .rendered_prompt
+            .contains("Explore the task space first")
+    );
+    assert!(plan.rendered_prompt.contains("Plan the work concretely"));
+    assert!(plan.rendered_prompt.contains("TASK: <short title> ::"));
+    assert!(
+        validate
+            .rendered_prompt
+            .contains("Validate the current plan aggressively")
+    );
+    assert!(
         implement
             .rendered_prompt
             .contains("Implement the requested change directly")
+    );
+    assert!(
+        review
+            .rendered_prompt
+            .contains("Review the completed work with fresh eyes")
+    );
+    assert!(
+        compound
+            .rendered_prompt
+            .contains("Capture durable learnings from the completed work")
     );
     assert!(
         single

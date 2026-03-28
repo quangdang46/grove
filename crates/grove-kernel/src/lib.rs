@@ -9,7 +9,7 @@ pub mod status_view;
 
 use anyhow::{Context, Result};
 use camino::Utf8Path;
-use grove_br::{BrClient, BrDependencySnapshot};
+use grove_br::{BrClient, BrCreateIssueInput, BrDependencySnapshot};
 use grove_bv::BvTriageOutput;
 use grove_config::{
     DEFAULT_CHECKPOINTS_DIR_NAME, DEFAULT_GROVE_DIR_NAME, DEFAULT_LOGS_DIR_NAME, GroveConfig,
@@ -26,7 +26,7 @@ use grove_session::{
 use grove_types::{
     AgentActivity, BeadId, CheckpointId, CircuitState, FailureClass, GroveBeadRecord,
     GroveBeadStatus, ProgressSignal, ReservationConflict, ReservationMode, ReservationRecord,
-    RunId, RunStatus, SessionStatus, Timestamp,
+    RunId, RunStatus, SessionStatus, Timestamp, WorkflowPhase, WorkflowState,
 };
 use std::{
     collections::BTreeMap,
@@ -900,6 +900,160 @@ fn persist_success_handoff(
         completed_at,
     })
     .map(Some)
+}
+
+pub(crate) fn continue_workflow_after_success<C: BrClient>(
+    db: &mut Database,
+    br: &C,
+    bead_id: &BeadId,
+    run_id: &RunId,
+    handoff: Option<&grove_types::HandoffRecord>,
+) -> Result<bool> {
+    let Some(bead) = db.get_bead_record(bead_id)? else {
+        return Ok(true);
+    };
+    let Some(workflow_state) = bead.workflow_state() else {
+        return Ok(true);
+    };
+    let Some(next_phase) = workflow_state.phase.next() else {
+        return Ok(true);
+    };
+
+    let advanced_at = handoff
+        .map(|record| record.completed_at)
+        .unwrap_or_else(chrono::Utc::now);
+
+    if workflow_state.phase == WorkflowPhase::Plan
+        && let Some(plan_handoff) = handoff
+    {
+        beadify_plan_phase(db, br, &bead, run_id, plan_handoff)?;
+    }
+
+    db.advance_bead_workflow(
+        bead_id,
+        &WorkflowState::new(next_phase),
+        run_id,
+        &advanced_at,
+    )?;
+    Ok(false)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedChildTask {
+    title: String,
+    description: String,
+}
+
+fn beadify_plan_phase<C: BrClient>(
+    db: &mut Database,
+    br: &C,
+    bead: &GroveBeadRecord,
+    run_id: &RunId,
+    handoff: &grove_types::HandoffRecord,
+) -> Result<()> {
+    let existing_dependencies = br.dep_list(&bead.bead.id)?;
+    if !existing_dependencies.blocked_by.is_empty() {
+        return Ok(());
+    }
+
+    let planned_tasks = extract_planned_child_tasks(bead, handoff);
+    let mut created_ids = Vec::new();
+    for task in planned_tasks {
+        let created = br.create_issue(&BrCreateIssueInput {
+            title: task.title,
+            description: Some(task.description),
+            priority: bead.bead.priority,
+            issue_type: "task".to_owned(),
+            labels: vec![
+                "grove:generated".to_owned(),
+                format!("grove:child-of:{}", bead.bead.id.as_str()),
+            ],
+        })?;
+        br.add_dependency(&bead.bead.id, &created.summary.id)?;
+        created_ids.push(created.summary.id.as_str().to_owned());
+    }
+
+    db.write_event_log(
+        grove_types::EventKind::RecoveryActionTaken,
+        Some(&bead.bead.id),
+        Some(run_id),
+        None,
+        &serde_json::json!({
+            "action": "workflow_plan_beadified",
+            "created_child_ids": created_ids,
+            "task_count": created_ids.len(),
+        }),
+        &handoff.completed_at,
+    )?;
+    Ok(())
+}
+
+fn extract_planned_child_tasks(
+    bead: &GroveBeadRecord,
+    handoff: &grove_types::HandoffRecord,
+) -> Vec<PlannedChildTask> {
+    let mut tasks = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    for decision in &handoff.decisions {
+        if let Some(task) = parse_planned_child_task(decision)
+            && seen.insert(task.title.to_ascii_lowercase())
+        {
+            tasks.push(task);
+        }
+    }
+
+    if tasks.is_empty() {
+        let summary = handoff.summary.trim();
+        tasks.push(PlannedChildTask {
+            title: format!("Implement {}", bead.bead.title),
+            description: if summary.is_empty() {
+                format!(
+                    "Execution task generated from workflow plan for {}.",
+                    bead.bead.id.as_str()
+                )
+            } else {
+                format!(
+                    "Execution task generated from workflow plan for {}.\n\nPlan summary: {}",
+                    bead.bead.id.as_str(),
+                    summary
+                )
+            },
+        });
+    }
+
+    tasks.truncate(8);
+    tasks
+}
+
+fn parse_planned_child_task(raw: &str) -> Option<PlannedChildTask> {
+    let trimmed = raw.trim();
+    let prefix = if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("TASK:") {
+        5
+    } else if trimmed.len() >= 15 && trimmed[..15].eq_ignore_ascii_case("EXECUTION_TASK:") {
+        15
+    } else {
+        return None;
+    };
+
+    let body = trimmed[prefix..].trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    let (title, description) = if let Some((title, description)) = body.split_once("::") {
+        (title.trim(), description.trim())
+    } else {
+        (body, "Implement this planned slice.")
+    };
+    if title.is_empty() {
+        return None;
+    }
+
+    Some(PlannedChildTask {
+        title: title.to_owned(),
+        description: description.to_owned(),
+    })
 }
 
 pub fn parent_handoff_summaries(db: &Database, bead_id: &BeadId) -> Result<Vec<String>> {

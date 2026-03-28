@@ -14,6 +14,7 @@ use grove_types::{
     LeaderLeaseRecord, MirrorOutboxRecord, MirrorStatus, PromptId, RecoveryCapsule,
     RecoveryCapsuleOutcome, ReservationConflict, ReservationMode, ReservationRecord, RunId,
     RunStatus, RuntimeProvider, SessionId, SessionStatus, StopReason, TaskRunRecord, Timestamp,
+    WorkflowState,
 };
 
 mod archive;
@@ -233,6 +234,11 @@ const MIGRATION_MANIFEST: &[Migration<'_>] = &[
         version: 12,
         name: "0012_session_provider.sql",
         sql: include_str!("../migrations/0012_session_provider.sql"),
+    },
+    Migration {
+        version: 13,
+        name: "0013_multi_phase_handoffs.sql",
+        sql: include_str!("../migrations/0013_multi_phase_handoffs.sql"),
     },
 ];
 
@@ -1151,6 +1157,69 @@ impl Database {
             .with_context(|| format!("query inserted handoff for {}", input.bead_id.as_str()))?;
         tx.commit().context("commit handoff write transaction")?;
         raw_handoff_into_record(raw)
+    }
+
+    pub fn advance_bead_workflow(
+        &mut self,
+        bead_id: &BeadId,
+        workflow_state: &WorkflowState,
+        run_id: &RunId,
+        advanced_at: &chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("begin workflow advance transaction")?;
+        ensure_bead_exists(&tx, bead_id)?;
+        ensure_run_exists(&tx, run_id)?;
+        ensure_run_belongs_to_bead(&tx, run_id, bead_id)?;
+
+        let metadata = current_runtime_metadata_tx(&tx, bead_id)?;
+        let metadata_json = serde_json::to_string(&workflow_state.apply_to_metadata(&metadata))
+            .context("serialize advanced workflow metadata")?;
+        let advanced_at_text = timestamp_string(advanced_at);
+
+        tx.execute(
+            "INSERT INTO bead_runtime(\
+                bead_id, grove_status, declared_paths_json, metadata_json, last_run_id, retry_after,\
+                last_failure_class, last_failure_detail, circuit_breaker_json, runtime_updated_at\
+             ) VALUES (\
+                ?1, ?2, COALESCE((SELECT declared_paths_json FROM bead_runtime WHERE bead_id = ?1), '[]'),\
+                ?3, ?4, NULL, NULL, NULL, COALESCE((SELECT circuit_breaker_json FROM bead_runtime WHERE bead_id = ?1), NULL), ?5\
+             ) \
+             ON CONFLICT(bead_id) DO UPDATE SET \
+                grove_status = excluded.grove_status,\
+                metadata_json = excluded.metadata_json,\
+                last_run_id = excluded.last_run_id,\
+                retry_after = NULL,\
+                last_failure_class = NULL,\
+                last_failure_detail = NULL,\
+                runtime_updated_at = excluded.runtime_updated_at",
+            params![
+                bead_id.as_str(),
+                encode_grove_bead_status(GroveBeadStatus::Ready),
+                metadata_json,
+                run_id.as_str(),
+                advanced_at_text,
+            ],
+        )
+        .with_context(|| format!("advance workflow for {}", bead_id.as_str()))?;
+
+        insert_event_log_tx(
+            &tx,
+            EventKind::RecoveryActionTaken,
+            Some(bead_id),
+            Some(run_id),
+            None,
+            &serde_json::json!({
+                "action": "workflow_phase_advanced",
+                "phase": workflow_state.phase.as_str(),
+            }),
+            advanced_at,
+        )?;
+
+        tx.commit().context("commit workflow advance transaction")?;
+        Ok(())
     }
 
     pub fn parent_handoffs_for_bead(&self, bead_id: &BeadId) -> Result<Vec<HandoffRecord>> {
@@ -2747,6 +2816,20 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
             .with_context(|| format!("apply SQLite pragma {pragma}"))?;
     }
     Ok(())
+}
+
+fn current_runtime_metadata_tx(tx: &Transaction<'_>, bead_id: &BeadId) -> Result<Value> {
+    let metadata_json = tx
+        .query_row(
+            "SELECT metadata_json FROM bead_runtime WHERE bead_id = ?1",
+            [bead_id.as_str()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .with_context(|| format!("query runtime metadata for {}", bead_id.as_str()))?
+        .flatten()
+        .unwrap_or_else(|| "{}".to_owned());
+    parse_json(&metadata_json, "runtime metadata")
 }
 
 fn begin_immediate_tx<'conn>(

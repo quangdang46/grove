@@ -2397,6 +2397,9 @@ fn print_status_view(
                 format_priority(bead.priority),
                 bead.title
             );
+            if let Some(workflow_phase) = bead.workflow_phase.as_deref() {
+                println!("  workflow: {workflow_phase}");
+            }
             println!("  run: {}", display_option(bead.run_id.as_ref()));
             println!("  session: {}", display_option(bead.session_id.as_ref()));
             println!("  started: {}", display_option(bead.started_at.as_ref()));
@@ -2421,6 +2424,9 @@ fn print_status_view(
                 format_score(entry.score),
                 entry.dispatch.summary()
             );
+            if let Some(workflow_phase) = entry.workflow_phase.as_deref() {
+                println!("  workflow: {workflow_phase}");
+            }
             if !entry.why.is_empty() {
                 println!("  why: {}", entry.why.join(", "));
             }
@@ -2455,6 +2461,9 @@ fn print_status_view(
     } else {
         for bead in &view.checkpointed_beads {
             println!("- {} {}", bead.bead_id, bead.title);
+            if let Some(workflow_phase) = bead.workflow_phase.as_deref() {
+                println!("  workflow: {workflow_phase}");
+            }
             println!("  run: {}", display_option(bead.run_id.as_ref()));
             println!(
                 "  checkpoint: {}",
@@ -2484,6 +2493,9 @@ fn print_status_view(
                 format_priority(bead.priority),
                 bead.title
             );
+            if let Some(workflow_phase) = bead.workflow_phase.as_deref() {
+                println!("  workflow: {workflow_phase}");
+            }
             println!("  run: {}", display_option(bead.run_id.as_ref()));
             println!(
                 "  failure class: {}",
@@ -2621,6 +2633,10 @@ fn print_inspect_report(
         Some(view) => {
             println!("\nGrove runtime:");
             println!("- status: {:?}", view.bead.grove_status);
+            println!(
+                "- workflow phase: {}",
+                display_option(view.workflow_phase.as_deref())
+            );
             println!("- synced at: {}", view.bead.synced_at);
             println!("- runtime updated: {}", view.bead.runtime_updated_at);
             println!(

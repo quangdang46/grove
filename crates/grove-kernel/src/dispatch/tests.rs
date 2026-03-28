@@ -1,15 +1,16 @@
 use super::*;
 use grove_br::{
-    BeadCacheStore, BrCapability, BrDependencySnapshot, BrError, BrIssueDetail, BrIssueSummary,
-    BrVersion,
+    BeadCacheStore, BrCapability, BrCreateIssueInput, BrDependencySnapshot, BrError, BrIssueDetail,
+    BrIssueSummary, BrVersion,
 };
 use grove_session::CliClaudeBackend;
 use grove_types::{
     BeadId, BeadPriority, BeadRef, CircuitBreakerState, CircuitState, GroveBeadRecord,
     GroveBeadStatus, Timestamp,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
+use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -69,26 +70,101 @@ fn bead_summary(bead_id: &str, priority: BeadPriority) -> TestResult<BrIssueSumm
 
 #[derive(Clone)]
 struct TestBrClient {
-    ready: Vec<BrIssueSummary>,
-    open: Vec<BrIssueSummary>,
+    state: Arc<Mutex<TestBrState>>,
     fail_mirror: bool,
     mirror_delay: Duration,
 }
 
+#[derive(Debug, Default)]
+struct TestBrState {
+    issues: BTreeMap<String, BrIssueSummary>,
+    blocked_by: BTreeMap<String, Vec<BeadId>>,
+    next_generated_id: usize,
+}
+
+impl TestBrClient {
+    fn new(open: Vec<BrIssueSummary>, fail_mirror: bool, mirror_delay: Duration) -> Self {
+        let issues = open
+            .into_iter()
+            .map(|issue| (issue.id.as_str().to_owned(), issue))
+            .collect();
+        Self {
+            state: Arc::new(Mutex::new(TestBrState {
+                issues,
+                blocked_by: BTreeMap::new(),
+                next_generated_id: 1,
+            })),
+            fail_mirror,
+            mirror_delay,
+        }
+    }
+
+    fn all_issue_ids(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("lock test br state")
+            .issues
+            .keys()
+            .cloned()
+            .collect()
+    }
+}
+
 impl BrClient for TestBrClient {
     fn ready(&self) -> Result<Vec<BrIssueSummary>, BrError> {
-        Ok(self.ready.clone())
+        let state = self.state.lock().expect("lock test br state");
+        let ready = state
+            .issues
+            .values()
+            .filter(|issue| issue.status == "open")
+            .filter(|issue| {
+                state
+                    .blocked_by
+                    .get(issue.id.as_str())
+                    .into_iter()
+                    .flatten()
+                    .all(|dependency| {
+                        state
+                            .issues
+                            .get(dependency.as_str())
+                            .is_none_or(|candidate| candidate.status == "closed")
+                    })
+            })
+            .cloned()
+            .collect();
+        Ok(ready)
     }
 
     fn list_open(&self) -> Result<Vec<BrIssueSummary>, BrError> {
-        Ok(self.open.clone())
+        let state = self.state.lock().expect("lock test br state");
+        let issues = state
+            .issues
+            .values()
+            .filter(|issue| issue.status != "closed")
+            .map(|issue| {
+                let mut issue = issue.clone();
+                issue.blocked_by = state
+                    .blocked_by
+                    .get(issue.id.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                issue.blocks = state
+                    .blocked_by
+                    .iter()
+                    .filter(|(_, dependencies)| dependencies.iter().any(|dep| dep == &issue.id))
+                    .map(|(candidate_id, _)| BeadId::new(candidate_id.clone()))
+                    .collect();
+                issue
+            })
+            .collect();
+        Ok(issues)
     }
 
     fn show(&self, id: &BeadId) -> Result<BrIssueDetail, BrError> {
-        let summary = self
-            .open
-            .iter()
-            .find(|bead| bead.id == *id)
+        let state = self.state.lock().expect("lock test br state");
+        let summary = state
+            .issues
+            .get(id.as_str())
             .cloned()
             .ok_or_else(|| BrError::BeadNotFound { id: id.clone() })?;
         Ok(BrIssueDetail {
@@ -101,10 +177,20 @@ impl BrClient for TestBrClient {
     }
 
     fn dep_list(&self, id: &BeadId) -> Result<BrDependencySnapshot, BrError> {
+        let state = self.state.lock().expect("lock test br state");
         Ok(BrDependencySnapshot {
             bead_id: id.clone(),
-            blocked_by: Vec::new(),
-            blocks: Vec::new(),
+            blocked_by: state
+                .blocked_by
+                .get(id.as_str())
+                .cloned()
+                .unwrap_or_default(),
+            blocks: state
+                .blocked_by
+                .iter()
+                .filter(|(_, dependencies)| dependencies.iter().any(|dep| dep == id))
+                .map(|(candidate_id, _)| BeadId::new(candidate_id.clone()))
+                .collect(),
             rows: Vec::new(),
         })
     }
@@ -123,7 +209,53 @@ impl BrClient for TestBrClient {
         })
     }
 
+    fn create_issue(&self, input: &BrCreateIssueInput) -> Result<BrIssueDetail, BrError> {
+        let mut state = self.state.lock().expect("lock test br state");
+        let id = BeadId::new(format!("bd-generated-{}", state.next_generated_id));
+        state.next_generated_id += 1;
+        let created_at: Timestamp = "2026-03-20T05:00:00Z".parse().expect("timestamp");
+        let summary = BrIssueSummary {
+            id: id.clone(),
+            title: input.title.clone(),
+            description: input.description.clone(),
+            priority: input.priority,
+            issue_type: input.issue_type.clone(),
+            status: "open".to_owned(),
+            assignee: None,
+            labels: input.labels.clone(),
+            created_at,
+            updated_at: created_at,
+            blocked_by: Vec::new(),
+            blocks: Vec::new(),
+            raw_json: serde_json::json!({}),
+        };
+        state.issues.insert(id.as_str().to_owned(), summary.clone());
+        Ok(BrIssueDetail {
+            summary,
+            closed_at: None,
+            close_reason: None,
+            comments: Vec::new(),
+            metadata: serde_json::json!({}),
+        })
+    }
+
+    fn add_dependency(&self, issue: &BeadId, depends_on: &BeadId) -> Result<(), BrError> {
+        let mut state = self.state.lock().expect("lock test br state");
+        state
+            .blocked_by
+            .entry(issue.as_str().to_owned())
+            .or_default()
+            .push(depends_on.clone());
+        Ok(())
+    }
+
     fn close_bead(&self, _id: &BeadId, _reason: Option<&str>) -> Result<(), BrError> {
+        if _id.as_str().starts_with("bd-generated-") || _id.as_str().starts_with("grove-mirror") {
+            let mut state = self.state.lock().expect("lock test br state");
+            if let Some(issue) = state.issues.get_mut(_id.as_str()) {
+                issue.status = "closed".to_owned();
+            }
+        }
         Ok(())
     }
 
@@ -135,7 +267,7 @@ impl BrClient for TestBrClient {
         &self,
         id: &BeadId,
         _handoff: &grove_types::HandoffRecord,
-        _close_bead: bool,
+        close_bead: bool,
     ) -> Result<(), BrError> {
         if !self.mirror_delay.is_zero() {
             std::thread::sleep(self.mirror_delay);
@@ -148,6 +280,9 @@ impl BrClient for TestBrClient {
                 stderr: format!("failed to mirror {}", id.as_str()),
             })
         } else {
+            if close_bead {
+                self.close_bead(id, Some("Completed successfully"))?;
+            }
             Ok(())
         }
     }
@@ -271,12 +406,11 @@ fn dispatch_loop_drains_inflight_workers_when_leader_lease_is_lost() -> TestResu
     fs::set_permissions(&script_path, permissions)?;
 
     let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
-    let br = TestBrClient {
-        ready: vec![bead_summary("grove-a", BeadPriority::P0)?],
-        open: vec![bead_summary("grove-a", BeadPriority::P0)?],
-        fail_mirror: false,
-        mirror_delay: Duration::ZERO,
-    };
+    let br = TestBrClient::new(
+        vec![bead_summary("grove-a", BeadPriority::P0)?],
+        false,
+        Duration::ZERO,
+    );
     let mut config = GroveConfig::default();
     config.scheduler.max_parallel = 1;
     config.scheduler.poll_interval_ms = 10;
@@ -309,6 +443,85 @@ fn dispatch_loop_drains_inflight_workers_when_leader_lease_is_lost() -> TestResu
     let runs = db.list_task_runs_for_bead(&BeadId::new("grove-a"))?;
     assert_eq!(runs.len(), 1, "expected one persisted run");
     assert_ne!(runs[0].status, grove_types::RunStatus::Active);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn workflow_labeled_bead_advances_across_multiple_internal_phases() -> TestResult {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    fs::create_dir_all(workspace_dir.join(".grove"))?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| std::io::Error::other("workspace dir must be valid UTF-8"))?;
+    let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+        .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+
+    let mut db = Database::open(&db_path)?;
+    db.migrate()?;
+
+    let mut workflow_bead = bead_summary("grove-feature", BeadPriority::P0)?;
+    workflow_bead.issue_type = "feature".to_owned();
+    db.upsert_bead_cache(&workflow_bead)?;
+    db.set_grove_status(&workflow_bead.id, GroveBeadStatus::Ready)?;
+
+    let script_path = dir.path().join("workflow-claude");
+    fs::write(
+        &script_path,
+        "#!/bin/sh\nprintf 'GROVE_RESULT: phase complete\\nGROVE_LESSONS: [\"keep workflow moving\"]\\nGROVE_EXIT: true\\nimplementation complete\\n'\n",
+    )?;
+    let mut permissions = fs::metadata(&script_path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions)?;
+
+    let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+    let br = TestBrClient::new(vec![workflow_bead.clone()], false, Duration::ZERO);
+    let mut config = GroveConfig::default();
+    config.scheduler.max_parallel = 1;
+    config.scheduler.poll_interval_ms = 5;
+    let lease_config = LeaderLeaseConfig {
+        owner_label: "workflow-owner".to_owned(),
+        lease_ttl: chrono::Duration::seconds(5),
+    };
+    let loop_config = DispatchLoopConfig {
+        max_total_runs: Some(7),
+        max_poll_cycles: Some(50),
+        working_dir: workspace_dir,
+        shutdown_signal: ShutdownSignal::new(),
+        db_path,
+    };
+
+    let outcome = run_dispatch_loop(&mut db, &backend, &br, &config, &lease_config, &loop_config)?;
+    assert!(matches!(
+        outcome.exit_reason,
+        DispatchExitReason::MaxRunsReached
+    ));
+
+    let runs = db.list_task_runs_for_bead(&workflow_bead.id)?;
+    assert_eq!(
+        runs.len(),
+        6,
+        "workflow bead should execute one run per phase"
+    );
+
+    let record = db
+        .get_bead_record(&workflow_bead.id)?
+        .ok_or_else(|| std::io::Error::other("workflow bead record missing"))?;
+    assert_eq!(record.grove_status, GroveBeadStatus::Succeeded);
+    assert_eq!(
+        record.workflow_state().map(|state| state.phase),
+        Some(grove_types::WorkflowPhase::Compound)
+    );
+    assert!(
+        br.all_issue_ids()
+            .iter()
+            .any(|id| id.starts_with("bd-generated-")),
+        "workflow plan phase should create at least one generated child bead"
+    );
+
     Ok(())
 }
 
@@ -357,12 +570,7 @@ fn process_mirror_outbox_can_take_longer_than_short_lease_ttl() -> TestResult {
     };
     db.enqueue_mirror_outbox(&bead.id, &run_id, &handoff, true)?;
 
-    let br = TestBrClient {
-        ready: Vec::new(),
-        open: vec![bead],
-        fail_mirror: false,
-        mirror_delay: Duration::from_millis(25),
-    };
+    let br = TestBrClient::new(vec![bead], false, Duration::from_millis(25));
     let config = GroveConfig::default();
 
     let started = std::time::Instant::now();
@@ -403,18 +611,14 @@ fn dispatch_loop_persists_multiple_inflight_runs_up_to_parallel_limit() -> TestR
     fs::set_permissions(&script_path, permissions)?;
 
     let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
-    let br = TestBrClient {
-        ready: vec![
+    let br = TestBrClient::new(
+        vec![
             bead_summary("grove-a", BeadPriority::P0)?,
             bead_summary("grove-b", BeadPriority::P1)?,
         ],
-        open: vec![
-            bead_summary("grove-a", BeadPriority::P0)?,
-            bead_summary("grove-b", BeadPriority::P1)?,
-        ],
-        fail_mirror: false,
-        mirror_delay: Duration::ZERO,
-    };
+        false,
+        Duration::ZERO,
+    );
     let mut config = GroveConfig::default();
     config.scheduler.max_parallel = 2;
     config.scheduler.poll_interval_ms = 10;
@@ -459,12 +663,7 @@ fn dispatch_loop_exits_queue_empty_when_ready_beads_are_all_locally_suppressed()
     db.upsert_bead_cache(&suppressed)?;
     db.set_grove_status(&suppressed.id, GroveBeadStatus::Failed)?;
 
-    let br = TestBrClient {
-        ready: vec![suppressed.clone()],
-        open: vec![suppressed],
-        fail_mirror: false,
-        mirror_delay: Duration::ZERO,
-    };
+    let br = TestBrClient::new(vec![suppressed], false, Duration::ZERO);
     let mut config = GroveConfig::default();
     config.scheduler.max_parallel = 1;
     config.scheduler.poll_interval_ms = 10;
@@ -594,12 +793,11 @@ fn dispatch_loop_survives_slow_mirror_outbox_with_short_lease_ttl() -> TestResul
     };
     db.enqueue_mirror_outbox(&mirror_bead, &run_id, &handoff, true)?;
 
-    let br = TestBrClient {
-        ready: Vec::new(),
-        open: vec![bead_summary(mirror_bead.as_str(), BeadPriority::P0)?],
-        fail_mirror: false,
-        mirror_delay: Duration::from_millis(25),
-    };
+    let br = TestBrClient::new(
+        vec![bead_summary(mirror_bead.as_str(), BeadPriority::P0)?],
+        false,
+        Duration::from_millis(25),
+    );
     let mut config = GroveConfig::default();
     config.scheduler.max_parallel = 1;
     config.scheduler.poll_interval_ms = 10;
@@ -667,12 +865,7 @@ fn process_mirror_outbox_logs_reaction_for_mirror_failure() -> TestResult {
     };
     db.enqueue_mirror_outbox(&bead.id, &run_id, &handoff, true)?;
 
-    let br = TestBrClient {
-        ready: Vec::new(),
-        open: vec![bead],
-        fail_mirror: true,
-        mirror_delay: Duration::ZERO,
-    };
+    let br = TestBrClient::new(vec![bead], true, Duration::ZERO);
     let config = GroveConfig::default();
     process_mirror_outbox(&mut db, &br, &config)?;
 

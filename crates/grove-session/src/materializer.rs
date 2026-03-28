@@ -268,8 +268,23 @@ fn build_startup_prompt_section(text: &str) -> PromptSegment {
 
 fn build_contract_section(contract: ExecutionContract) -> PromptSegment {
     let text = match contract {
+        ExecutionContract::Explore => {
+            "[EXECUTION CONTRACT]\nExplore the task space first. Clarify missing context, identify constraints, and emit a concrete summary of what must be true before planning proceeds."
+        }
+        ExecutionContract::Plan => {
+            "[EXECUTION CONTRACT]\nPlan the work concretely. Produce an execution-ready approach and decompose it into clear, testable steps without drifting into implementation. For each execution task, emit one GROVE_DECISIONS item in the format `TASK: <short title> :: <what that task will implement>`."
+        }
+        ExecutionContract::Validate => {
+            "[EXECUTION CONTRACT]\nValidate the current plan aggressively. Find weak assumptions, risk points, and missing acceptance criteria before execution continues."
+        }
         ExecutionContract::Implement => {
             "[EXECUTION CONTRACT]\nImplement the requested change directly and keep the scope tight."
+        }
+        ExecutionContract::Review => {
+            "[EXECUTION CONTRACT]\nReview the completed work with fresh eyes. Verify behavior, identify defects or regressions, and fix anything obviously wrong before closure."
+        }
+        ExecutionContract::Compound => {
+            "[EXECUTION CONTRACT]\nCapture durable learnings from the completed work. Summarize lessons, decisions, warnings, and follow-up guidance without reopening settled implementation."
         }
         ExecutionContract::Resume => {
             "[EXECUTION CONTRACT]\nResume from the latest checkpoint and continue the in-progress task without redoing completed work."

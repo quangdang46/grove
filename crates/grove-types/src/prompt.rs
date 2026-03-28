@@ -6,7 +6,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionContract {
+    Explore,
+    Plan,
+    Validate,
     Implement,
+    Review,
+    Compound,
     Resume,
     RetryRescue,
     SingleTask,
@@ -16,7 +21,12 @@ impl ExecutionContract {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Explore => "explore",
+            Self::Plan => "plan",
+            Self::Validate => "validate",
             Self::Implement => "implement",
+            Self::Review => "review",
+            Self::Compound => "compound",
             Self::Resume => "resume",
             Self::RetryRescue => "retry_rescue",
             Self::SingleTask => "single_task",

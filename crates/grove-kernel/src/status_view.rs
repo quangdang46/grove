@@ -105,6 +105,7 @@ impl LeaderLeaseView {
 pub struct RunningBeadView {
     pub bead_id: BeadId,
     pub title: String,
+    pub workflow_phase: Option<String>,
     pub priority: BeadPriority,
     pub br_status: String,
     pub grove_status: GroveBeadStatus,
@@ -119,6 +120,7 @@ pub struct RunningBeadView {
 pub struct ReadyQueueEntry {
     pub bead_id: BeadId,
     pub title: String,
+    pub workflow_phase: Option<String>,
     pub priority: BeadPriority,
     pub score: Option<f64>,
     pub score_breakdown: Vec<ScoreComponentView>,
@@ -140,6 +142,7 @@ pub struct ScoreComponentView {
 pub struct CheckpointedBeadView {
     pub bead_id: BeadId,
     pub title: String,
+    pub workflow_phase: Option<String>,
     pub run_id: Option<RunId>,
     pub checkpoint_id: Option<String>,
     pub progress: Option<String>,
@@ -153,6 +156,7 @@ pub struct CheckpointedBeadView {
 pub struct FailedBeadView {
     pub bead_id: BeadId,
     pub title: String,
+    pub workflow_phase: Option<String>,
     pub priority: BeadPriority,
     pub run_id: Option<RunId>,
     pub failure_class: Option<FailureClass>,
@@ -469,6 +473,9 @@ fn build_running_beads(beads: &[GroveBeadRecord], db: &Database) -> Result<Vec<R
             Ok(RunningBeadView {
                 bead_id: bead.bead.id.clone(),
                 title: bead.bead.title.clone(),
+                workflow_phase: bead
+                    .workflow_state()
+                    .map(|state| state.phase.as_str().to_owned()),
                 priority: bead.bead.priority,
                 br_status: bead.bead.br_status.clone(),
                 grove_status: bead.grove_status,
@@ -550,6 +557,9 @@ fn build_ready_queue(
             Some(ReadyQueueEntry {
                 bead_id: bead.bead.id.clone(),
                 title: bead.bead.title.clone(),
+                workflow_phase: bead
+                    .workflow_state()
+                    .map(|state| state.phase.as_str().to_owned()),
                 priority: bead.bead.priority,
                 score: Some(score),
                 score_breakdown,
@@ -639,6 +649,9 @@ fn build_checkpointed_beads(
             Ok(CheckpointedBeadView {
                 bead_id: bead.bead.id.clone(),
                 title: bead.bead.title.clone(),
+                workflow_phase: bead
+                    .workflow_state()
+                    .map(|state| state.phase.as_str().to_owned()),
                 run_id: bead.last_run_id.clone(),
                 checkpoint_id: checkpoint
                     .as_ref()
@@ -716,6 +729,9 @@ fn build_failed_beads(
         failed.push(FailedBeadView {
             bead_id: bead.bead.id.clone(),
             title: bead.bead.title.clone(),
+            workflow_phase: bead
+                .workflow_state()
+                .map(|state| state.phase.as_str().to_owned()),
             priority: bead.bead.priority,
             run_id: bead.last_run_id.clone(),
             failure_class: bead.last_failure_class,

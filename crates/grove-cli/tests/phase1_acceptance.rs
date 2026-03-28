@@ -92,7 +92,7 @@ fn init_creates_database_with_migrations() -> TestResult {
     let applied_migrations = db.applied_migrations()?;
     assert_eq!(
         applied_migrations.len(),
-        12,
+        13,
         "should apply all current migrations"
     );
     assert_eq!(applied_migrations[0].version, 1);
@@ -123,7 +123,7 @@ fn init_creates_database_with_migrations() -> TestResult {
         applied_migrations[10].name,
         "0011_circuit_breaker_state.sql"
     );
-    assert_eq!(applied_migrations[11].version, 12);
+    assert_eq!(applied_migrations[12].version, 13);
     assert_eq!(applied_migrations[11].name, "0012_session_provider.sql");
 
     // Verify tables exist by attempting to query them
@@ -1768,6 +1768,41 @@ impl BrClient for FakeBrClient {
             }),
             beads_dir_exists: true,
         })
+    }
+
+    fn create_issue(
+        &self,
+        input: &grove_br::BrCreateIssueInput,
+    ) -> anyhow::Result<grove_br::BrIssueDetail, grove_br::BrError> {
+        Ok(grove_br::BrIssueDetail {
+            summary: BrIssueSummary {
+                id: BeadId::new("bd-created"),
+                title: input.title.clone(),
+                description: input.description.clone(),
+                priority: input.priority,
+                issue_type: input.issue_type.clone(),
+                status: "open".to_owned(),
+                assignee: None,
+                labels: input.labels.clone(),
+                created_at: "2026-03-20T05:00:00Z".parse().expect("timestamp"),
+                updated_at: "2026-03-20T05:00:00Z".parse().expect("timestamp"),
+                blocked_by: vec![],
+                blocks: vec![],
+                raw_json: serde_json::json!({}),
+            },
+            closed_at: None,
+            close_reason: None,
+            comments: vec![],
+            metadata: serde_json::json!({}),
+        })
+    }
+
+    fn add_dependency(
+        &self,
+        _issue: &BeadId,
+        _depends_on: &BeadId,
+    ) -> anyhow::Result<(), grove_br::BrError> {
+        Ok(())
     }
 
     fn close_bead(
