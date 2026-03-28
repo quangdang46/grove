@@ -18,7 +18,8 @@ use grove_session::{
 use grove_types::{
     BeadId, ClaudeSessionRecord, ContextPressureLevel, EscalationTier, ExecutionContract,
     FailureClass, IterationAnalysis, ProgressSignal, PromptId, PromptManifest, PromptSegmentKind,
-    RunId, SessionId, SessionOutcome, SessionStatus, SessionTerminalClass, StopReason,
+    RunId, RuntimeProvider, SessionId, SessionOutcome, SessionStatus, SessionTerminalClass,
+    StopReason,
 };
 use tempfile::tempdir;
 
@@ -44,6 +45,7 @@ fn sample_request(workspace_dir: Utf8PathBuf) -> SingleTaskSessionRequest {
         bead_id: BeadId::new("grove-1j9.6.9"),
         run_id: RunId::new("run-1"),
         session_id: SessionId::new("ses-1"),
+        provider: RuntimeProvider::Claude,
         prompt_id: PromptId::new("prompt-1"),
         task_title: "Phase 2 acceptance coverage".to_owned(),
         task_description: "Prove one-task execution semantics before Phase 3 depends on them."
@@ -87,6 +89,7 @@ fn sample_previous_outcome(
         session: ClaudeSessionRecord {
             id: SessionId::new("ses-prev"),
             run_id: RunId::new("run-prev"),
+            provider: RuntimeProvider::Claude,
             external_session_id: None,
             ordinal_in_run: 1,
             status: SessionStatus::UnknownFailure,

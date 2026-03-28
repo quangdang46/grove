@@ -8,9 +8,11 @@ pub const DEFAULT_INIT_GROVE_TOML: &str = r#"# Grove orchestration configuration
 # See the grove README "Config" section for full documentation.
 
 [runtime]
-# Executable name or path for the Claude CLI (must be on PATH unless you use an absolute path).
-claude_bin = "claude"
-# Model passed to `claude --model`. Use "default" to omit --model and let the CLI pick; otherwise e.g. "sonnet", "opus".
+# Runtime provider used for Grove task sessions: `claude` or `codex`.
+provider = "claude"
+# Executable name or path for the selected provider CLI (must be on PATH unless you use an absolute path).
+provider_bin = "claude"
+# Model passed to the selected provider. Use "default" to omit the model flag and let the CLI pick.
 default_model = "default"
 # Directory Grove treats as the project root (relative to this file, or absolute).
 workspace_root = "."
@@ -20,7 +22,7 @@ timeout_minutes = 60
 startup_prompt_path = ".grove/startup_prompt.md"
 
 [scheduler]
-# Maximum concurrent Claude sessions (still subject to reservation safety).
+# Maximum concurrent provider sessions (still subject to reservation safety).
 max_parallel = 5
 # How often the scheduler wakes to check for ready work (milliseconds).
 poll_interval_ms = 1000

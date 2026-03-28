@@ -1,6 +1,40 @@
 use crate::{PromptId, ProtocolEvent, SessionId, Timestamp, errors::InvalidTransition};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeProvider {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl RuntimeProvider {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    #[must_use]
+    pub const fn default_bin(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    #[must_use]
+    pub const fn skill_invocation(self) -> &'static str {
+        match self {
+            Self::Claude => "/skill",
+            Self::Codex => "$skill",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionStatus {
     Starting,
@@ -87,6 +121,7 @@ pub struct IterationAnalysis {
 pub struct ClaudeSessionRecord {
     pub id: SessionId,
     pub run_id: crate::RunId,
+    pub provider: RuntimeProvider,
     pub external_session_id: Option<String>,
     pub ordinal_in_run: i32,
     pub status: SessionStatus,

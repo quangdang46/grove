@@ -10,8 +10,8 @@ use chrono::Utc;
 use grove_types::{
     AgentActivity, BeadId, ClaudeSessionRecord, ContextPressureLevel, EscalationContext,
     EscalationTier, ExecutionContract, FailureClass, MutationStrategy, PromptId, ProtocolEvent,
-    ProtocolState, RunId, SessionId, SessionOutcome, SessionStatus, SessionTerminalClass,
-    StopReason,
+    ProtocolState, RunId, RuntimeProvider, SessionId, SessionOutcome, SessionStatus,
+    SessionTerminalClass, StopReason,
 };
 use std::{
     fs,
@@ -46,6 +46,7 @@ pub struct SingleTaskSessionRequest {
     pub bead_id: BeadId,
     pub run_id: RunId,
     pub session_id: SessionId,
+    pub provider: RuntimeProvider,
     pub prompt_id: PromptId,
     pub task_title: String,
     pub task_description: String,
@@ -275,6 +276,7 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
     let started_session = ClaudeSessionRecord {
         id: request.session_id.clone(),
         run_id: request.run_id.clone(),
+        provider: request.provider,
         external_session_id: None,
         ordinal_in_run: request.ordinal_in_run,
         status: SessionStatus::Running,
@@ -301,6 +303,7 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
 
     let result = (|| {
         let mut running = backend.start(StartSessionRequest {
+            provider: request.provider,
             model: request.model.clone(),
             prompt: materialized.rendered_prompt.clone(),
             working_dir: request.working_dir.clone(),
@@ -484,6 +487,7 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
         let session = ClaudeSessionRecord {
             id: request.session_id.clone(),
             run_id: request.run_id.clone(),
+            provider: request.provider,
             external_session_id: None,
             ordinal_in_run: request.ordinal_in_run,
             status: if forced_shutdown {
@@ -634,6 +638,7 @@ fn failure_result_from_error(
     let session = ClaudeSessionRecord {
         id: request.session_id.clone(),
         run_id: request.run_id.clone(),
+        provider: request.provider,
         external_session_id: None,
         ordinal_in_run: request.ordinal_in_run,
         status: status_from_terminal_class(terminal_class),
@@ -738,6 +743,7 @@ mod tests {
     use crate::{CliClaudeBackend, replay_transcript};
     use grove_types::{
         FailureClass, IterationAnalysis, ProgressSignal, PromptManifest, PromptSegmentKind,
+        RuntimeProvider,
     };
     use std::{error::Error, fs, io, time::Duration};
     use tempfile::tempdir;
@@ -768,6 +774,7 @@ exit "${EXIT_CODE:-0}"
             bead_id: BeadId::new("grove-1j9.6.8"),
             run_id: RunId::new("run-1"),
             session_id: SessionId::new("ses-1"),
+            provider: RuntimeProvider::Claude,
             prompt_id: PromptId::new("prompt-1"),
             task_title: "Implement single task runner".to_owned(),
             task_description: "Wire the session subsystem end to end.".to_owned(),
@@ -996,6 +1003,7 @@ exit "${EXIT_CODE:-0}"
             session: ClaudeSessionRecord {
                 id: SessionId::new("ses-prev"),
                 run_id: RunId::new("run-prev"),
+                provider: RuntimeProvider::Claude,
                 external_session_id: None,
                 ordinal_in_run: 1,
                 status: SessionStatus::UnknownFailure,

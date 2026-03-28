@@ -52,8 +52,8 @@ pub use run::{
 };
 pub use session::{
     CircuitBreakerState, CircuitState, ClaudeSessionRecord, ContextPressureLevel,
-    IterationAnalysis, ProgressSignal, SessionOutcome, SessionStatus, SessionTerminalClass,
-    StopReason, TranscriptEvent,
+    IterationAnalysis, ProgressSignal, RuntimeProvider, SessionOutcome, SessionStatus,
+    SessionTerminalClass, StopReason, TranscriptEvent,
 };
 pub use task::{BeadRef, BeadRuntimePatch, GroveBeadRecord, GroveBeadStatus};
 pub use time::Timestamp;

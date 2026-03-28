@@ -13,7 +13,7 @@ use grove_types::{
     EventLogRecord, EventOutcome, FailureClass, GroveBeadRecord, GroveBeadStatus, HandoffRecord,
     LeaderLeaseRecord, MirrorOutboxRecord, MirrorStatus, PromptId, RecoveryCapsule,
     RecoveryCapsuleOutcome, ReservationConflict, ReservationMode, ReservationRecord, RunId,
-    RunStatus, SessionId, SessionStatus, StopReason, TaskRunRecord, Timestamp,
+    RunStatus, RuntimeProvider, SessionId, SessionStatus, StopReason, TaskRunRecord, Timestamp,
 };
 
 mod archive;
@@ -229,6 +229,11 @@ const MIGRATION_MANIFEST: &[Migration<'_>] = &[
         name: "0011_circuit_breaker_state.sql",
         sql: include_str!("../migrations/0011_circuit_breaker_state.sql"),
     },
+    Migration {
+        version: 12,
+        name: "0012_session_provider.sql",
+        sql: include_str!("../migrations/0012_session_provider.sql"),
+    },
 ];
 
 #[derive(Debug)]
@@ -294,6 +299,7 @@ struct RawTaskRunRow {
 struct RawSessionRow {
     id: String,
     run_id: String,
+    provider: String,
     external_session_id: Option<String>,
     ordinal_in_run: i32,
     status: String,
@@ -636,11 +642,12 @@ impl Database {
         ensure_run_belongs_to_bead(&tx, &session.run_id, bead_id)?;
         tx.execute(
             "INSERT INTO claude_sessions(\
-                id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, prompt_id, prompt_manifest_path, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                id, run_id, provider, external_session_id, ordinal_in_run, status, started_at, ended_at, prompt_id, prompt_manifest_path, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 session.id.as_str(),
                 session.run_id.as_str(),
+                session.provider.as_str(),
                 session.external_session_id.as_deref(),
                 session.ordinal_in_run,
                 encode_session_status(session.status),
@@ -705,10 +712,11 @@ impl Database {
         ensure_session_belongs_to_run(&tx, &session.id, &session.run_id)?;
         tx.execute(
             "UPDATE claude_sessions SET \
-                external_session_id = ?2, ordinal_in_run = ?3, status = ?4, started_at = ?5, ended_at = ?6, prompt_id = ?7, prompt_manifest_path = ?8, prompt_bytes = ?9, estimated_input_tokens = ?10, estimated_output_tokens = ?11, exit_code = ?12, stop_reason = ?13, transcript_path = ?14 \
+                provider = ?2, external_session_id = ?3, ordinal_in_run = ?4, status = ?5, started_at = ?6, ended_at = ?7, prompt_id = ?8, prompt_manifest_path = ?9, prompt_bytes = ?10, estimated_input_tokens = ?11, estimated_output_tokens = ?12, exit_code = ?13, stop_reason = ?14, transcript_path = ?15 \
              WHERE id = ?1",
             params![
                 session.id.as_str(),
+                session.provider.as_str(),
                 session.external_session_id.as_deref(),
                 session.ordinal_in_run,
                 encode_session_status(session.status),
@@ -928,15 +936,22 @@ impl Database {
     }
 
     pub fn latest_session_for_run(&self, run_id: &RunId) -> Result<Option<ClaudeSessionRecord>> {
+        let provider_column = if has_column(&self.conn, "claude_sessions", "provider")? {
+            "provider"
+        } else {
+            "'claude' AS provider"
+        };
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, run_id, external_session_id, ordinal_in_run, status, started_at, ended_at, \
-                    prompt_id, prompt_manifest_path, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path \
-                 FROM claude_sessions \
-                 WHERE run_id = ?1 \
-                 ORDER BY ordinal_in_run DESC, started_at DESC \
-                 LIMIT 1",
+                &format!(
+                    "SELECT id, run_id, {provider_column}, external_session_id, ordinal_in_run, status, started_at, ended_at, \
+                        prompt_id, prompt_manifest_path, prompt_bytes, estimated_input_tokens, estimated_output_tokens, exit_code, stop_reason, transcript_path \
+                     FROM claude_sessions \
+                     WHERE run_id = ?1 \
+                     ORDER BY ordinal_in_run DESC, started_at DESC \
+                     LIMIT 1"
+                ),
             )
             .context("prepare latest session query")?;
 
@@ -2522,6 +2537,21 @@ impl Database {
     }
 }
 
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("prepare schema probe for {table}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("query schema probe for {table}"))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 impl BeadCacheStore for Database {
     fn upsert_bead_cache(&mut self, bead: &BrIssueSummary) -> Result<UpsertOutcome> {
         let existed = self
@@ -2794,19 +2824,20 @@ fn raw_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSessionRow> {
     Ok(RawSessionRow {
         id: row.get(0)?,
         run_id: row.get(1)?,
-        external_session_id: row.get(2)?,
-        ordinal_in_run: row.get(3)?,
-        status: row.get(4)?,
-        started_at: row.get(5)?,
-        ended_at: row.get(6)?,
-        prompt_id: row.get(7)?,
-        prompt_manifest_path: row.get(8)?,
-        prompt_bytes: row.get(9)?,
-        estimated_input_tokens: row.get(10)?,
-        estimated_output_tokens: row.get(11)?,
-        exit_code: row.get(12)?,
-        stop_reason: row.get(13)?,
-        transcript_path: row.get(14)?,
+        provider: row.get(2)?,
+        external_session_id: row.get(3)?,
+        ordinal_in_run: row.get(4)?,
+        status: row.get(5)?,
+        started_at: row.get(6)?,
+        ended_at: row.get(7)?,
+        prompt_id: row.get(8)?,
+        prompt_manifest_path: row.get(9)?,
+        prompt_bytes: row.get(10)?,
+        estimated_input_tokens: row.get(11)?,
+        estimated_output_tokens: row.get(12)?,
+        exit_code: row.get(13)?,
+        stop_reason: row.get(14)?,
+        transcript_path: row.get(15)?,
     })
 }
 
@@ -2975,6 +3006,7 @@ fn raw_session_into_record(row: RawSessionRow) -> Result<ClaudeSessionRecord> {
     Ok(ClaudeSessionRecord {
         id: SessionId::new(row.id),
         run_id: RunId::new(row.run_id),
+        provider: parse_runtime_provider(&row.provider)?,
         external_session_id: row.external_session_id,
         ordinal_in_run: row.ordinal_in_run,
         status: parse_session_status(&row.status)?,
@@ -2993,6 +3025,14 @@ fn raw_session_into_record(row: RawSessionRow) -> Result<ClaudeSessionRecord> {
             .transpose()?,
         transcript_path: row.transcript_path,
     })
+}
+
+fn parse_runtime_provider(value: &str) -> Result<RuntimeProvider> {
+    match value {
+        "claude" => Ok(RuntimeProvider::Claude),
+        "codex" => Ok(RuntimeProvider::Codex),
+        _ => bail!("unknown runtime provider `{value}`"),
+    }
 }
 
 fn raw_checkpoint_into_record(row: RawCheckpointRow) -> Result<CheckpointRecord> {
@@ -3991,7 +4031,7 @@ mod tests {
         BeadId, BeadPriority, CheckpointId, CheckpointPayload, CircuitBreakerState,
         ClaudeSessionRecord, EventKind, FailureClass, HandoffRecord, PromptId,
         RecoveryCapsuleOutcome, ReservationMode, RunId, RunStatus, SessionId, SessionStatus,
-        StopReason, Timestamp,
+        StopReason, Timestamp, RuntimeProvider,
     };
     use rusqlite::OptionalExtension;
     use serde_json::json;
@@ -4028,7 +4068,7 @@ mod tests {
         db.migrate()?;
 
         let migrations = db.applied_migrations()?;
-        assert_eq!(migrations.len(), 11);
+        assert_eq!(migrations.len(), 12);
         assert_eq!(
             migrations[0],
             MigrationState {
@@ -4104,6 +4144,13 @@ mod tests {
             MigrationState {
                 version: 11,
                 name: "0011_circuit_breaker_state.sql".into(),
+            }
+        );
+        assert_eq!(
+            migrations[11],
+            MigrationState {
+                version: 12,
+                name: "0012_session_provider.sql".into(),
             }
         );
         Ok(())
@@ -4785,6 +4832,7 @@ mod tests {
         let session_started = ClaudeSessionRecord {
             id: SessionId::new("ses-life"),
             run_id: RunId::new("run-life"),
+            provider: RuntimeProvider::Claude,
             external_session_id: Some("claude-life".to_owned()),
             ordinal_in_run: 1,
             status: SessionStatus::Running,
@@ -4931,6 +4979,7 @@ mod tests {
         let session_a = ClaudeSessionRecord {
             id: SessionId::new("ses-a"),
             run_id: RunId::new("run-a"),
+            provider: RuntimeProvider::Claude,
             external_session_id: None,
             ordinal_in_run: 1,
             status: SessionStatus::Running,

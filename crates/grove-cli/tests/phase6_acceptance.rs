@@ -91,6 +91,7 @@ fn test_diary_implicit_feedback() {
         session: grove_types::ClaudeSessionRecord {
             id: grove_types::SessionId::new("ses-1"),
             run_id: run_id.clone(),
+            provider: grove_types::RuntimeProvider::Claude,
             external_session_id: None,
             ordinal_in_run: 1,
             status: SessionStatus::Completed,

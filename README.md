@@ -54,7 +54,7 @@ Grove didn't appear from nothing. The exit gate and circuit breaker come from [F
 
 ## How It Works
 
-Grove runs a continuous autonomous loop over your beads task graph. Each bead is dispatched to a Claude session. The coordinator can keep multiple sessions in flight concurrently up to `max_parallel`, while still enforcing file reservation safety and a single active leader lease. When context exhausts, grove checkpoints and spawns a fresh session automatically. Child beads inherit structured handoffs from parents.
+Grove runs a continuous autonomous loop over your beads task graph. Each bead is dispatched to the configured provider runtime session. The coordinator can keep multiple sessions in flight concurrently up to `max_parallel`, while still enforcing file reservation safety and a single active leader lease. When context exhausts, grove checkpoints and spawns a fresh session automatically. Child beads inherit structured handoffs from parents.
 
 ### The Loop
 
@@ -194,18 +194,23 @@ br create "Implement auth middleware" --type task
 
 br dep add bd-7f3a2c bd-e9b1d4   # auth depends on schema
 
-# Init grove
+# Init grove with the default Claude runtime
 # Add --skills to scaffold all bundled skills into .agents/skills/
 grove init --skills
 
-# Optional: customize the startup prompt template grove injects into new Claude sessions
+# Or initialize directly for Codex/OpenAI
+grove init --provider codex --skills
+
+# Optional: customize the startup prompt template grove injects into new sessions
 $EDITOR .grove/startup_prompt.md
 
 # Run — then go do something else
 grove run
 ```
 
-`grove init` creates a user-owned startup prompt template at `.grove/startup_prompt.md` if it does not already exist. Edit that file to change the baseline instructions Grove injects into every freshly spawned Claude session. Re-running `grove init` will preserve your edited file unless you delete it yourself. If Grove is already initialized, use `grove sync` to refresh the bead cache instead of re-running `grove init`.
+`grove init` creates a user-owned startup prompt template at `.grove/startup_prompt.md` if it does not already exist. Edit that file to change the baseline instructions Grove injects into every freshly spawned session. Re-running `grove init` will preserve your edited file unless you delete it yourself. If Grove is already initialized, use `grove sync` to refresh the bead cache instead of re-running `grove init`.
+
+Use `grove migrate --provider codex` or `grove migrate --provider claude` to switch an existing workspace between providers without resetting unrelated Grove settings.
 
 If you pass `grove init --skills`, Grove scaffolds all bundled skills into `.agents/skills/<skill-name>/SKILL.md`. Each scaffold is create-if-missing and becomes user-owned immediately, so reruns (including `--force`) preserve any edits you make there.
 
@@ -245,7 +250,7 @@ If you want Grove to implement all tasks faster, follow the setup below.
    grove run
    ```
 
-This setup makes Grove implement all tasks faster because each new Claude session starts in the swarm workflow immediately. The trade-off is higher token usage.
+This setup makes Grove implement all tasks faster because each new Claude session starts in the swarm workflow immediately. The trade-off is higher token usage. For Codex workspaces, use the corresponding `$skill` form in the startup prompt instead of Claude's slash command form.
 
 Always make sure `am` (MCP Agent Mail) is running before using this workflow.
 
@@ -261,9 +266,16 @@ Grove handles everything from here. When it finishes, your beads are closed and 
 # Init grove workspace
 grove init
 
+# Init grove workspace for Codex/OpenAI
+grove init --provider codex
+
 # Init grove and scaffold all bundled skills for Claude Code
 # into .agents/skills/<skill-name>/SKILL.md
 grove init --skills
+
+# Migrate an existing Grove workspace between providers
+grove migrate --provider codex
+grove migrate --provider claude
 
 # Refresh Grove's local bead cache from br without resetting local runtime state
 grove sync
@@ -291,7 +303,7 @@ grove retry bd-e9b1d4
 
 ## Node Protocol
 
-Grove communicates with Claude sessions through stdout markers:
+Grove communicates with provider runtime sessions through stdout markers:
 
 **Task complete:**
 
@@ -320,18 +332,19 @@ GROVE_EXIT: false
 
 ## Config
 
-Besides `grove.toml`, Grove also uses a user-owned startup prompt file. By default it lives at `.grove/startup_prompt.md`, but you can override that path with `runtime.startup_prompt_path` in `grove.toml`. The file is created by `grove init`, can be edited freely, and is injected into every new Claude session before task-specific context. It is separate from `.grove/prompts/`, which stores Grove-generated rendered prompt manifests for dispatched sessions.
+Besides `grove.toml`, Grove also uses a user-owned startup prompt file. By default it lives at `.grove/startup_prompt.md`, but you can override that path with `runtime.startup_prompt_path` in `grove.toml`. The file is created by `grove init`, can be edited freely, and is injected into every new provider session before task-specific context. It is separate from `.grove/prompts/`, which stores Grove-generated rendered prompt manifests for dispatched sessions.
 
 ```toml
 # grove.toml
 
 [runtime]
-claude_bin = "claude"
-default_model = "default"   # omit --model; use a concrete name (e.g. "sonnet") to force --model
+provider = "claude"         # or "codex"
+provider_bin = "claude"     # selected provider CLI binary/path
+default_model = "default"   # omit the provider model flag; use a concrete name to force it
 workspace_root = "."
 timeout_minutes = 60
 startup_prompt_path = ".grove/startup_prompt.md"  # override to use a different startup prompt file
-env_passthrough = []         # optional env vars forwarded to Claude sessions
+env_passthrough = []         # optional env vars forwarded to provider sessions
 
 [scheduler]
 max_parallel = 5              # parallel sessions, bounded by reservation safety

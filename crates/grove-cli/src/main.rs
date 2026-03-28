@@ -22,7 +22,7 @@ use grove_kernel::{
 use grove_session::replay_transcript;
 use grove_types::{
     AgentActivity, BeadId, BeadPriority, EventKind, GroveBeadRecord, GroveBeadStatus,
-    LeaderLeaseRecord, ProtocolEvent, RunReport, RunStatus, TranscriptEvent,
+    LeaderLeaseRecord, ProtocolEvent, RunReport, RunStatus, RuntimeProvider, TranscriptEvent,
 };
 use ratatui::{
     Frame, Terminal,
@@ -38,7 +38,7 @@ use std::{cmp, env, fs, io, io::IsTerminal, sync::mpsc, thread, time::Duration};
 
 #[derive(Parser)]
 #[command(name = "grove")]
-#[command(about = "Autonomous orchestration for beads-backed Claude work")]
+#[command(about = "Autonomous orchestration for beads-backed provider work")]
 struct Cli {
     #[arg(long, global = true, action = ArgAction::SetTrue)]
     json: bool,
@@ -49,10 +49,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Init {
+        #[arg(long)]
+        provider: Option<String>,
         #[arg(long, action = ArgAction::SetTrue)]
         force: bool,
         #[arg(long, action = ArgAction::SetTrue)]
         skills: bool,
+    },
+    Migrate {
+        #[arg(long)]
+        provider: String,
     },
     Sync,
     Status,
@@ -75,9 +81,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Init { force, skills }) => {
-            run_json_command("init", cli.json, || handle_init(cli.json, force, skills))
-        }
+        Some(Command::Init {
+            provider,
+            force,
+            skills,
+        }) => run_json_command("init", cli.json, || {
+            handle_init(cli.json, provider.as_deref(), force, skills)
+        }),
+        Some(Command::Migrate { provider }) => run_json_command("migrate", cli.json, || {
+            handle_migrate(cli.json, &provider)
+        }),
         Some(Command::Sync) => run_json_command("sync", cli.json, || handle_sync(cli.json)),
         Some(Command::Status) => handle_status(cli.json),
         Some(Command::Inspect { bead_id }) => handle_inspect(&BeadId::new(bead_id), cli.json),
@@ -94,7 +107,7 @@ fn main() -> Result<()> {
                         "ok": true,
                         "command": null,
                         "message": "Use `grove --help` to see available commands.",
-                        "available_commands": ["init", "sync", "status", "inspect", "log", "retry", "run"],
+                        "available_commands": ["init", "migrate", "sync", "status", "inspect", "log", "retry", "run"],
                     }))?
                 );
             } else {
@@ -269,10 +282,19 @@ const BUNDLED_SKILLS: &[(&str, &str)] = &[
     ),
 ];
 
-fn handle_init(json_mode: bool, force: bool, skills: bool) -> Result<()> {
+fn handle_init(
+    json_mode: bool,
+    provider_override: Option<&str>,
+    force: bool,
+    skills: bool,
+) -> Result<()> {
     let workspace_root = current_workspace_root()?;
     let config_path = workspace_root.join("grove.toml");
-    let paths = resolve_init_paths(&workspace_root, &config_path)?;
+    let init_provider = provider_override
+        .map(parse_runtime_provider)
+        .transpose()?
+        .unwrap_or(RuntimeProvider::Claude);
+    let paths = resolve_init_paths(&workspace_root, &config_path, init_provider)?;
     let existing_artifacts = existing_init_artifacts(&paths);
     let already_initialized = !existing_artifacts.is_empty();
 
@@ -290,7 +312,7 @@ fn handle_init(json_mode: bool, force: bool, skills: bool) -> Result<()> {
     let wrote_default_config = if config_path.exists() {
         false
     } else {
-        write_default_config(&config_path)?;
+        write_default_config(&config_path, init_provider)?;
         true
     };
 
@@ -301,7 +323,7 @@ fn handle_init(json_mode: bool, force: bool, skills: bool) -> Result<()> {
         )
     })?;
     ensure_workspace_layout(&loaded.paths)?;
-    let wrote_startup_prompt = ensure_startup_prompt_file(&loaded.paths)?;
+    let wrote_startup_prompt = ensure_startup_prompt_file(&loaded.paths, loaded.config.runtime.provider)?;
     let bundled_skill_results = if skills {
         ensure_bundled_skill_files(loaded.paths.workspace_root())?
     } else {
@@ -352,6 +374,8 @@ fn handle_init(json_mode: bool, force: bool, skills: bool) -> Result<()> {
                 "checkpoints_dir": loaded.paths.checkpoints_dir().as_str(),
                 "startup_prompt_path": loaded.paths.startup_prompt_path().as_str(),
                 "skills_requested": skills,
+                "provider": loaded.config.runtime.provider.as_str(),
+                "provider_bin": loaded.config.runtime.provider_bin,
                 "bundled_skills": skills.then_some(
                     bundled_skill_results
                         .iter()
@@ -375,7 +399,9 @@ fn handle_init(json_mode: bool, force: bool, skills: bool) -> Result<()> {
                     "error_count": result.errors.len(),
                 })),
                 "tooling": {
+                    "active_provider": render_tool_line(&tooling.active_provider.binary, tooling.active_provider.version.as_deref()),
                     "claude": render_tool_line(&tooling.claude.binary, tooling.claude.version.as_deref()),
+                    "codex": render_tool_line(&tooling.codex.binary, tooling.codex.version.as_deref()),
                     "br": render_tool_line("br", br_capability.version_line.as_deref()),
                     "bv": render_tool_line("bv", bv_capability.version.as_deref()),
                 },
@@ -400,6 +426,11 @@ fn handle_init(json_mode: bool, force: bool, skills: bool) -> Result<()> {
     println!("- transcripts: {}", loaded.paths.transcript_dir());
     println!("- checkpoints: {}", loaded.paths.checkpoints_dir());
     println!("- startup prompt: {}", loaded.paths.startup_prompt_path());
+    println!(
+        "- provider: {} ({})",
+        loaded.config.runtime.provider.as_str(),
+        loaded.config.runtime.provider_bin
+    );
     if skills {
         println!(
             "- bundled skills directory: {}/.agents/skills",
@@ -438,7 +469,15 @@ fn handle_init(json_mode: bool, force: bool, skills: bool) -> Result<()> {
     println!("\nValidated tools:");
     println!(
         "- {}",
+        render_tool_line(&tooling.active_provider.binary, tooling.active_provider.version.as_deref())
+    );
+    println!(
+        "- {}",
         render_tool_line(&tooling.claude.binary, tooling.claude.version.as_deref())
+    );
+    println!(
+        "- {}",
+        render_tool_line(&tooling.codex.binary, tooling.codex.version.as_deref())
     );
     println!(
         "- {}",
@@ -688,7 +727,10 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
         .register_ctrlc()
         .context("register shutdown handler")?;
 
-    let backend = grove_session::CliClaudeBackend::new(loaded.config.runtime.claude_bin.clone());
+    let backend = grove_session::CliClaudeBackend::new_for_provider(
+        loaded.config.runtime.provider,
+        loaded.config.runtime.provider_bin.clone(),
+    );
     let loop_config = DispatchLoopConfig {
         max_total_runs: None,
         max_poll_cycles: None,
@@ -1550,7 +1592,10 @@ fn run_dispatch_loop_with_live_ui(
     lease_config: &LeaderLeaseConfig,
     loop_config: &DispatchLoopConfig,
 ) -> Result<Result<DispatchLoopOutcome>> {
-    let backend = grove_session::CliClaudeBackend::new(loaded.config.runtime.claude_bin.clone());
+    let backend = grove_session::CliClaudeBackend::new_for_provider(
+        loaded.config.runtime.provider,
+        loaded.config.runtime.provider_bin.clone(),
+    );
     let mut worker_db = Database::open(loaded.paths.db_path())
         .with_context(|| format!("open database at {}", loaded.paths.db_path()))?;
     let br_for_thread = br.clone();
@@ -1908,14 +1953,20 @@ fn current_workspace_root() -> Result<Utf8PathBuf> {
         .map_err(|path| anyhow::anyhow!("working directory is not valid UTF-8: {}", path.display()))
 }
 
-fn resolve_init_paths(workspace_root: &Utf8Path, config_path: &Utf8Path) -> Result<GrovePaths> {
+fn resolve_init_paths(
+    workspace_root: &Utf8Path,
+    config_path: &Utf8Path,
+    provider: RuntimeProvider,
+) -> Result<GrovePaths> {
     if config_path.exists() {
         return load_from_workspace(workspace_root)
             .with_context(|| format!("load grove configuration from {config_path}"))
             .map(|loaded| loaded.paths);
     }
 
-    let config = grove_config::GroveConfig::default();
+    let mut config = grove_config::GroveConfig::default();
+    config.runtime.provider = provider;
+    config.runtime.provider_bin = provider.default_bin().to_owned();
     GrovePaths::from_config(&config, config_path).map_err(|error| anyhow!(error.to_string()))
 }
 
@@ -1947,21 +1998,140 @@ fn reset_managed_init_state(paths: &GrovePaths) -> Result<()> {
     Ok(())
 }
 
-fn write_default_config(path: &Utf8PathBuf) -> Result<()> {
-    let text = DEFAULT_INIT_GROVE_TOML.trim_end();
+fn write_default_config(path: &Utf8PathBuf, provider: RuntimeProvider) -> Result<()> {
+    let text = render_default_config(provider);
     fs::write(path, format!("{text}\n"))
         .with_context(|| format!("write default config to {path}"))?;
     Ok(())
 }
 
-fn ensure_startup_prompt_file(paths: &GrovePaths) -> Result<bool> {
+fn ensure_startup_prompt_file(paths: &GrovePaths, provider: RuntimeProvider) -> Result<bool> {
     let path = paths.startup_prompt_path();
     if path.exists() {
         return Ok(false);
     }
 
-    let text = "First read ALL of the AGENTS.md file and README.md file super carefully and understand ALL of both! Then use your code investigation agent mode to fully understand the code, and technical architecture and purpose of the project. Then register with MCP Agent Mail and introduce yourself to the other agents. Be sure to check your agent mail and to promptly respond if needed to any messages; then proceed meticulously with your next assigned beads, working on the tasks systematically and meticulously and tracking your progress via beads and agent mail messages. Don't get stuck in \"communication purgatory\" where nothing is getting done; be proactive about starting tasks that need to be done, but inform your fellow agents via messages when you do so and mark beads appropriately. When you're not sure what to do next, use the bv tool mentioned in AGENTS.md to prioritize the best beads to work on next; pick the next one that you can usefully work on and get started. Make sure to acknowledge all communication requests from other agents and that you are aware of all active agents and their names. Use /effort max.\n";
+    let text = default_startup_prompt(provider);
     fs::write(path, text).with_context(|| format!("write startup prompt template to {path}"))?;
+    Ok(true)
+}
+
+fn render_default_config(provider: RuntimeProvider) -> String {
+    let default_bin = provider.default_bin();
+    DEFAULT_INIT_GROVE_TOML
+        .replace("provider = \"claude\"", &format!("provider = \"{}\"", provider.as_str()))
+        .replace("provider_bin = \"claude\"", &format!("provider_bin = \"{default_bin}\""))
+        .trim_end()
+        .to_owned()
+}
+
+fn default_startup_prompt(provider: RuntimeProvider) -> String {
+    format!(
+        "First read ALL of the AGENTS.md file and README.md file super carefully and understand ALL of both! Then use your code investigation agent mode to fully understand the code, and technical architecture and purpose of the project. Then register with MCP Agent Mail and introduce yourself to the other agents. Be sure to check your agent mail and to promptly respond if needed to any messages; then proceed meticulously with your next assigned beads, working on the tasks systematically and meticulously and tracking your progress via beads and agent mail messages. Don't get stuck in \"communication purgatory\" where nothing is getting done; be proactive about starting tasks that need to be done, but inform your fellow agents via messages when you do so and mark beads appropriately. When you're not sure what to do next, use the bv tool mentioned in AGENTS.md to prioritize the best beads to work on next; pick the next one that you can usefully work on and get started. Make sure to acknowledge all communication requests from other agents and that you are aware of all active agents and their names. Use maximum reasoning effort. Use {} to invoke skills when needed.\n",
+        provider.skill_invocation(),
+    )
+}
+
+fn parse_runtime_provider(raw: &str) -> Result<RuntimeProvider> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "claude" => Ok(RuntimeProvider::Claude),
+        "codex" => Ok(RuntimeProvider::Codex),
+        _ => bail!("unsupported provider `{raw}`; expected `claude` or `codex`"),
+    }
+}
+
+fn handle_migrate(json_mode: bool, provider: &str) -> Result<()> {
+    let provider = parse_runtime_provider(provider)?;
+    let workspace_root = current_workspace_root()?;
+    let config_path = workspace_root.join("grove.toml");
+    if !config_path.exists() {
+        bail!("no grove.toml found in {}", workspace_root);
+    }
+
+    migrate_workspace_provider(&config_path, provider)?;
+    let loaded = load_from_workspace(&workspace_root)?;
+    let startup_path = loaded.paths.startup_prompt_path().to_owned();
+    let startup_updated = maybe_update_startup_prompt(&startup_path, provider)?;
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "command": "migrate",
+                "provider": provider.as_str(),
+                "provider_bin": loaded.config.runtime.provider_bin,
+                "config_path": config_path.as_str(),
+                "startup_prompt_path": startup_path.as_str(),
+                "startup_prompt_updated": startup_updated,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Migrated Grove runtime to {} using `{}`.",
+        provider.as_str(),
+        loaded.config.runtime.provider_bin
+    );
+    if startup_updated {
+        println!("- rewrote startup prompt: {}", startup_path);
+    } else {
+        println!("- preserved existing startup prompt: {}", startup_path);
+    }
+    Ok(())
+}
+
+fn migrate_workspace_provider(config_path: &Utf8Path, provider: RuntimeProvider) -> Result<()> {
+    let raw = fs::read_to_string(config_path)
+        .with_context(|| format!("read Grove config from {config_path}"))?;
+    let mut parsed: toml::Value = raw
+        .parse()
+        .with_context(|| format!("parse Grove config from {config_path}"))?;
+    let root = parsed
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("grove.toml root must be a table"))?;
+    let runtime = root
+        .entry("runtime")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("runtime section must be a table"))?;
+    runtime.insert(
+        "provider".to_owned(),
+        toml::Value::String(provider.as_str().to_owned()),
+    );
+    runtime.insert(
+        "provider_bin".to_owned(),
+        toml::Value::String(provider.default_bin().to_owned()),
+    );
+    runtime.remove("claude_bin");
+    let encoded =
+        toml::to_string_pretty(&parsed).context("encode migrated Grove config back to TOML")?;
+    fs::write(config_path, encoded)
+        .with_context(|| format!("write migrated Grove config to {config_path}"))?;
+    Ok(())
+}
+
+fn maybe_update_startup_prompt(path: &Utf8Path, provider: RuntimeProvider) -> Result<bool> {
+    if !path.exists() {
+        fs::write(path, default_startup_prompt(provider))
+            .with_context(|| format!("write startup prompt template to {path}"))?;
+        return Ok(true);
+    }
+
+    let current =
+        fs::read_to_string(path).with_context(|| format!("read startup prompt from {path}"))?;
+    let normalized = current.trim_end_matches('\n');
+    let claude_default = default_startup_prompt(RuntimeProvider::Claude);
+    let codex_default = default_startup_prompt(RuntimeProvider::Codex);
+    let is_default_like = normalized == claude_default.trim_end_matches('\n')
+        || normalized == codex_default.trim_end_matches('\n');
+    if !is_default_like {
+        return Ok(false);
+    }
+
+    fs::write(path, default_startup_prompt(provider))
+        .with_context(|| format!("rewrite startup prompt template to {path}"))?;
     Ok(true)
 }
 
@@ -2131,7 +2301,7 @@ fn ensure_workspace_layout(paths: &GrovePaths) -> Result<()> {
 }
 
 fn ensure_required_tooling(tooling: &RequiredTooling) -> Result<()> {
-    for tool in [&tooling.claude, &tooling.br, &tooling.bv] {
+    for tool in [&tooling.active_provider, &tooling.br, &tooling.bv] {
         ensure_tool_available(tool)?;
     }
     Ok(())

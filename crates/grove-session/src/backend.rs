@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use anyhow::{Context, Result, anyhow};
 use camino::Utf8PathBuf;
+use grove_types::RuntimeProvider;
 use std::{
     io::{BufRead, BufReader, Lines},
     process::{Child, ChildStderr, ChildStdout, Command, Stdio},
@@ -9,6 +10,7 @@ use std::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartSessionRequest {
+    pub provider: RuntimeProvider,
     pub model: String,
     pub prompt: String,
     pub working_dir: Utf8PathBuf,
@@ -21,15 +23,28 @@ pub trait ClaudeBackend: Send + Sync {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CliClaudeBackend {
-    claude_bin: String,
+pub struct CliSessionBackend {
+    provider: RuntimeProvider,
+    provider_bin: String,
 }
 
-impl CliClaudeBackend {
+pub trait SessionBackend: ClaudeBackend {}
+
+impl<T: ClaudeBackend + ?Sized> SessionBackend for T {}
+
+pub type CliClaudeBackend = CliSessionBackend;
+
+impl CliSessionBackend {
     #[must_use]
-    pub fn new(claude_bin: impl Into<String>) -> Self {
+    pub fn new(provider_bin: impl Into<String>) -> Self {
+        Self::new_for_provider(RuntimeProvider::Claude, provider_bin)
+    }
+
+    #[must_use]
+    pub fn new_for_provider(provider: RuntimeProvider, provider_bin: impl Into<String>) -> Self {
         Self {
-            claude_bin: claude_bin.into(),
+            provider,
+            provider_bin: provider_bin.into(),
         }
     }
 }
@@ -49,19 +64,31 @@ impl RunningSession {
 }
 
 /// Sentinel: when `default_model` in config is `"default"`, Grove does not pass `--model`
-/// so the Claude CLI uses its own default model.
+/// so the provider CLI uses its own default model.
 pub const DEFAULT_MODEL_OMIT_FLAG: &str = "default";
 
-impl ClaudeBackend for CliClaudeBackend {
+impl ClaudeBackend for CliSessionBackend {
     fn start(&self, req: StartSessionRequest) -> Result<RunningSession> {
-        let mut command = Command::new(&self.claude_bin);
-        command
-            .arg("-p")
-            .arg(&req.prompt)
-            .arg("--permission-mode")
-            .arg("bypassPermissions");
-        if req.model != DEFAULT_MODEL_OMIT_FLAG {
-            command.arg("--model").arg(&req.model);
+        let provider = req.provider;
+        let mut command = Command::new(&self.provider_bin);
+        match provider {
+            RuntimeProvider::Claude => {
+                command
+                    .arg("-p")
+                    .arg(&req.prompt)
+                    .arg("--permission-mode")
+                    .arg("bypassPermissions");
+                if req.model != DEFAULT_MODEL_OMIT_FLAG {
+                    command.arg("--model").arg(&req.model);
+                }
+            }
+            RuntimeProvider::Codex => {
+                command.arg("exec").arg("--full-auto");
+                if req.model != DEFAULT_MODEL_OMIT_FLAG {
+                    command.arg("--model").arg(&req.model);
+                }
+                command.arg(&req.prompt);
+            }
         }
         command
             .current_dir(req.working_dir.as_std_path())
@@ -74,17 +101,17 @@ impl ClaudeBackend for CliClaudeBackend {
         }
 
         let mut child = command.spawn().with_context(|| {
-            format!("spawn {} in {}", self.claude_bin, req.working_dir.as_str())
+            format!("spawn {} in {}", self.provider_bin, req.working_dir.as_str())
         })?;
 
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| anyhow!("{} did not expose stdout pipe", self.claude_bin))?;
+            .ok_or_else(|| anyhow!("{} did not expose stdout pipe", self.provider_bin))?;
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| anyhow!("{} did not expose stderr pipe", self.claude_bin))?;
+            .ok_or_else(|| anyhow!("{} did not expose stderr pipe", self.provider_bin))?;
 
         Ok(RunningSession {
             child,
@@ -97,8 +124,9 @@ impl ClaudeBackend for CliClaudeBackend {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{ClaudeBackend, CliClaudeBackend, DEFAULT_MODEL_OMIT_FLAG, StartSessionRequest};
+    use super::{ClaudeBackend, CliSessionBackend, DEFAULT_MODEL_OMIT_FLAG, StartSessionRequest};
     use camino::Utf8PathBuf;
+    use grove_types::RuntimeProvider;
     use std::{error::Error, fs, time::Duration};
     use tempfile::tempdir;
 
@@ -141,8 +169,12 @@ printf 'stderr line\n' >&2
 
         let working_dir = Utf8PathBuf::from_path_buf(workspace_dir.clone())
             .map_err(|_| std::io::Error::other("workspace dir must be valid UTF-8"))?;
-        let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+        let backend = CliSessionBackend::new_for_provider(
+            RuntimeProvider::Claude,
+            script_path.to_string_lossy().into_owned(),
+        );
         let mut session = backend.start(StartSessionRequest {
+            provider: RuntimeProvider::Claude,
             model: "sonnet".to_owned(),
             prompt: "write code while you sleep".to_owned(),
             working_dir,
@@ -216,8 +248,12 @@ printf 'stderr line\n' >&2
 
         let working_dir = Utf8PathBuf::from_path_buf(workspace_dir.clone())
             .map_err(|_| std::io::Error::other("workspace dir must be valid UTF-8"))?;
-        let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+        let backend = CliSessionBackend::new_for_provider(
+            RuntimeProvider::Claude,
+            script_path.to_string_lossy().into_owned(),
+        );
         let mut session = backend.start(StartSessionRequest {
+            provider: RuntimeProvider::Claude,
             model: DEFAULT_MODEL_OMIT_FLAG.to_owned(),
             prompt: "write code while you sleep".to_owned(),
             working_dir,
@@ -249,8 +285,12 @@ printf 'stderr line\n' >&2
 
     #[test]
     fn cli_backend_surfaces_spawn_failures() {
-        let backend = CliClaudeBackend::new("/definitely/missing/claude");
+        let backend = CliSessionBackend::new_for_provider(
+            RuntimeProvider::Claude,
+            "/definitely/missing/claude",
+        );
         let request = StartSessionRequest {
+            provider: RuntimeProvider::Claude,
             model: "sonnet".to_owned(),
             prompt: "hello".to_owned(),
             working_dir: Utf8PathBuf::from("."),

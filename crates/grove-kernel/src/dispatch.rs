@@ -8,7 +8,9 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use grove_br::BrClient;
-use grove_config::{DEFAULT_CHECKPOINTS_DIR_NAME, DEFAULT_GROVE_DIR_NAME, GroveConfig};
+use grove_config::{
+    DEFAULT_CHECKPOINTS_DIR_NAME, DEFAULT_GROVE_DIR_NAME, GroveConfig, build_provider_environment,
+};
 use grove_db::Database;
 use grove_session::{
     CheckpointPromptInput, ClaudeBackend, ContextMonitor, ExitPolicy, SessionShutdownConfig,
@@ -932,11 +934,13 @@ fn build_session_request(
     ));
     let prompt_manifest_path =
         Utf8PathBuf::from(format!(".grove/prompts/{}.json", prompt_id.as_str()));
+    let current_env = std::env::vars().collect();
 
     SingleTaskSessionRequest {
         bead_id: bead.bead.id.clone(),
         run_id: run_id.clone(),
         session_id: session_id.clone(),
+        provider: config.runtime.provider,
         prompt_id,
         task_title: bead.bead.title.clone(),
         task_description: bead.bead.description.clone().unwrap_or_default(),
@@ -969,7 +973,7 @@ fn build_session_request(
         ordinal_in_run: 1,
         archive_bundle: None,
         playbook_rules: Vec::new(),
-        env: Vec::new(),
+        env: build_provider_environment(config.runtime.provider, &config.runtime, &current_env),
         shutdown: SessionShutdownConfig::default(),
         escalation_tier,
         mutation_strategy: escalation_tier.default_mutation(),

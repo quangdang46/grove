@@ -93,7 +93,7 @@ fn init_creates_database_with_migrations() -> TestResult {
     let applied_migrations = db.applied_migrations()?;
     assert_eq!(
         applied_migrations.len(),
-        11,
+        12,
         "should apply all current migrations"
     );
     assert_eq!(applied_migrations[0].version, 1);
@@ -124,6 +124,8 @@ fn init_creates_database_with_migrations() -> TestResult {
         applied_migrations[10].name,
         "0011_circuit_breaker_state.sql"
     );
+    assert_eq!(applied_migrations[11].version, 12);
+    assert_eq!(applied_migrations[11].name, "0012_session_provider.sql");
 
     // Verify tables exist by attempting to query them
     let conn = db.connection();

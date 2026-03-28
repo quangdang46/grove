@@ -343,6 +343,7 @@ mod tests {
             session: ClaudeSessionRecord {
                 id: SessionId::new("ses-1"),
                 run_id: RunId::new("run-1"),
+                provider: grove_types::RuntimeProvider::Claude,
                 external_session_id: None,
                 ordinal_in_run: 1,
                 status: SessionStatus::Completed,
@@ -383,6 +384,7 @@ mod tests {
             session: ClaudeSessionRecord {
                 id: SessionId::new("ses-2"),
                 run_id: RunId::new("run-2"),
+                provider: grove_types::RuntimeProvider::Claude,
                 external_session_id: None,
                 ordinal_in_run: 1,
                 status: SessionStatus::UnknownFailure,

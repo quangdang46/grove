@@ -193,8 +193,8 @@ mod tests {
     use super::plan_retry_mutation;
     use grove_types::{
         ClaudeSessionRecord, ContextPressureLevel, ExecutionContract, FailureClass,
-        IterationAnalysis, ProgressSignal, ProtocolEvent, RunId, SessionId, SessionOutcome,
-        SessionStatus, SessionTerminalClass, StopReason, Timestamp,
+        IterationAnalysis, ProgressSignal, ProtocolEvent, RunId, RuntimeProvider, SessionId,
+        SessionOutcome, SessionStatus, SessionTerminalClass, StopReason, Timestamp,
     };
 
     fn sample_outcome(
@@ -206,6 +206,7 @@ mod tests {
             session: ClaudeSessionRecord {
                 id: SessionId::new("ses-1"),
                 run_id: RunId::new("run-1"),
+                provider: RuntimeProvider::Claude,
                 external_session_id: None,
                 ordinal_in_run: 1,
                 status: SessionStatus::UnknownFailure,

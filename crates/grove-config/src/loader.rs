@@ -4,6 +4,7 @@ use std::{
 };
 
 use camino::Utf8Path;
+use grove_types::RuntimeProvider;
 
 use crate::{ConfigError, GroveConfig, GrovePaths, RuntimeConfig, validate_config};
 
@@ -22,7 +23,9 @@ pub struct ToolCapability {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequiredTooling {
+    pub active_provider: ToolCapability,
     pub claude: ToolCapability,
+    pub codex: ToolCapability,
     pub br: ToolCapability,
     pub bv: ToolCapability,
 }
@@ -66,9 +69,15 @@ pub fn apply_env_overrides(
     config: &mut GroveConfig,
     env: &HashMap<String, String>,
 ) -> Result<(), ConfigError> {
+    let mut provider_override = None;
+    let mut provider_bin_override = None;
+    let mut legacy_claude_bin_override = None;
+
     for (key, value) in env {
         match key.as_str() {
-            "GROVE_RUNTIME__CLAUDE_BIN" => config.runtime.claude_bin = value.clone(),
+            "GROVE_RUNTIME__PROVIDER" => provider_override = Some(parse_provider_env(key, value)?),
+            "GROVE_RUNTIME__PROVIDER_BIN" => provider_bin_override = Some(value.clone()),
+            "GROVE_RUNTIME__CLAUDE_BIN" => legacy_claude_bin_override = Some(value.clone()),
             "GROVE_RUNTIME__DEFAULT_MODEL" => config.runtime.default_model = value.clone(),
             "GROVE_RUNTIME__WORKSPACE_ROOT" => config.runtime.workspace_root = value.clone(),
             "GROVE_RUNTIME__TIMEOUT_MINUTES" => {
@@ -161,14 +170,28 @@ pub fn apply_env_overrides(
         }
     }
 
+    if let Some(provider) = provider_override {
+        config.runtime.provider = provider;
+        config.runtime.provider_bin = provider.default_bin().to_owned();
+    }
+
+    if let Some(provider_bin) = provider_bin_override {
+        config.runtime.provider_bin = provider_bin;
+    } else if let Some(legacy_claude_bin) = legacy_claude_bin_override
+        && matches!(config.runtime.provider, RuntimeProvider::Claude)
+    {
+        config.runtime.provider_bin = legacy_claude_bin;
+    }
+
     Ok(())
 }
 
-pub fn build_claude_environment(
+pub fn build_provider_environment(
+    provider: RuntimeProvider,
     config: &RuntimeConfig,
     current_env: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
-    let always_pass = [
+    let mut always_pass = vec![
         "HOME",
         "USER",
         "PATH",
@@ -177,9 +200,15 @@ pub fn build_claude_environment(
         "LANG",
         "LC_ALL",
         "TZ",
-        "ANTHROPIC_API_KEY",
-        "CLAUDE_API_KEY",
     ];
+    match provider {
+        RuntimeProvider::Claude => {
+            always_pass.extend(["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]);
+        }
+        RuntimeProvider::Codex => {
+            always_pass.extend(["OPENAI_API_KEY"]);
+        }
+    }
     let never_pass = [
         "AWS_SECRET_ACCESS_KEY",
         "GCP_SERVICE_ACCOUNT_KEY",
@@ -214,10 +243,26 @@ pub fn build_claude_environment(
 }
 
 pub fn detect_required_tooling(config: &GroveConfig) -> RequiredTooling {
+    let claude = detect_tool(RuntimeProvider::Claude.default_bin());
+    let codex = detect_tool(RuntimeProvider::Codex.default_bin());
+    let active_provider = detect_tool(&config.runtime.provider_bin);
     RequiredTooling {
-        claude: detect_tool(&config.runtime.claude_bin),
+        active_provider,
+        claude,
+        codex,
         br: detect_tool("br"),
         bv: detect_tool("bv"),
+    }
+}
+
+fn parse_provider_env(key: &str, value: &str) -> Result<RuntimeProvider, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "claude" => Ok(RuntimeProvider::Claude),
+        "codex" => Ok(RuntimeProvider::Codex),
+        _ => Err(ConfigError::Validation {
+            field: key.to_owned(),
+            message: format!("unsupported provider `{value}`; expected `claude` or `codex`"),
+        }),
     }
 }
 

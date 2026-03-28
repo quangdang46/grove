@@ -18,7 +18,8 @@ pub use analyzer::{
     evaluate_exit_policy, evaluate_outcome_exit_policy, update_circuit_breaker,
 };
 pub use backend::{
-    ClaudeBackend, CliClaudeBackend, DEFAULT_MODEL_OMIT_FLAG, RunningSession, StartSessionRequest,
+    ClaudeBackend, CliClaudeBackend, CliSessionBackend, DEFAULT_MODEL_OMIT_FLAG, RunningSession,
+    SessionBackend, StartSessionRequest,
 };
 pub use exit_policy::{ExitDecision, ExitPolicy};
 pub use grove_types::EscalationContext;
@@ -42,4 +43,4 @@ pub use transcript::{TranscriptError, TranscriptReplay, TranscriptWriter, replay
 pub use verify::{VerificationMode, run_verification};
 
 pub const CRATE_PURPOSE: &str =
-    "Claude session protocol parsing, transcript capture, and session analysis helpers.";
+    "Provider session protocol parsing, transcript capture, and session analysis helpers.";

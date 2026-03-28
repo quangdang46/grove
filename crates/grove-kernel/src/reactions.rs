@@ -337,6 +337,7 @@ mod tests {
             session: grove_types::ClaudeSessionRecord {
                 id: grove_types::SessionId::new("ses-1"),
                 run_id: RunId::new("run-1"),
+                provider: grove_types::RuntimeProvider::Claude,
                 external_session_id: None,
                 ordinal_in_run: 1,
                 status: grove_types::SessionStatus::PermissionDenied,

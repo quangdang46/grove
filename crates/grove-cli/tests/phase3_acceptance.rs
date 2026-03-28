@@ -23,7 +23,7 @@ use grove_session::{
 };
 use grove_types::{
     AgentActivity, BeadId, ClaudeSessionRecord, CoordinatorStopReason, EscalationTier, EventKind,
-    ExecutionContract, FailureClass, PromptId, RunId, RunStatus, SessionId,
+    ExecutionContract, FailureClass, PromptId, RunId, RunStatus, RuntimeProvider, SessionId,
 };
 use std::{fs, io, os::unix::fs::PermissionsExt, sync::Mutex, time::Duration};
 use tempfile::tempdir;
@@ -56,6 +56,7 @@ fn sample_request(workspace_dir: Utf8PathBuf) -> SingleTaskSessionRequest {
         bead_id: BeadId::new("grove-244"),
         run_id: RunId::new("run-activity-proof"),
         session_id: SessionId::new("ses-activity-proof"),
+        provider: RuntimeProvider::Claude,
         prompt_id: PromptId::new("prompt-activity-proof"),
         task_title: "Prove live activity transitions".to_owned(),
         task_description: "Acceptance proof for observable activity transitions.".to_owned(),

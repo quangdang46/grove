@@ -1,6 +1,13 @@
 use crate::{ConfigError, GroveConfig, GrovePaths};
 
 pub fn validate_config(config: &GroveConfig, paths: &GrovePaths) -> Result<(), ConfigError> {
+    if config.runtime.provider_bin.trim().is_empty() {
+        return Err(ConfigError::Validation {
+            field: "runtime.provider_bin".to_owned(),
+            message: "must not be empty".to_owned(),
+        });
+    }
+
     ensure_range("checkpoint.warn_pct", config.checkpoint.warn_pct)?;
     ensure_range("checkpoint.rotate_pct", config.checkpoint.rotate_pct)?;
     ensure_range("checkpoint.hard_stop_pct", config.checkpoint.hard_stop_pct)?;

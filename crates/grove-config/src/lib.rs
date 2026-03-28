@@ -12,7 +12,7 @@ pub use defaults::{
 };
 pub use init_template::DEFAULT_INIT_GROVE_TOML;
 pub use loader::{
-    LoadedConfig, RequiredTooling, ToolCapability, apply_env_overrides, build_claude_environment,
+    LoadedConfig, RequiredTooling, ToolCapability, apply_env_overrides, build_provider_environment,
     detect_required_tooling, load_from_path, load_from_path_with_env, load_from_workspace,
 };
 pub use model::{
@@ -50,7 +50,7 @@ mod tests {
 
     use super::*;
     use camino::Utf8PathBuf;
-    use grove_types::{ReactionAction, ReactionTrigger};
+    use grove_types::{ReactionAction, ReactionTrigger, RuntimeProvider};
     use std::{collections::HashMap, error::Error, fs, io::Error as IoError};
     use tempfile::tempdir;
 
@@ -85,6 +85,60 @@ mod tests {
             )]),
         )?;
         assert_eq!(loaded.config.scheduler.shutdown_grace_period_ms, 2500);
+        Ok(())
+    }
+
+    #[test]
+    fn env_provider_override_resets_provider_bin_to_provider_default() -> TestResult {
+        let loaded = load_with_text(
+            "[runtime]\nprovider_bin = \"claude-custom\"\n",
+            &HashMap::from([(
+                String::from("GROVE_RUNTIME__PROVIDER"),
+                String::from("codex"),
+            )]),
+        )?;
+        assert_eq!(loaded.config.runtime.provider, RuntimeProvider::Codex);
+        assert_eq!(loaded.config.runtime.provider_bin, "codex");
+        Ok(())
+    }
+
+    #[test]
+    fn env_provider_bin_override_wins_over_provider_default() -> TestResult {
+        let loaded = load_with_text(
+            "",
+            &HashMap::from([
+                (
+                    String::from("GROVE_RUNTIME__PROVIDER"),
+                    String::from("codex"),
+                ),
+                (
+                    String::from("GROVE_RUNTIME__PROVIDER_BIN"),
+                    String::from("/tmp/custom-codex"),
+                ),
+            ]),
+        )?;
+        assert_eq!(loaded.config.runtime.provider, RuntimeProvider::Codex);
+        assert_eq!(loaded.config.runtime.provider_bin, "/tmp/custom-codex");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_claude_bin_is_ignored_when_provider_switches_to_codex() -> TestResult {
+        let loaded = load_with_text(
+            "",
+            &HashMap::from([
+                (
+                    String::from("GROVE_RUNTIME__PROVIDER"),
+                    String::from("codex"),
+                ),
+                (
+                    String::from("GROVE_RUNTIME__CLAUDE_BIN"),
+                    String::from("/tmp/custom-claude"),
+                ),
+            ]),
+        )?;
+        assert_eq!(loaded.config.runtime.provider, RuntimeProvider::Codex);
+        assert_eq!(loaded.config.runtime.provider_bin, "codex");
         Ok(())
     }
 
@@ -150,7 +204,7 @@ mod tests {
             &config_path,
             r#"
 [runtime]
-claude_bin = "claude-custom"
+provider_bin = "claude-custom"
 default_model = "opus"
 workspace_root = "."
 timeout_minutes = 90
@@ -208,7 +262,7 @@ persist_jsonl = false
         )?;
 
         let loaded = load_from_path_with_env(&config_path, &HashMap::new())?;
-        assert_eq!(loaded.config.runtime.claude_bin, "claude-custom");
+        assert_eq!(loaded.config.runtime.provider_bin, "claude-custom");
         assert_eq!(loaded.config.scheduler.max_parallel, 7);
         assert_eq!(loaded.config.scheduler.shutdown_grace_period_ms, 1500);
         assert_eq!(loaded.config.checkpoint.max_context_bytes, 32000);

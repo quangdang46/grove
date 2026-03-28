@@ -1877,6 +1877,7 @@ exit "${EXIT_CODE:-0}"
             bead_id: BeadId::new("grove-life"),
             run_id: RunId::new("run-life"),
             session_id: grove_types::SessionId::new("ses-life"),
+            provider: grove_types::RuntimeProvider::Claude,
             prompt_id: grove_types::PromptId::new("prompt-life"),
             task_title: "Persist runtime lifecycle".to_owned(),
             task_description: "Wire session lifecycle into the runtime DB.".to_owned(),
