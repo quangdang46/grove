@@ -171,7 +171,7 @@ curl -fsSL "https://raw.githubusercontent.com/quangdang46/grove/main/install.sh?
 
 **Required tools (install first):**
 
-- `claude` CLI — [https://claude.ai/code](https://claude.ai/code)
+- Provider CLI: `claude` or `codex` (install the one you plan to run Grove with)
 - `br` (beads_rust) — `cargo install --git https://github.com/Dicklesworthstone/beads_rust`
 - `bv` (beads_viewer) — `cargo install --git https://github.com/Dicklesworthstone/beads_viewer`
 
@@ -334,6 +334,8 @@ GROVE_EXIT: false
 
 Besides `grove.toml`, Grove also uses a user-owned startup prompt file. By default it lives at `.grove/startup_prompt.md`, but you can override that path with `runtime.startup_prompt_path` in `grove.toml`. The file is created by `grove init`, can be edited freely, and is injected into every new provider session before task-specific context. It is separate from `.grove/prompts/`, which stores Grove-generated rendered prompt manifests for dispatched sessions.
 
+Claude and Codex share the same schema. The provider-specific keys are `runtime.provider`, `runtime.provider_bin`, and usually `runtime.default_model`.
+
 ```toml
 # grove.toml
 
@@ -401,6 +403,30 @@ persist_jsonl = true
 
 `grove init` writes a smaller default `grove.toml`; omitted keys keep their built-in defaults. The full schema above reflects the current config model. If you want Grove to load a different startup prompt file, set `runtime.startup_prompt_path` to another relative or absolute path.
 
+For Codex/OpenAI workspaces, set the runtime block like this:
+
+```toml
+[runtime]
+provider = "codex"
+provider_bin = "codex"
+default_model = "default"   # or set an explicit OpenAI model name
+workspace_root = "."
+timeout_minutes = 60
+startup_prompt_path = ".grove/startup_prompt.md"
+env_passthrough = []
+```
+
+Authentication is provider-aware:
+
+- Claude sessions automatically receive `ANTHROPIC_API_KEY` and `CLAUDE_API_KEY` from your shell when present.
+- Codex sessions automatically receive `OPENAI_API_KEY` from your shell when present.
+- `env_passthrough` is only for extra non-secret environment variables you explicitly want forwarded into provider sessions.
+
+Provider command behavior is also different:
+
+- Claude runs `claude -p ...` and only adds `--model <name>` when `default_model` is not `"default"`.
+- Codex runs `codex exec --full-auto ...` and only adds `--model <name>` when `default_model` is not `"default"`.
+
 ---
 
 ## Project Structure
@@ -436,7 +462,7 @@ All required. `grove init` validates them up front and exits clearly if any are 
 
 | Tool                | Purpose                                                           |
 | ------------------- | ----------------------------------------------------------------- |
-| `claude` CLI        | Execute Claude coding sessions                                      |
+| `claude` or `codex` CLI | Execute provider coding sessions                               |
 | `br` (beads_rust)   | Source of truth for bead state, dependencies, comments, and close sync |
 | `bv` (beads_viewer) | Graph-aware triage and planning insight (`--robot-triage` and related robot views) |
 
