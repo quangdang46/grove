@@ -94,8 +94,10 @@ fn workflow_phase_roundtrip_and_progression() -> TestResult {
 #[test]
 fn workflow_state_can_be_inferred_from_labels_and_metadata() {
     let labels = vec!["grove:workflow:review".to_owned()];
-    let inferred = WorkflowState::inferred_from_labels(&labels).expect("workflow label");
-    assert_eq!(inferred.phase, WorkflowPhase::Review);
+    assert_eq!(
+        WorkflowState::inferred_from_labels(&labels).map(|state| state.phase),
+        Some(WorkflowPhase::Review)
+    );
 
     let metadata = json!({
         "grove": {
@@ -104,14 +106,18 @@ fn workflow_state_can_be_inferred_from_labels_and_metadata() {
             }
         }
     });
-    let from_metadata = WorkflowState::from_metadata(&metadata).expect("workflow metadata");
-    assert_eq!(from_metadata.phase, WorkflowPhase::Plan);
+    assert_eq!(
+        WorkflowState::from_metadata(&metadata).map(|state| state.phase),
+        Some(WorkflowPhase::Plan)
+    );
 }
 
 #[test]
 fn workflow_state_can_be_inferred_from_issue_type() {
-    let inferred = WorkflowState::inferred_from_issue_type("feature").expect("feature workflow");
-    assert_eq!(inferred.phase, WorkflowPhase::Explore);
+    assert_eq!(
+        WorkflowState::inferred_from_issue_type("feature").map(|state| state.phase),
+        Some(WorkflowPhase::Explore)
+    );
     assert!(WorkflowState::inferred_from_issue_type("task").is_none());
 }
 

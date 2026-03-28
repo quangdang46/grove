@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use super::*;
 use grove_br::{
     BeadCacheStore, BrCapability, BrCreateIssueInput, BrDependencySnapshot, BrError, BrIssueDetail,

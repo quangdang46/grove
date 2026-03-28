@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use super::*;
 use crate::status_view::SuppressionReasonView;
 use camino::Utf8PathBuf;

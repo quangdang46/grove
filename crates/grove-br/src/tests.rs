@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use super::*;
 use grove_types::{BeadPriority, HandoffRecord, Timestamp};
 use serde_json::json;
@@ -124,6 +126,15 @@ impl BrClient for FakeBrClient {
     }
 
     fn create_issue(&self, input: &crate::BrCreateIssueInput) -> Result<BrIssueDetail, BrError> {
+        let created_at: Timestamp =
+            "2026-03-20T05:00:00Z"
+                .parse()
+                .map_err(|error: chrono::ParseError| BrError::ProtocolViolation {
+                    command: "fake create_issue timestamp".to_owned(),
+                    message: error.to_string(),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })?;
         Ok(BrIssueDetail {
             summary: BrIssueSummary {
                 id: BeadId::new("bd-created"),
@@ -134,8 +145,8 @@ impl BrClient for FakeBrClient {
                 status: "open".to_owned(),
                 assignee: None,
                 labels: input.labels.clone(),
-                created_at: "2026-03-20T05:00:00Z".parse().expect("timestamp"),
-                updated_at: "2026-03-20T05:00:00Z".parse().expect("timestamp"),
+                created_at,
+                updated_at: created_at,
                 blocked_by: Vec::new(),
                 blocks: Vec::new(),
                 raw_json: json!({}),
