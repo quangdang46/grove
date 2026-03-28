@@ -1394,9 +1394,13 @@ mod tests {
     use grove_types::{
         BeadId, BeadPriority, BeadRef, CircuitBreakerState, CircuitState, RunId, RunStatus,
     };
-    use std::error::Error;
+    use std::{error::Error, io};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    fn require_some<T>(value: Option<T>, message: &str) -> TestResult<T> {
+        value.ok_or_else(|| io::Error::other(message).into())
+    }
 
     #[test]
     fn ready_bead_without_local_blockers_is_dispatchable() -> TestResult {
@@ -1681,16 +1685,20 @@ mod tests {
             "2026-03-16T12:00:30Z".parse::<Timestamp>()?
         );
 
-        let heartbeat = LeaderLeaseManager::heartbeat(&mut db, &config, heartbeat_at)?
-            .expect("heartbeat should refresh owned lease");
+        let heartbeat = require_some(
+            LeaderLeaseManager::heartbeat(&mut db, &config, heartbeat_at)?,
+            "heartbeat should refresh owned lease",
+        )?;
         assert_eq!(heartbeat.heartbeat_at, heartbeat_at);
         assert_eq!(
             heartbeat.expires_at,
             "2026-03-16T12:00:35Z".parse::<Timestamp>()?
         );
 
-        let released = LeaderLeaseManager::release(&mut db, "worker-a", release_at)?
-            .expect("release should return the lease record");
+        let released = require_some(
+            LeaderLeaseManager::release(&mut db, "worker-a", release_at)?,
+            "release should return the lease record",
+        )?;
         assert_eq!(released.owner_label, "worker-a");
         assert!(db.active_leader_lease(&release_at)?.is_none());
         Ok(())
@@ -1771,9 +1779,10 @@ mod tests {
         );
         assert!(report.reservations.expired.is_empty());
 
-        let bead = db
-            .get_bead_record(&BeadId::new("grove-recover"))?
-            .expect("runtime bead should exist");
+        let bead = require_some(
+            db.get_bead_record(&BeadId::new("grove-recover"))?,
+            "runtime bead should exist",
+        )?;
         assert_eq!(bead.grove_status, GroveBeadStatus::WaitingToRetry);
         assert_eq!(bead.last_failure_class, Some(FailureClass::Interrupted));
         assert!(db.list_active_reservations_at(&now)?.is_empty());
@@ -1979,15 +1988,19 @@ exit "${EXIT_CODE:-0}"
             Some(vec!["crates/grove-kernel/src/lib.rs".to_owned()])
         );
         assert_eq!(
-            db.latest_session_for_run(&RunId::new("run-life"))?
-                .expect("session should persist")
-                .status,
+            require_some(
+                db.latest_session_for_run(&RunId::new("run-life"))?,
+                "session should persist",
+            )?
+            .status,
             SessionStatus::Completed
         );
         assert_eq!(
-            db.handoff_for_bead(&BeadId::new("grove-life"))?
-                .expect("handoff should persist")
-                .summary,
+            require_some(
+                db.handoff_for_bead(&BeadId::new("grove-life"))?,
+                "handoff should persist",
+            )?
+            .summary,
             "runtime persistence wired"
         );
         Ok(())
@@ -2113,9 +2126,11 @@ exit "${EXIT_CODE:-0}"
             Some("finish wiring")
         );
         assert_eq!(
-            db.latest_checkpoint_for_bead(&BeadId::new("grove-life"))?
-                .expect("checkpoint should persist")
-                .next_step,
+            require_some(
+                db.latest_checkpoint_for_bead(&BeadId::new("grove-life"))?,
+                "checkpoint should persist",
+            )?
+            .next_step,
             "finish wiring"
         );
         let checkpoint_path = workspace_dir
@@ -2193,28 +2208,32 @@ exit "${EXIT_CODE:-0}"
                 .contains("failed to persist checkpoint file")
         );
 
-        let bead = db
-            .get_bead_record(&BeadId::new("grove-life"))?
-            .expect("bead runtime should persist");
+        let bead = require_some(
+            db.get_bead_record(&BeadId::new("grove-life"))?,
+            "bead runtime should persist",
+        )?;
         assert_eq!(bead.grove_status, GroveBeadStatus::Checkpointed);
 
-        let run = db
-            .list_task_runs_for_bead(&BeadId::new("grove-life"))?
-            .into_iter()
-            .next()
-            .expect("run should persist");
+        let run = require_some(
+            db.list_task_runs_for_bead(&BeadId::new("grove-life"))?
+                .into_iter()
+                .next(),
+            "run should persist",
+        )?;
         assert_eq!(run.status, RunStatus::Checkpointed);
 
-        let checkpoint = db
-            .latest_checkpoint_for_bead(&BeadId::new("grove-life"))?
-            .expect("checkpoint row should persist");
+        let checkpoint = require_some(
+            db.latest_checkpoint_for_bead(&BeadId::new("grove-life"))?,
+            "checkpoint row should persist",
+        )?;
         assert_eq!(checkpoint.next_step, "finish wiring");
 
-        let run = db
-            .list_task_runs_for_bead(&BeadId::new("grove-life"))?
-            .into_iter()
-            .next()
-            .expect("run should persist");
+        let run = require_some(
+            db.list_task_runs_for_bead(&BeadId::new("grove-life"))?
+                .into_iter()
+                .next(),
+            "run should persist",
+        )?;
         assert!(
             run.failure_detail
                 .as_deref()
@@ -2271,9 +2290,10 @@ exit "${EXIT_CODE:-0}"
             persisted.run.failure_class,
             Some(FailureClass::ClaudeCrashed)
         );
-        let checkpoint = persisted
-            .checkpoint
-            .expect("fallback checkpoint should be written for crash without GROVE_CHECKPOINT");
+        let checkpoint = require_some(
+            persisted.checkpoint,
+            "fallback checkpoint should be written for crash without GROVE_CHECKPOINT",
+        )?;
         assert!(checkpoint.id.as_str().contains("fallback"));
         assert!(
             checkpoint
@@ -2347,9 +2367,10 @@ exit "${EXIT_CODE:-0}"
             persisted.session.session.stop_reason,
             Some(grove_types::StopReason::Unknown)
         );
-        let bead = db
-            .get_bead_record(&BeadId::new("grove-life"))?
-            .expect("bead runtime should persist");
+        let bead = require_some(
+            db.get_bead_record(&BeadId::new("grove-life"))?,
+            "bead runtime should persist",
+        )?;
         assert_eq!(bead.grove_status, GroveBeadStatus::Checkpointed);
         assert_eq!(bead.last_failure_class, None);
         assert!(persisted.checkpoint.is_some());
@@ -2402,9 +2423,10 @@ exit "${EXIT_CODE:-0}"
             SessionStatus::UnknownFailure
         );
         assert_eq!(persisted.session.session.exit_code, None);
-        let bead = db
-            .get_bead_record(&BeadId::new("grove-life"))?
-            .expect("bead runtime should persist");
+        let bead = require_some(
+            db.get_bead_record(&BeadId::new("grove-life"))?,
+            "bead runtime should persist",
+        )?;
         assert_eq!(bead.grove_status, GroveBeadStatus::Checkpointed);
         assert_eq!(bead.last_failure_class, None);
         assert!(persisted.checkpoint.is_some());
@@ -2461,9 +2483,10 @@ exit "${EXIT_CODE:-0}"
 
         assert_eq!(persisted.run.status, RunStatus::WaitingToRetry);
         assert_eq!(persisted.run.failure_class, Some(FailureClass::Interrupted));
-        let bead = db
-            .get_bead_record(&BeadId::new("grove-life"))?
-            .expect("bead runtime should persist");
+        let bead = require_some(
+            db.get_bead_record(&BeadId::new("grove-life"))?,
+            "bead runtime should persist",
+        )?;
         assert_eq!(bead.grove_status, GroveBeadStatus::Checkpointed);
         assert_eq!(bead.last_failure_class, None);
         assert!(persisted.checkpoint.is_some());
@@ -2519,9 +2542,11 @@ exit "${EXIT_CODE:-0}"
         assert_eq!(persisted.session.session.status, SessionStatus::RateLimited);
         assert!(persisted.handoff.is_none());
         assert_eq!(
-            db.get_bead_record(&BeadId::new("grove-life"))?
-                .expect("bead runtime should persist")
-                .retry_after,
+            require_some(
+                db.get_bead_record(&BeadId::new("grove-life"))?,
+                "bead runtime should persist",
+            )?
+            .retry_after,
             persisted.run.ended_at
         );
         Ok(())

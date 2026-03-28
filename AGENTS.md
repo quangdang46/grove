@@ -838,12 +838,13 @@ UBS stands for "Ultimate Bug Scanner": **The AI Coding Agent's Secret Weapon: Fl
 
 **Install:** `curl -sSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh | bash`
 
-**Golden Rule:** `ubs <changed-files>` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
+**Golden Rule:** `ubs --diff .` during iteration and `ubs --staged .` before every commit. In this repo, those modes respect `.ubsignore`, which trims test-only panic/assert inventory while keeping runtime Rust changes scanned.
 
 **Commands:**
 ```bash
-ubs file.ts file2.py                    # Specific files (< 1s) — USE THIS
-ubs $(git diff --name-only --cached)    # Staged files — before commit
+ubs --diff .                            # Changed files in working tree (preferred here)
+ubs --staged .                          # Staged files — before commit
+ubs file.ts file2.py                    # Direct file scan when you need a one-off deep dive
 ubs --only=js,python src/               # Language filter (3-5x faster)
 ubs --ci --fail-on-warning .            # CI mode — before PR
 ubs --help                              # Full command reference
@@ -865,10 +866,10 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 2. Navigate `file:line:col` → view context
 3. Verify real issue (not false positive)
 4. Fix root cause (not symptom)
-5. Re-run `ubs <file>` → exit 0
+5. Re-run `ubs --diff .` or `ubs --staged .` → exit 0
 6. Commit
 
-**Speed Critical:** Scope to changed files. `ubs src/file.ts` (< 1s) vs `ubs .` (30s). Never full scan for small edits.
+**Speed Critical:** Scope to changed files. Prefer `ubs --diff .` or `ubs --staged .` in this repo so `.ubsignore` stays active; use direct file scans only for deliberate spot checks.
 
 **Bug Severity:**
 - **Critical** (always fix): Null safety, XSS/injection, async/await, memory leaks

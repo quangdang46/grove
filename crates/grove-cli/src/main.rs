@@ -2293,7 +2293,7 @@ mod tests {
     use super::*;
     use grove_kernel::{BlockedReasonCount, BlockedSampleBead, BlockedSampleReason};
     use grove_types::{BeadRef, RunId, Timestamp};
-    use std::error::Error;
+    use std::{error::Error, io};
     use tempfile::tempdir;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -2310,7 +2310,10 @@ mod tests {
             ),
         )?;
 
-        let lines = read_live_transcript_lines(path.to_str().unwrap())?;
+        let transcript_path = path
+            .to_str()
+            .ok_or_else(|| io::Error::other("partial transcript path must be valid UTF-8"))?;
+        let lines = read_live_transcript_lines(transcript_path)?;
         assert_eq!(
             lines,
             vec![
@@ -2322,7 +2325,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_blocked_summary_prints_retry_guidance() {
+    fn dispatch_blocked_summary_prints_retry_guidance() -> TestResult {
         let summary = DispatchBlockedSummary {
             blocked_ready_count: 1,
             reason_counts: vec![BlockedReasonCount {
@@ -2339,13 +2342,14 @@ mod tests {
             }],
         };
 
-        let payload = serde_json::to_value(summary).expect("blocked summary should serialize");
+        let payload = serde_json::to_value(summary)?;
         assert_eq!(payload["blocked_ready_count"], 1);
         assert_eq!(
             payload["reason_counts"][0]["code"],
             "failed_awaiting_manual_retry"
         );
         assert_eq!(payload["sample_beads"][0]["bead_id"], "saw-1rb");
+        Ok(())
     }
 
     #[test]
