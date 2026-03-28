@@ -192,14 +192,7 @@ pub fn build_provider_environment(
     current_env: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
     let mut always_pass = vec![
-        "HOME",
-        "USER",
-        "PATH",
-        "SHELL",
-        "TERM",
-        "LANG",
-        "LC_ALL",
-        "TZ",
+        "HOME", "USER", "PATH", "SHELL", "TERM", "LANG", "LC_ALL", "TZ",
     ];
     match provider {
         RuntimeProvider::Claude => {

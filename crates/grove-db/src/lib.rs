@@ -4030,8 +4030,8 @@ mod tests {
     use grove_types::{
         BeadId, BeadPriority, CheckpointId, CheckpointPayload, CircuitBreakerState,
         ClaudeSessionRecord, EventKind, FailureClass, HandoffRecord, PromptId,
-        RecoveryCapsuleOutcome, ReservationMode, RunId, RunStatus, SessionId, SessionStatus,
-        StopReason, Timestamp, RuntimeProvider,
+        RecoveryCapsuleOutcome, ReservationMode, RunId, RunStatus, RuntimeProvider, SessionId,
+        SessionStatus, StopReason, Timestamp,
     };
     use rusqlite::OptionalExtension;
     use serde_json::json;

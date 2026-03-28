@@ -88,9 +88,9 @@ fn main() -> Result<()> {
         }) => run_json_command("init", cli.json, || {
             handle_init(cli.json, provider.as_deref(), force, skills)
         }),
-        Some(Command::Migrate { provider }) => run_json_command("migrate", cli.json, || {
-            handle_migrate(cli.json, &provider)
-        }),
+        Some(Command::Migrate { provider }) => {
+            run_json_command("migrate", cli.json, || handle_migrate(cli.json, &provider))
+        }
         Some(Command::Sync) => run_json_command("sync", cli.json, || handle_sync(cli.json)),
         Some(Command::Status) => handle_status(cli.json),
         Some(Command::Inspect { bead_id }) => handle_inspect(&BeadId::new(bead_id), cli.json),
@@ -323,7 +323,8 @@ fn handle_init(
         )
     })?;
     ensure_workspace_layout(&loaded.paths)?;
-    let wrote_startup_prompt = ensure_startup_prompt_file(&loaded.paths, loaded.config.runtime.provider)?;
+    let wrote_startup_prompt =
+        ensure_startup_prompt_file(&loaded.paths, loaded.config.runtime.provider)?;
     let bundled_skill_results = if skills {
         ensure_bundled_skill_files(loaded.paths.workspace_root())?
     } else {
@@ -469,7 +470,10 @@ fn handle_init(
     println!("\nValidated tools:");
     println!(
         "- {}",
-        render_tool_line(&tooling.active_provider.binary, tooling.active_provider.version.as_deref())
+        render_tool_line(
+            &tooling.active_provider.binary,
+            tooling.active_provider.version.as_deref()
+        )
     );
     println!(
         "- {}",
@@ -2019,8 +2023,14 @@ fn ensure_startup_prompt_file(paths: &GrovePaths, provider: RuntimeProvider) -> 
 fn render_default_config(provider: RuntimeProvider) -> String {
     let default_bin = provider.default_bin();
     DEFAULT_INIT_GROVE_TOML
-        .replace("provider = \"claude\"", &format!("provider = \"{}\"", provider.as_str()))
-        .replace("provider_bin = \"claude\"", &format!("provider_bin = \"{default_bin}\""))
+        .replace(
+            "provider = \"claude\"",
+            &format!("provider = \"{}\"", provider.as_str()),
+        )
+        .replace(
+            "provider_bin = \"claude\"",
+            &format!("provider_bin = \"{default_bin}\""),
+        )
         .trim_end()
         .to_owned()
 }

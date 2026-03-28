@@ -101,7 +101,11 @@ impl ClaudeBackend for CliSessionBackend {
         }
 
         let mut child = command.spawn().with_context(|| {
-            format!("spawn {} in {}", self.provider_bin, req.working_dir.as_str())
+            format!(
+                "spawn {} in {}",
+                self.provider_bin,
+                req.working_dir.as_str()
+            )
         })?;
 
         let stdout = child
