@@ -2015,8 +2015,7 @@ fn ensure_startup_prompt_file(paths: &GrovePaths, provider: RuntimeProvider) -> 
         return Ok(false);
     }
 
-    let text = default_startup_prompt(provider);
-    fs::write(path, text).with_context(|| format!("write startup prompt template to {path}"))?;
+    write_startup_prompt(path, provider, "write startup prompt template")?;
     Ok(true)
 }
 
@@ -2095,37 +2094,131 @@ fn handle_migrate(json_mode: bool, provider: &str) -> Result<()> {
 fn migrate_workspace_provider(config_path: &Utf8Path, provider: RuntimeProvider) -> Result<()> {
     let raw = fs::read_to_string(config_path)
         .with_context(|| format!("read Grove config from {config_path}"))?;
-    let mut parsed: toml::Value = raw
+    let parsed: toml::Value = raw
         .parse()
         .with_context(|| format!("parse Grove config from {config_path}"))?;
     let root = parsed
-        .as_table_mut()
+        .as_table()
         .ok_or_else(|| anyhow!("grove.toml root must be a table"))?;
-    let runtime = root
-        .entry("runtime")
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
-        .as_table_mut()
-        .ok_or_else(|| anyhow!("runtime section must be a table"))?;
-    runtime.insert(
-        "provider".to_owned(),
-        toml::Value::String(provider.as_str().to_owned()),
-    );
-    runtime.insert(
-        "provider_bin".to_owned(),
-        toml::Value::String(provider.default_bin().to_owned()),
-    );
-    runtime.remove("claude_bin");
-    let encoded =
-        toml::to_string_pretty(&parsed).context("encode migrated Grove config back to TOML")?;
+    if let Some(runtime) = root.get("runtime") {
+        runtime
+            .as_table()
+            .ok_or_else(|| anyhow!("runtime section must be a table"))?;
+    }
+
+    let encoded = rewrite_runtime_provider_block(&raw, provider);
+    encoded
+        .parse::<toml::Value>()
+        .context("validate migrated Grove config TOML")?;
     fs::write(config_path, encoded)
         .with_context(|| format!("write migrated Grove config to {config_path}"))?;
     Ok(())
 }
 
+fn rewrite_runtime_provider_block(raw: &str, provider: RuntimeProvider) -> String {
+    let mut lines = raw.lines().map(str::to_owned).collect::<Vec<_>>();
+    let had_trailing_newline = raw.ends_with('\n');
+
+    let runtime_start =
+        if let Some(index) = lines.iter().position(|line| line.trim() == "[runtime]") {
+            index
+        } else {
+            if !lines.is_empty() && !lines.last().is_some_and(|line| line.is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push("[runtime]".to_owned());
+            lines.push(format!("provider = \"{}\"", provider.as_str()));
+            lines.push(format!("provider_bin = \"{}\"", provider.default_bin()));
+            return render_lines(lines, had_trailing_newline);
+        };
+    let runtime_body_start = runtime_start + 1;
+    let runtime_end = lines
+        .iter()
+        .enumerate()
+        .skip(runtime_body_start)
+        .find(|(_, line)| {
+            let trimmed = line.trim();
+            trimmed.starts_with('[') && trimmed.ends_with(']')
+        })
+        .map_or(lines.len(), |(index, _)| index);
+
+    let mut provider_line_index = None;
+    let mut provider_bin_line_index = None;
+    let mut claude_bin_line_index = None;
+
+    for (offset, line) in lines[runtime_body_start..runtime_end].iter().enumerate() {
+        let index = runtime_body_start + offset;
+        match assignment_key(line) {
+            Some("provider") => provider_line_index = Some(index),
+            Some("provider_bin") => provider_bin_line_index = Some(index),
+            Some("claude_bin") => claude_bin_line_index = Some(index),
+            _ => {}
+        }
+    }
+
+    if let Some(index) = provider_line_index {
+        let indent = leading_whitespace(&lines[index]);
+        lines[index] = format!("{indent}provider = \"{}\"", provider.as_str());
+    } else {
+        lines.insert(
+            runtime_body_start,
+            format!("provider = \"{}\"", provider.as_str()),
+        );
+        provider_line_index = Some(runtime_body_start);
+        provider_bin_line_index = provider_bin_line_index.map(|index| index + 1);
+        claude_bin_line_index = claude_bin_line_index.map(|index| index + 1);
+    }
+
+    if let Some(index) = provider_bin_line_index.or(claude_bin_line_index) {
+        let indent = leading_whitespace(&lines[index]);
+        lines[index] = format!("{indent}provider_bin = \"{}\"", provider.default_bin());
+    } else {
+        let insert_at = provider_line_index.map_or(runtime_body_start, |index| index + 1);
+        lines.insert(
+            insert_at,
+            format!("provider_bin = \"{}\"", provider.default_bin()),
+        );
+    }
+
+    if let Some(index) = claude_bin_line_index
+        && provider_bin_line_index.is_some()
+    {
+        lines.remove(index);
+    }
+
+    render_lines(lines, had_trailing_newline)
+}
+
+fn assignment_key(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    let (key, _) = trimmed.split_once('=')?;
+    Some(key.trim())
+}
+
+fn leading_whitespace(line: &str) -> &str {
+    line.split_at(
+        line.char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+            .map_or(line.len(), |(index, _)| index),
+    )
+    .0
+}
+
+fn render_lines(lines: Vec<String>, had_trailing_newline: bool) -> String {
+    let mut rendered = lines.join("\n");
+    if had_trailing_newline {
+        rendered.push('\n');
+    }
+    rendered
+}
+
 fn maybe_update_startup_prompt(path: &Utf8Path, provider: RuntimeProvider) -> Result<bool> {
     if !path.exists() {
-        fs::write(path, default_startup_prompt(provider))
-            .with_context(|| format!("write startup prompt template to {path}"))?;
+        write_startup_prompt(path, provider, "write startup prompt template")?;
         return Ok(true);
     }
 
@@ -2140,9 +2233,18 @@ fn maybe_update_startup_prompt(path: &Utf8Path, provider: RuntimeProvider) -> Re
         return Ok(false);
     }
 
-    fs::write(path, default_startup_prompt(provider))
-        .with_context(|| format!("rewrite startup prompt template to {path}"))?;
+    write_startup_prompt(path, provider, "rewrite startup prompt template")?;
     Ok(true)
+}
+
+fn write_startup_prompt(path: &Utf8Path, provider: RuntimeProvider, action: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create startup prompt parent directory {parent}"))?;
+    }
+    fs::write(path, default_startup_prompt(provider))
+        .with_context(|| format!("{action} to {path}"))?;
+    Ok(())
 }
 
 struct BundledSkillResult {

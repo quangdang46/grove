@@ -52,10 +52,9 @@ fn sample_paths(config: &GroveConfig) -> Result<(TempDir, GrovePaths), Box<dyn s
 }
 
 fn sample_timestamp() -> Timestamp {
-    match "2026-03-17T00:00:00Z".parse() {
-        Ok(timestamp) => timestamp,
-        Err(error) => panic!("failed to parse fixture timestamp: {error}"),
-    }
+    chrono::DateTime::parse_from_rfc3339("2026-03-17T00:00:00Z")
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
 }
 
 // ============================================================================
@@ -1054,6 +1053,158 @@ fn init_json_emits_machine_readable_output() -> TestResult {
     assert!(payload["next_steps"].is_array());
     assert_eq!(payload["forced_reset"], true);
     assert!(payload["sync_result"].is_null() || payload["sync_result"].is_object());
+
+    Ok(())
+}
+
+#[test]
+fn migrate_preserves_existing_config_order() -> TestResult {
+    let harness = CliHarness::new()?;
+    let original = r#"[runtime]
+provider = "claude"
+provider_bin = "claude"
+default_model = "default"
+workspace_root = "."
+timeout_minutes = 60
+
+[scheduler]
+max_parallel = 5
+poll_interval_ms = 1000
+retry_max = 3
+retry_backoff_secs = 30
+critical_path_bonus = 20
+reservation_conflict_penalty = 1000
+
+[checkpoint]
+warn_pct = 0.70
+rotate_pct = 0.82
+hard_stop_pct = 0.90
+
+[exit_policy]
+completion_indicator_threshold = 2
+heuristic_window = 8
+require_explicit_exit = true
+
+[circuit_breaker]
+no_progress_threshold = 3
+same_error_threshold = 5
+permission_denial_threshold = 2
+cooldown_minutes = 30
+
+[memory]
+enable_playbook = true
+archive_top_k = 5
+max_prompt_snippets = 3
+max_prompt_bullets = 12
+
+[reservations]
+enabled = true
+default_ttl_minutes = 60
+
+[safety]
+scan_transcripts = true
+inject_safety_preamble = true
+
+[logging]
+level = "info"
+persist_jsonl = true
+"#;
+    fs::write(harness.workspace_root.join("grove.toml"), original)?;
+
+    let output = harness.run(["migrate", "--provider", "codex"])?;
+    assert!(
+        output.status.success(),
+        "migrate should succeed: {}",
+        output_text(&output)
+    );
+
+    let expected = r#"[runtime]
+provider = "codex"
+provider_bin = "codex"
+default_model = "default"
+workspace_root = "."
+timeout_minutes = 60
+
+[scheduler]
+max_parallel = 5
+poll_interval_ms = 1000
+retry_max = 3
+retry_backoff_secs = 30
+critical_path_bonus = 20
+reservation_conflict_penalty = 1000
+
+[checkpoint]
+warn_pct = 0.70
+rotate_pct = 0.82
+hard_stop_pct = 0.90
+
+[exit_policy]
+completion_indicator_threshold = 2
+heuristic_window = 8
+require_explicit_exit = true
+
+[circuit_breaker]
+no_progress_threshold = 3
+same_error_threshold = 5
+permission_denial_threshold = 2
+cooldown_minutes = 30
+
+[memory]
+enable_playbook = true
+archive_top_k = 5
+max_prompt_snippets = 3
+max_prompt_bullets = 12
+
+[reservations]
+enabled = true
+default_ttl_minutes = 60
+
+[safety]
+scan_transcripts = true
+inject_safety_preamble = true
+
+[logging]
+level = "info"
+persist_jsonl = true
+"#;
+    assert_eq!(
+        fs::read_to_string(harness.workspace_root.join("grove.toml"))?,
+        expected,
+        "migrate should only rewrite runtime provider fields"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn migrate_replaces_legacy_claude_bin_without_reordering_runtime_block() -> TestResult {
+    let harness = CliHarness::new()?;
+    let original = r#"[runtime]
+provider = "claude"
+claude_bin = "claude-custom"
+default_model = "default"
+workspace_root = "."
+timeout_minutes = 60
+
+[logging]
+level = "info"
+persist_jsonl = true
+"#;
+    fs::write(harness.workspace_root.join("grove.toml"), original)?;
+
+    let output = harness.run(["migrate", "--provider", "codex"])?;
+    assert!(
+        output.status.success(),
+        "migrate should succeed for legacy claude_bin configs: {}",
+        output_text(&output)
+    );
+
+    let migrated = fs::read_to_string(harness.workspace_root.join("grove.toml"))?;
+    assert!(!migrated.contains("claude_bin ="));
+    assert!(migrated.contains("provider = \"codex\""));
+    assert!(migrated.contains("provider_bin = \"codex\""));
+    assert!(migrated.contains("default_model = \"default\""));
+    assert!(migrated.contains("\n[logging]\n"));
 
     Ok(())
 }
