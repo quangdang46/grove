@@ -724,6 +724,83 @@ fn dispatch_loop_exits_queue_empty_when_ready_beads_are_all_locally_suppressed()
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn dispatch_loop_stops_after_explicit_exit_false_without_checkpoint() -> TestResult {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    fs::create_dir_all(workspace_dir.join(".grove"))?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| std::io::Error::other("workspace dir must be valid UTF-8"))?;
+    let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+        .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+
+    let mut db = Database::open(&db_path)?;
+    db.migrate()?;
+
+    let first = bead_summary("grove-blocked", BeadPriority::P0)?;
+    let second = bead_summary("grove-next", BeadPriority::P1)?;
+    db.upsert_bead_cache(&first)?;
+    db.upsert_bead_cache(&second)?;
+    db.set_grove_status(&first.id, GroveBeadStatus::Ready)?;
+    db.set_grove_status(&second.id, GroveBeadStatus::Ready)?;
+
+    let script_path = dir.path().join("blocked-claude");
+    fs::write(
+        &script_path,
+        "#!/bin/sh\nprintf 'GROVE_RESULT: blocked on upstream coordination\\nGROVE_WARNINGS: waiting for unblock\\nGROVE_EXIT: false\\n'\n",
+    )?;
+    let mut permissions = fs::metadata(&script_path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions)?;
+
+    let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+    let br = TestBrClient::new(vec![first.clone(), second.clone()], false, Duration::ZERO);
+    let mut config = GroveConfig::default();
+    config.scheduler.max_parallel = 1;
+    config.scheduler.poll_interval_ms = 10;
+    let lease_config = LeaderLeaseConfig {
+        owner_label: "test-owner".to_owned(),
+        lease_ttl: chrono::Duration::seconds(1),
+    };
+    let now = chrono::Utc::now();
+    let _ = LeaderLeaseManager::acquire(&mut db, &lease_config, None, now)?;
+    let loop_config = DispatchLoopConfig {
+        max_total_runs: None,
+        max_poll_cycles: Some(50),
+        working_dir: workspace_dir,
+        shutdown_signal: ShutdownSignal::new(),
+        db_path,
+    };
+
+    let outcome = run_dispatch_loop(&mut db, &backend, &br, &config, &lease_config, &loop_config)?;
+
+    assert_eq!(outcome.exit_reason, DispatchExitReason::DispatchBlocked);
+    assert_eq!(outcome.stop_reason, CoordinatorStopReason::DispatchBlocked);
+    assert_eq!(outcome.dispatched_count, 1);
+    let blocked_summary = outcome
+        .blocked_summary
+        .expect("blocked summary should explain manual stop");
+    assert_eq!(blocked_summary.blocked_ready_count, 1);
+    assert_eq!(
+        blocked_summary.reason_counts[0].code,
+        "explicit_exit_false_without_checkpoint"
+    );
+    assert_eq!(
+        blocked_summary.sample_beads[0].bead_id,
+        BeadId::new("grove-blocked")
+    );
+    let runs = db.list_task_runs_for_bead(&BeadId::new("grove-next"))?;
+    assert!(
+        runs.is_empty(),
+        "expected second bead to remain undispatched"
+    );
+    Ok(())
+}
+
 #[test]
 fn dispatch_exit_reason_display() {
     assert_eq!(

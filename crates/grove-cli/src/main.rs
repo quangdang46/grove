@@ -213,6 +213,14 @@ fn print_dispatch_blocked_summary(
                 "Next action: run `grove retry {}` and then `grove run`.",
                 sample.bead_id.as_str()
             );
+        } else if sample
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "explicit_exit_false_without_checkpoint")
+        {
+            println!(
+                "Next action: update the task output to emit `GROVE_CHECKPOINT` together with `GROVE_EXIT: false`, or mark the bead blocked in `br` before rerunning."
+            );
         } else {
             println!(
                 "Next action: inspect the blocked bead with `grove inspect {}` or review `grove status`.",

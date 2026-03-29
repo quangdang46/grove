@@ -17,8 +17,9 @@ use grove_session::{
     SingleTaskSessionRequest,
 };
 use grove_types::{
-    BeadId, CoordinatorStopReason, EscalationTier, ExecutionContract, GroveBeadRecord,
-    GroveBeadStatus, PromptId, ReservationConflict, ReservationMode, RunId, SessionId, Timestamp,
+    BeadId, CoordinatorStopReason, EscalationTier, ExecutionContract, FailureClass,
+    GroveBeadRecord, GroveBeadStatus, PromptId, ReservationConflict, ReservationMode, RunId,
+    RunStatus, SessionId, SessionStatus, Timestamp,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -124,6 +125,10 @@ pub struct BlockedSampleReason {
     pub code: &'static str,
     pub summary: String,
 }
+
+const EXPLICIT_EXIT_FALSE_WITHOUT_CHECKPOINT_CODE: &str = "explicit_exit_false_without_checkpoint";
+const EXPLICIT_EXIT_FALSE_WITHOUT_CHECKPOINT_SUMMARY: &str =
+    "provider ended with `GROVE_EXIT: false` without a matching `GROVE_CHECKPOINT`";
 
 /// Why the dispatch loop stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,20 +420,57 @@ fn lease_renew_interval(lease_ttl: chrono::Duration) -> chrono::Duration {
     chrono::Duration::milliseconds((lease_ttl.num_milliseconds() / 3).max(1))
 }
 
+fn requires_manual_dispatch_stop(outcome: &PersistedTaskRunOutcome) -> bool {
+    outcome.run.status == RunStatus::Failed
+        && outcome.run.failure_class == Some(FailureClass::Unknown)
+        && outcome.session.session.status == SessionStatus::UnknownFailure
+        && outcome.session.analysis.has_explicit_exit_false
+        && outcome.checkpoint.is_none()
+}
+
+fn explicit_exit_false_without_checkpoint_summary(bead_ids: &[BeadId]) -> DispatchBlockedSummary {
+    let sample_beads = bead_ids
+        .iter()
+        .take(3)
+        .cloned()
+        .map(|bead_id| BlockedSampleBead {
+            bead_id,
+            reasons: vec![BlockedSampleReason {
+                code: EXPLICIT_EXIT_FALSE_WITHOUT_CHECKPOINT_CODE,
+                summary: EXPLICIT_EXIT_FALSE_WITHOUT_CHECKPOINT_SUMMARY.to_owned(),
+            }],
+        })
+        .collect();
+
+    DispatchBlockedSummary {
+        blocked_ready_count: bead_ids.len().max(1),
+        reason_counts: vec![BlockedReasonCount {
+            code: EXPLICIT_EXIT_FALSE_WITHOUT_CHECKPOINT_CODE,
+            summary: EXPLICIT_EXIT_FALSE_WITHOUT_CHECKPOINT_SUMMARY.to_owned(),
+            count: bead_ids.len().max(1),
+        }],
+        sample_beads,
+    }
+}
+
 fn handle_completed_worker<C: BrClient>(
     db: &mut Database,
     br: &C,
     config: &GroveConfig,
     inflight_workers: &mut HashMap<BeadId, InFlightWorker>,
     completed: CompletedWorker,
-) {
+) -> Option<BeadId> {
     let CompletedWorker { ctx, result } = completed;
     if let Some(worker) = inflight_workers.remove(&ctx.bead_id) {
         let _ = worker.handle.join();
     }
+    let mut manual_stop_bead_id = None;
 
     match result {
         Ok(outcome) => {
+            if requires_manual_dispatch_stop(&outcome) {
+                manual_stop_bead_id = Some(ctx.bead_id.clone());
+            }
             apply_reaction_side_effects(db, config, &ctx, Some(&outcome), None, false);
             if outcome.session.session.stop_reason == Some(grove_types::StopReason::Kill) {
                 let _ = db.write_event_log(
@@ -533,6 +575,8 @@ fn handle_completed_worker<C: BrClient>(
     if let Err(error) = grove_br::sync_bead_cache(br, db) {
         eprintln!("grove dispatch: bead cache sync failed: {error}");
     }
+
+    manual_stop_bead_id
 }
 
 fn drain_inflight_workers<C: BrClient>(
@@ -1173,9 +1217,33 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
 
     loop {
         poll_cycles += 1;
+        let mut manual_stop_bead_ids = Vec::new();
 
         while let Ok(completed) = completed_rx.try_recv() {
-            handle_completed_worker(db, br, &config, &mut inflight_workers, completed);
+            if let Some(bead_id) =
+                handle_completed_worker(db, br, &config, &mut inflight_workers, completed)
+            {
+                manual_stop_bead_ids.push(bead_id);
+            }
+        }
+        if !manual_stop_bead_ids.is_empty() {
+            drain_inflight_workers(
+                db,
+                br,
+                &config,
+                &mut inflight_workers,
+                &completed_rx,
+                poll_sleep,
+                None,
+            );
+            let blocked_summary =
+                explicit_exit_false_without_checkpoint_summary(&manual_stop_bead_ids);
+            return Ok(dispatch_loop_outcome(
+                dispatched_count,
+                poll_cycles,
+                DispatchExitReason::DispatchBlocked,
+                Some(blocked_summary),
+            ));
         }
         if let Ok(event) = lease_monitor_rx.try_recv() {
             match event {
