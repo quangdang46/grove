@@ -3,8 +3,9 @@ use anyhow::{Context, Result, anyhow};
 use camino::Utf8PathBuf;
 use grove_types::RuntimeProvider;
 use std::{
-    io::{BufRead, BufReader, Lines},
+    io::{self, BufRead, BufReader, Lines},
     process::{Child, ChildStderr, ChildStdout, Command, Stdio},
+    thread,
     time::Duration,
 };
 
@@ -66,6 +67,8 @@ impl RunningSession {
 /// Sentinel: when `default_model` in config is `"default"`, Grove does not pass `--model`
 /// so the provider CLI uses its own default model.
 pub const DEFAULT_MODEL_OMIT_FLAG: &str = "default";
+const SPAWN_RETRY_ATTEMPTS: usize = 5;
+const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 impl ClaudeBackend for CliSessionBackend {
     fn start(&self, req: StartSessionRequest) -> Result<RunningSession> {
@@ -100,7 +103,7 @@ impl ClaudeBackend for CliSessionBackend {
             command.env(key, value);
         }
 
-        let mut child = command.spawn().with_context(|| {
+        let mut child = spawn_with_retry(&mut command).with_context(|| {
             format!(
                 "spawn {} in {}",
                 self.provider_bin,
@@ -124,6 +127,35 @@ impl ClaudeBackend for CliSessionBackend {
             timeout: req.timeout,
         })
     }
+}
+
+fn spawn_with_retry(command: &mut Command) -> io::Result<Child> {
+    let mut last_error = None;
+
+    for attempt in 0..SPAWN_RETRY_ATTEMPTS {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error)
+                if is_transient_spawn_error(&error) && attempt + 1 < SPAWN_RETRY_ATTEMPTS =>
+            {
+                last_error = Some(error);
+                thread::sleep(SPAWN_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| io::Error::other("spawn retry exhausted")))
+}
+
+#[cfg(unix)]
+fn is_transient_spawn_error(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(26)
+}
+
+#[cfg(not(unix))]
+fn is_transient_spawn_error(_error: &io::Error) -> bool {
+    false
 }
 
 #[cfg(all(test, unix))]

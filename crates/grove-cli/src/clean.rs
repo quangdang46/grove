@@ -96,23 +96,35 @@ struct CleanupSynthesis {
     transcript_tail_summary: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CleanOptions<'a> {
+    pub bead_filter: Option<&'a BeadId>,
+    pub dry_run: bool,
+    pub no_llm: bool,
+    pub max_beads: Option<usize>,
+    pub json_mode: bool,
+    pub yes: bool,
+}
+
 pub(super) fn handle_clean(
     loaded: LoadedConfig,
     mut db: Database,
-    bead_filter: Option<&BeadId>,
-    dry_run: bool,
-    no_llm: bool,
-    max_beads: Option<usize>,
-    json_mode: bool,
-    yes: bool,
+    options: CleanOptions<'_>,
 ) -> Result<()> {
-    if !dry_run && !yes {
+    if !options.dry_run && !options.yes {
         bail!("`grove clean` is mutating; re-run with `--yes` or inspect with `--dry-run`");
     }
 
-    let report = execute_clean(&loaded, &mut db, bead_filter, dry_run, no_llm, max_beads)?;
+    let report = execute_clean(
+        &loaded,
+        &mut db,
+        options.bead_filter,
+        options.dry_run,
+        options.no_llm,
+        options.max_beads,
+    )?;
 
-    if json_mode {
+    if options.json_mode {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_report(&report);
@@ -163,7 +175,7 @@ fn execute_clean(
         }
 
         match candidate_for_bead(loaded, db, bead, &pending_mirror_beads)? {
-            CandidateState::Eligible(candidate) => candidates.push(candidate),
+            CandidateState::Eligible(candidate) => candidates.push(*candidate),
             CandidateState::Skipped(reason, bead_id) => skipped.push(SkippedReport {
                 bead_id: bead_id.to_string(),
                 reason,
@@ -331,7 +343,7 @@ fn execute_clean(
 }
 
 enum CandidateState {
-    Eligible(CleanupCandidate),
+    Eligible(Box<CleanupCandidate>),
     Skipped(String, BeadId),
 }
 
@@ -449,7 +461,7 @@ fn candidate_for_bead(
         ));
     }
 
-    Ok(CandidateState::Eligible(CleanupCandidate {
+    Ok(CandidateState::Eligible(Box::new(CleanupCandidate {
         bead,
         latest_run,
         latest_session,
@@ -457,7 +469,7 @@ fn candidate_for_bead(
         latest_checkpoint,
         latest_recovery_capsule,
         artifacts,
-    }))
+    })))
 }
 
 fn synthesize_cleanup_snapshot(

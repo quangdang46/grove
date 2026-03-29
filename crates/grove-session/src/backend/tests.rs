@@ -1,4 +1,7 @@
-use super::{ClaudeBackend, CliSessionBackend, DEFAULT_MODEL_OMIT_FLAG, StartSessionRequest};
+use super::{
+    ClaudeBackend, CliSessionBackend, DEFAULT_MODEL_OMIT_FLAG, StartSessionRequest,
+    is_transient_spawn_error,
+};
 use camino::Utf8PathBuf;
 use grove_types::RuntimeProvider;
 use std::{error::Error, fs, time::Duration};
@@ -179,4 +182,14 @@ fn cli_backend_surfaces_spawn_failures() {
                 .contains("spawn /definitely/missing/claude in .")
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn transient_spawn_error_matches_etxtbsy() {
+    let error = std::io::Error::from_raw_os_error(26);
+    assert!(is_transient_spawn_error(&error));
+
+    let other = std::io::Error::from_raw_os_error(2);
+    assert!(!is_transient_spawn_error(&other));
 }

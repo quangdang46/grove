@@ -1194,12 +1194,14 @@ fn handle_clean(
     clean::handle_clean(
         loaded,
         db,
-        bead_filter.as_ref(),
-        dry_run,
-        no_llm,
-        max_beads,
-        json_mode,
-        yes,
+        clean::CleanOptions {
+            bead_filter: bead_filter.as_ref(),
+            dry_run,
+            no_llm,
+            max_beads,
+            json_mode,
+            yes,
+        },
     )
 }
 
