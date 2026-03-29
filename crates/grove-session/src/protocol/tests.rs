@@ -29,6 +29,18 @@ fn parse_grove_result_with_whitespace() -> TestResult {
 }
 
 #[test]
+fn parse_grove_result_without_colon_is_empty_header() -> TestResult {
+    let event = parse_protocol_event("GROVE_RESULT")?.ok_or("missing event")?;
+    assert_eq!(
+        event,
+        ProtocolEvent::Result {
+            summary: String::new()
+        }
+    );
+    Ok(())
+}
+
+#[test]
 fn parse_grove_exit_true() -> TestResult {
     let event = parse_protocol_event("GROVE_EXIT: true")?.ok_or("missing event")?;
     assert_eq!(event, ProtocolEvent::Exit { value: true });
@@ -56,6 +68,15 @@ fn parse_grove_exit_invalid_value() {
         Err(error) => error,
     };
     assert!(matches!(error, ProtocolParseError::InvalidExitValue { .. }));
+}
+
+#[test]
+fn parse_grove_exit_without_colon_is_unknown_marker() {
+    let error = match parse_protocol_event("GROVE_EXIT true") {
+        Ok(value) => panic!("expected parse error, got {value:?}"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ProtocolParseError::UnknownMarker { .. }));
 }
 
 #[test]
@@ -99,6 +120,13 @@ fn parse_grove_artifacts_single_item() -> TestResult {
 #[test]
 fn parse_grove_artifacts_empty() -> TestResult {
     let event = parse_protocol_event("GROVE_ARTIFACTS: none")?.ok_or("missing event")?;
+    assert_eq!(event, ProtocolEvent::Artifacts { items: Vec::new() });
+    Ok(())
+}
+
+#[test]
+fn parse_grove_artifacts_without_colon_is_empty_header() -> TestResult {
+    let event = parse_protocol_event("GROVE_ARTIFACTS")?.ok_or("missing event")?;
     assert_eq!(event, ProtocolEvent::Artifacts { items: Vec::new() });
     Ok(())
 }

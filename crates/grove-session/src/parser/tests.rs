@@ -136,6 +136,70 @@ fn multiline_decisions_are_captured_after_empty_header() {
 }
 
 #[test]
+fn bare_result_header_captures_following_summary_line() {
+    let mut parser = ProtocolParser::default();
+
+    assert!(matches!(
+        parser.parse_stdout_line("GROVE_RESULT"),
+        ParserLineKind::Protocol(ProtocolEvent::Result { .. })
+    ));
+    assert!(matches!(
+        parser.parse_stdout_line("- verified storage handoff"),
+        ParserLineKind::Protocol(ProtocolEvent::Result { .. })
+    ));
+
+    assert_eq!(
+        parser.state().result_summary.as_deref(),
+        Some("verified storage handoff")
+    );
+}
+
+#[test]
+fn bare_multiline_artifacts_header_is_captured() {
+    let mut parser = ProtocolParser::default();
+
+    assert!(matches!(
+        parser.parse_stdout_line("GROVE_ARTIFACTS"),
+        ParserLineKind::Protocol(ProtocolEvent::Artifacts { .. })
+    ));
+    assert!(matches!(
+        parser.parse_stdout_line("- src/storage/sqlite.rs:79"),
+        ParserLineKind::Protocol(ProtocolEvent::Artifacts { .. })
+    ));
+    assert!(matches!(
+        parser.parse_stdout_line("- src/storage/repository.rs:23"),
+        ParserLineKind::Protocol(ProtocolEvent::Artifacts { .. })
+    ));
+
+    assert_eq!(
+        parser.state().artifacts,
+        vec![
+            "src/storage/sqlite.rs:79".to_owned(),
+            "src/storage/repository.rs:23".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn bare_multiline_decisions_header_is_captured() {
+    let mut parser = ProtocolParser::default();
+
+    assert!(matches!(
+        parser.parse_stdout_line("GROVE_DECISIONS"),
+        ParserLineKind::Protocol(ProtocolEvent::Decisions { .. })
+    ));
+    assert!(matches!(
+        parser.parse_stdout_line("- keep SQLite canonical"),
+        ParserLineKind::Protocol(ProtocolEvent::Decisions { .. })
+    ));
+
+    assert_eq!(
+        parser.state().decisions,
+        vec!["keep SQLite canonical".to_owned(),]
+    );
+}
+
+#[test]
 fn multiline_warnings_stop_on_blank_line() {
     let mut parser = ProtocolParser::default();
 

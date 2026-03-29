@@ -18,16 +18,18 @@ pub struct ProtocolWarning {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingListKind {
+enum PendingProtocolKind {
+    Result,
     Artifacts,
     Lessons,
     Decisions,
     Warnings,
 }
 
-impl PendingListKind {
+impl PendingProtocolKind {
     fn from_event(event: &ProtocolEvent) -> Option<Self> {
         match event {
+            ProtocolEvent::Result { summary } if summary.is_empty() => Some(Self::Result),
             ProtocolEvent::Artifacts { items } if items.is_empty() => Some(Self::Artifacts),
             ProtocolEvent::Lessons { items } if items.is_empty() => Some(Self::Lessons),
             ProtocolEvent::Decisions { items } if items.is_empty() => Some(Self::Decisions),
@@ -38,6 +40,7 @@ impl PendingListKind {
 
     fn into_event(self, item: String) -> ProtocolEvent {
         match self {
+            Self::Result => ProtocolEvent::Result { summary: item },
             Self::Artifacts => ProtocolEvent::Artifacts { items: vec![item] },
             Self::Lessons => ProtocolEvent::Lessons { items: vec![item] },
             Self::Decisions => ProtocolEvent::Decisions { items: vec![item] },
@@ -51,7 +54,7 @@ pub struct ProtocolParser {
     state: ProtocolState,
     warnings: Vec<ProtocolWarning>,
     stdout_lines_seen: usize,
-    pending_list: Option<PendingListKind>,
+    pending_list: Option<PendingProtocolKind>,
 }
 
 impl ProtocolParser {
@@ -63,7 +66,7 @@ impl ProtocolParser {
             self.pending_list = None;
             match parse_protocol_event(line) {
                 Ok(Some(event)) => {
-                    self.pending_list = PendingListKind::from_event(&event);
+                    self.pending_list = PendingProtocolKind::from_event(&event);
                     self.apply_event(event.clone());
                     ParserLineKind::Protocol(event)
                 }
@@ -78,7 +81,7 @@ impl ProtocolParser {
                 }
             }
         } else if let Some(pending) = self.pending_list {
-            if let Some(item) = parse_pending_list_item(trimmed) {
+            if let Some(item) = parse_pending_protocol_item(trimmed, pending) {
                 let event = pending.into_event(item);
                 self.apply_event(event.clone());
                 ParserLineKind::Protocol(event)
@@ -144,13 +147,28 @@ fn merge_unique(target: &mut Vec<String>, incoming: &[String]) {
     }
 }
 
-fn parse_pending_list_item(line: &str) -> Option<String> {
+fn parse_pending_protocol_item(line: &str, pending: PendingProtocolKind) -> Option<String> {
     let trimmed = line.trim();
-    let item = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-        .map(str::trim)?;
-    (!item.is_empty()).then(|| item.to_owned())
+    match pending {
+        PendingProtocolKind::Result => {
+            let item = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+                .map(str::trim)
+                .unwrap_or(trimmed);
+            (!item.is_empty()).then(|| item.to_owned())
+        }
+        PendingProtocolKind::Artifacts
+        | PendingProtocolKind::Lessons
+        | PendingProtocolKind::Decisions
+        | PendingProtocolKind::Warnings => {
+            let item = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+                .map(str::trim)?;
+            (!item.is_empty()).then(|| item.to_owned())
+        }
+    }
 }
 
 #[cfg(test)]

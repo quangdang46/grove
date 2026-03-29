@@ -40,10 +40,32 @@ impl ProtocolMarker {
     }
 
     #[must_use]
+    fn bare_prefix(self) -> Option<&'static str> {
+        match self {
+            Self::Result => Some("GROVE_RESULT"),
+            Self::Artifacts => Some("GROVE_ARTIFACTS"),
+            Self::Lessons => Some("GROVE_LESSONS"),
+            Self::Decisions => Some("GROVE_DECISIONS"),
+            Self::Warnings => Some("GROVE_WARNINGS"),
+            Self::Exit | Self::Blocked | Self::Checkpoint => None,
+        }
+    }
+
+    #[must_use]
     pub fn from_trimmed_line(line: &str) -> Option<Self> {
-        Self::all()
-            .into_iter()
-            .find(|marker| line.starts_with(marker.prefix()))
+        Self::all().into_iter().find(|marker| {
+            line.starts_with(marker.prefix())
+                || marker.bare_prefix().is_some_and(|prefix| line == prefix)
+        })
+    }
+
+    #[must_use]
+    fn payload_start(self, line: &str) -> usize {
+        if line.starts_with(self.prefix()) {
+            self.prefix().len()
+        } else {
+            self.bare_prefix().map_or(self.prefix().len(), str::len)
+        }
     }
 
     #[must_use]
@@ -98,7 +120,7 @@ pub fn parse_protocol_event(line: &str) -> Result<Option<ProtocolEvent>, Protoco
         });
     };
 
-    let payload = trimmed[marker.prefix().len()..].trim();
+    let payload = trimmed[marker.payload_start(trimmed)..].trim();
     let event = match marker {
         ProtocolMarker::Result => ProtocolEvent::Result {
             summary: parse_result_payload(payload)?,
@@ -130,12 +152,7 @@ pub fn parse_protocol_event(line: &str) -> Result<Option<ProtocolEvent>, Protoco
 }
 
 fn parse_result_payload(payload: &str) -> Result<String, ProtocolParseError> {
-    let summary = payload.trim();
-    if summary.is_empty() {
-        Err(ProtocolParseError::EmptyResult)
-    } else {
-        Ok(summary.to_owned())
-    }
+    Ok(payload.trim().to_owned())
 }
 
 fn parse_exit_payload(payload: &str) -> Result<bool, ProtocolParseError> {

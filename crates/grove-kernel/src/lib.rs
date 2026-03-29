@@ -911,8 +911,11 @@ fn persist_success_handoff(
     let Some(summary) = outcome
         .protocol_events
         .iter()
+        .rev()
         .find_map(|event| match event {
-            grove_types::ProtocolEvent::Result { summary } => Some(summary.clone()),
+            grove_types::ProtocolEvent::Result { summary } if !summary.trim().is_empty() => {
+                Some(summary.clone())
+            }
             _ => None,
         })
         .or_else(|| outcome.stdout_tail.last().cloned())
@@ -928,32 +931,44 @@ fn persist_success_handoff(
         artifacts: outcome
             .protocol_events
             .iter()
+            .rev()
             .find_map(|event| match event {
-                grove_types::ProtocolEvent::Artifacts { items } => Some(items.clone()),
+                grove_types::ProtocolEvent::Artifacts { items } if !items.is_empty() => {
+                    Some(items.clone())
+                }
                 _ => None,
             })
             .unwrap_or_default(),
         lessons: outcome
             .protocol_events
             .iter()
+            .rev()
             .find_map(|event| match event {
-                grove_types::ProtocolEvent::Lessons { items } => Some(items.clone()),
+                grove_types::ProtocolEvent::Lessons { items } if !items.is_empty() => {
+                    Some(items.clone())
+                }
                 _ => None,
             })
             .unwrap_or_default(),
         decisions: outcome
             .protocol_events
             .iter()
+            .rev()
             .find_map(|event| match event {
-                grove_types::ProtocolEvent::Decisions { items } => Some(items.clone()),
+                grove_types::ProtocolEvent::Decisions { items } if !items.is_empty() => {
+                    Some(items.clone())
+                }
                 _ => None,
             })
             .unwrap_or_default(),
         warnings: outcome
             .protocol_events
             .iter()
+            .rev()
             .find_map(|event| match event {
-                grove_types::ProtocolEvent::Warnings { items } => Some(items.clone()),
+                grove_types::ProtocolEvent::Warnings { items } if !items.is_empty() => {
+                    Some(items.clone())
+                }
                 _ => None,
             })
             .unwrap_or_default(),

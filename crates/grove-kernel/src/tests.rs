@@ -692,6 +692,75 @@ fn persisted_runner_records_successful_run_and_session() -> TestResult {
 
 #[cfg(unix)]
 #[test]
+fn persisted_runner_records_success_with_legacy_protocol_headers() -> TestResult {
+    use std::{fs, io};
+    use tempfile::tempdir;
+
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    fs::create_dir_all(&workspace_dir)?;
+    let workspace_dir = camino::Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| io::Error::other("workspace dir must be valid UTF-8"))?;
+    let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+        .map_err(|_| io::Error::other("db path must be valid UTF-8"))?;
+
+    let mut db = Database::open(&db_path)?;
+    db.migrate()?;
+    insert_bead_cache_row(&db, "grove-life", "Lifecycle bead")?;
+
+    let script_path = dir.path().join("fake-claude");
+    write_fake_claude_script(&script_path)?;
+    let backend = grove_session::CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+
+    let mut request = sample_session_request(workspace_dir);
+    request.env = vec![
+        (
+            "STDOUT_SCRIPT".to_owned(),
+            concat!(
+                "GROVE_RESULT\n",
+                "- verified storage handoff\n",
+                "GROVE_ARTIFACTS\n",
+                "- src/storage/sqlite.rs:79\n",
+                "GROVE_DECISIONS\n",
+                "- keep SQLite canonical\n",
+                "GROVE_EXIT: true\n"
+            )
+            .to_owned(),
+        ),
+        ("STDERR_SCRIPT".to_owned(), String::new()),
+        ("EXIT_CODE".to_owned(), "0".to_owned()),
+    ];
+
+    let persisted = execute_persisted_single_task_session(
+        &mut db,
+        &backend,
+        request,
+        1,
+        &GroveConfig::default(),
+    )?;
+
+    assert_eq!(persisted.run.status, RunStatus::Succeeded);
+    assert_eq!(persisted.session.session.status, SessionStatus::Completed);
+    assert!(persisted.checkpoint.is_none());
+    assert_eq!(
+        persisted
+            .handoff
+            .as_ref()
+            .map(|handoff| handoff.summary.as_str()),
+        Some("verified storage handoff")
+    );
+    assert_eq!(
+        persisted
+            .handoff
+            .as_ref()
+            .map(|handoff| handoff.artifacts.clone()),
+        Some(vec!["src/storage/sqlite.rs:79".to_owned()])
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn persisted_runner_writes_trace_log_for_successful_session() -> TestResult {
     use std::{fs, io};
     use tempfile::tempdir;
