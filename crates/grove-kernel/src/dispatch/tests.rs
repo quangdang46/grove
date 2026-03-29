@@ -785,7 +785,11 @@ fn dispatch_loop_prefers_runnable_blocker_before_exiting_blocked() -> TestResult
     fs::set_permissions(&script_path, permissions)?;
 
     let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
-    let br = TestBrClient::new(vec![blocked.clone(), blocker.clone()], false, Duration::ZERO);
+    let br = TestBrClient::new(
+        vec![blocked.clone(), blocker.clone()],
+        false,
+        Duration::ZERO,
+    );
     let mut config = GroveConfig::default();
     config.scheduler.max_parallel = 1;
     config.scheduler.poll_interval_ms = 10;

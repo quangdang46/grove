@@ -256,7 +256,12 @@ fn sync_bead_cache_uses_inline_dependency_snapshot_when_present() -> TestResult 
 fn sync_bead_cache_preserves_failed_running_and_checkpointed_states() -> TestResult {
     let failed = sample_issue("grove-failed", "failed-bead", Vec::new(), Vec::new())?;
     let running = sample_issue("grove-running", "running-bead", Vec::new(), Vec::new())?;
-    let checkpointed = sample_issue("grove-checkpointed", "checkpointed-bead", Vec::new(), Vec::new())?;
+    let checkpointed = sample_issue(
+        "grove-checkpointed",
+        "checkpointed-bead",
+        Vec::new(),
+        Vec::new(),
+    )?;
     let dep_snapshots = BTreeMap::from([
         (
             failed.id.as_str().to_owned(),

@@ -583,8 +583,10 @@ fn select_runnable_blocker_candidate<'a>(
     config: &GroveConfig,
     now: Timestamp,
 ) -> Option<&'a GroveBeadRecord> {
-    let beads_by_id: HashMap<BeadId, &'a GroveBeadRecord> =
-        beads.iter().map(|bead| (bead.bead.id.clone(), bead)).collect();
+    let beads_by_id: HashMap<BeadId, &'a GroveBeadRecord> = beads
+        .iter()
+        .map(|bead| (bead.bead.id.clone(), bead))
+        .collect();
     let mut blocker_candidates = Vec::new();
 
     for bead in beads {
@@ -1664,17 +1666,12 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
         }
 
         if !launched_any {
-            if let Some(blocker_candidate) = select_runnable_blocker_candidate(
-                &beads,
-                &ready_ids,
-                &excluded_ids,
-                &config,
-                now,
-            ) {
-                if !excluded_ids.contains(&blocker_candidate.bead.id) {
-                    excluded_ids.remove(&blocker_candidate.bead.id);
-                    continue;
-                }
+            if let Some(blocker_candidate) =
+                select_runnable_blocker_candidate(&beads, &ready_ids, &excluded_ids, &config, now)
+                && !excluded_ids.contains(&blocker_candidate.bead.id)
+            {
+                excluded_ids.remove(&blocker_candidate.bead.id);
+                continue;
             }
 
             let any_dispatchable = beads.iter().any(|bead| {
