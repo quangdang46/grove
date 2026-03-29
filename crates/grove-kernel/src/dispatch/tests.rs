@@ -5,6 +5,7 @@ use grove_br::{
     BeadCacheStore, BrCapability, BrCreateIssueInput, BrDependencySnapshot, BrError, BrIssueDetail,
     BrIssueSummary, BrVersion,
 };
+use grove_db::RunFinishInput;
 use grove_session::CliClaudeBackend;
 use grove_types::{
     BeadId, BeadPriority, BeadRef, CircuitBreakerState, CircuitState, GroveBeadRecord,
@@ -721,6 +722,94 @@ fn dispatch_loop_exits_queue_empty_when_ready_beads_are_all_locally_suppressed()
         blocked_summary.sample_beads[0].bead_id,
         BeadId::new("grove-failed")
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn dispatch_loop_prefers_runnable_blocker_before_exiting_blocked() -> TestResult {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    fs::create_dir_all(workspace_dir.join(".grove"))?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| std::io::Error::other("workspace dir must be valid UTF-8"))?;
+    let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+        .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+
+    let mut db = Database::open(&db_path)?;
+    db.migrate()?;
+
+    let blocked = bead_summary("grove-blocked", BeadPriority::P0)?;
+    let blocker = bead_summary("grove-parent", BeadPriority::P1)?;
+    db.upsert_bead_cache(&blocked)?;
+    db.upsert_bead_cache(&blocker)?;
+    let started_at = chrono::Utc::now();
+    db.record_run_started(RunStartInput {
+        run_id: RunId::new("run-grove-blocked-1"),
+        bead_id: blocked.id.clone(),
+        attempt_no: 1,
+        started_at,
+        escalation_tier: grove_types::EscalationTier::FirstAttempt,
+    })?;
+    db.record_run_finished(
+        &blocked.id,
+        RunFinishInput {
+            run_id: RunId::new("run-grove-blocked-1"),
+            status: RunStatus::Failed,
+            failure_class: Some(FailureClass::Blocked),
+            failure_detail: Some(
+                serde_json::json!({
+                    "reason": "waiting for upstream coordination",
+                    "blocked_by": ["grove-parent"],
+                    "next_action": "retry after grove-parent succeeds"
+                })
+                .to_string(),
+            ),
+            ended_at: started_at,
+            retry_after: None,
+            circuit_breaker_state: None,
+        },
+    )?;
+    db.set_grove_status(&blocker.id, GroveBeadStatus::Ready)?;
+
+    let script_path = dir.path().join("blocker-claude");
+    fs::write(
+        &script_path,
+        "#!/bin/sh\nprintf 'GROVE_RESULT: unblocked upstream bead\\nGROVE_ARTIFACTS: crates/grove-kernel/src/dispatch.rs\\nGROVE_EXIT: true\\n'\n",
+    )?;
+    let mut permissions = fs::metadata(&script_path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions)?;
+
+    let backend = CliClaudeBackend::new(script_path.to_string_lossy().into_owned());
+    let br = TestBrClient::new(vec![blocked.clone(), blocker.clone()], false, Duration::ZERO);
+    let mut config = GroveConfig::default();
+    config.scheduler.max_parallel = 1;
+    config.scheduler.poll_interval_ms = 10;
+    let lease_config = LeaderLeaseConfig {
+        owner_label: "test-owner".to_owned(),
+        lease_ttl: chrono::Duration::seconds(1),
+    };
+    let now = chrono::Utc::now();
+    let _ = LeaderLeaseManager::acquire(&mut db, &lease_config, None, now)?;
+    let loop_config = DispatchLoopConfig {
+        max_total_runs: Some(1),
+        max_poll_cycles: Some(20),
+        working_dir: workspace_dir,
+        shutdown_signal: ShutdownSignal::new(),
+        db_path,
+    };
+
+    let outcome = run_dispatch_loop(&mut db, &backend, &br, &config, &lease_config, &loop_config)?;
+
+    assert_eq!(outcome.dispatched_count, 1);
+    assert_eq!(outcome.exit_reason, DispatchExitReason::MaxRunsReached);
+    let runs = db.list_task_runs_for_bead(&BeadId::new("grove-parent"))?;
+    assert_eq!(runs.len(), 1, "expected blocker bead to be dispatched once");
+    assert_eq!(runs[0].status, RunStatus::Succeeded);
     Ok(())
 }
 

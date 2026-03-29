@@ -576,6 +576,59 @@ fn refresh_resolved_blocked_beads(db: &mut Database, beads: &[GroveBeadRecord]) 
     Ok(changed)
 }
 
+fn select_runnable_blocker_candidate<'a>(
+    beads: &'a [GroveBeadRecord],
+    ready_ids: &HashSet<BeadId>,
+    excluded_ids: &HashSet<BeadId>,
+    config: &GroveConfig,
+    now: Timestamp,
+) -> Option<&'a GroveBeadRecord> {
+    let beads_by_id: HashMap<BeadId, &'a GroveBeadRecord> =
+        beads.iter().map(|bead| (bead.bead.id.clone(), bead)).collect();
+    let mut blocker_candidates = Vec::new();
+
+    for bead in beads {
+        if !ready_ids.contains(&bead.bead.id) || excluded_ids.contains(&bead.bead.id) {
+            continue;
+        }
+        let Some(payload) = blocked_payload_for_bead(bead) else {
+            continue;
+        };
+        for blocked_id in &payload.blocked_by {
+            let blocker_id = BeadId::new(blocked_id);
+            let Some(blocker) = beads_by_id.get(&blocker_id).copied() else {
+                continue;
+            };
+            if excluded_ids.contains(&blocker.bead.id) {
+                continue;
+            }
+            let eligibility = crate::evaluate_dispatch_eligibility(
+                blocker,
+                &DispatchEligibilityContext {
+                    ready_in_br: ready_ids.contains(&blocker.bead.id),
+                    circuit_state: crate::circuit_state_for_bead(blocker),
+                    reservation_conflicts: Vec::new(),
+                    now,
+                },
+            );
+            if eligibility.dispatchable_in_grove {
+                blocker_candidates.push(blocker);
+            }
+        }
+    }
+
+    blocker_candidates.sort_by(|a, b| {
+        let score_a = score_bead(a, config);
+        let score_b = score_bead(b, config);
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.bead.id.cmp(&b.bead.id))
+    });
+    blocker_candidates.dedup_by(|a, b| a.bead.id == b.bead.id);
+    blocker_candidates.into_iter().next()
+}
+
 fn drain_inflight_workers<C: BrClient>(
     db: &mut Database,
     br: &C,
@@ -1611,6 +1664,19 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
         }
 
         if !launched_any {
+            if let Some(blocker_candidate) = select_runnable_blocker_candidate(
+                &beads,
+                &ready_ids,
+                &excluded_ids,
+                &config,
+                now,
+            ) {
+                if !excluded_ids.contains(&blocker_candidate.bead.id) {
+                    excluded_ids.remove(&blocker_candidate.bead.id);
+                    continue;
+                }
+            }
+
             let any_dispatchable = beads.iter().any(|bead| {
                 ready_ids.contains(&bead.bead.id)
                     && !excluded_ids.contains(&bead.bead.id)

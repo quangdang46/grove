@@ -253,6 +253,69 @@ fn sync_bead_cache_uses_inline_dependency_snapshot_when_present() -> TestResult 
 }
 
 #[test]
+fn sync_bead_cache_preserves_failed_running_and_checkpointed_states() -> TestResult {
+    let failed = sample_issue("grove-failed", "failed-bead", Vec::new(), Vec::new())?;
+    let running = sample_issue("grove-running", "running-bead", Vec::new(), Vec::new())?;
+    let checkpointed = sample_issue("grove-checkpointed", "checkpointed-bead", Vec::new(), Vec::new())?;
+    let dep_snapshots = BTreeMap::from([
+        (
+            failed.id.as_str().to_owned(),
+            BrDependencySnapshot {
+                bead_id: failed.id.clone(),
+                blocked_by: Vec::new(),
+                blocks: Vec::new(),
+                rows: Vec::new(),
+            },
+        ),
+        (
+            running.id.as_str().to_owned(),
+            BrDependencySnapshot {
+                bead_id: running.id.clone(),
+                blocked_by: Vec::new(),
+                blocks: Vec::new(),
+                rows: Vec::new(),
+            },
+        ),
+        (
+            checkpointed.id.as_str().to_owned(),
+            BrDependencySnapshot {
+                bead_id: checkpointed.id.clone(),
+                blocked_by: Vec::new(),
+                blocks: Vec::new(),
+                rows: Vec::new(),
+            },
+        ),
+    ]);
+    let br = FakeBrClient {
+        ready: vec![failed.clone(), running.clone(), checkpointed.clone()],
+        list_open: vec![failed.clone(), running.clone(), checkpointed.clone()],
+        dep_snapshots,
+        dep_failures: BTreeMap::new(),
+    };
+    let mut store = FakeStore::default()
+        .with_status(failed.id.as_str(), GroveBeadStatus::Failed)
+        .with_status(running.id.as_str(), GroveBeadStatus::Running)
+        .with_status(checkpointed.id.as_str(), GroveBeadStatus::Checkpointed);
+
+    let result = sync_bead_cache(&br, &mut store)?;
+
+    assert!(result.errors.is_empty());
+    assert_eq!(
+        store.statuses.get(failed.id.as_str()),
+        Some(&GroveBeadStatus::Failed)
+    );
+    assert_eq!(
+        store.statuses.get(running.id.as_str()),
+        Some(&GroveBeadStatus::Running)
+    );
+    assert_eq!(
+        store.statuses.get(checkpointed.id.as_str()),
+        Some(&GroveBeadStatus::Checkpointed)
+    );
+    Ok(())
+}
+
+#[test]
 fn sync_bead_cache_counts_missing_non_running_cached_beads_as_removed() -> TestResult {
     let bead = sample_issue("grove-1j9.5.5", "grove-br", Vec::new(), Vec::new())?;
     let br = FakeBrClient {

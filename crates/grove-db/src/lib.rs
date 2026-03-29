@@ -2805,12 +2805,18 @@ impl BeadCacheStore for Database {
                     last_failure_class, last_failure_detail, circuit_breaker_json, runtime_updated_at\
                  ) VALUES (?1, ?2, '[]', '{}', NULL, NULL, NULL, NULL, NULL, ?3) \
                  ON CONFLICT(bead_id) DO UPDATE SET \
-                    grove_status = excluded.grove_status, \
+                    grove_status = CASE \
+                        WHEN bead_runtime.grove_status IN (?4, ?5, ?6) THEN bead_runtime.grove_status \
+                        ELSE excluded.grove_status \
+                    END, \
                     runtime_updated_at = excluded.runtime_updated_at",
                 params![
                     bead_id.as_str(),
                     encode_grove_bead_status(status),
                     &runtime_updated_at,
+                    encode_grove_bead_status(GroveBeadStatus::Failed),
+                    encode_grove_bead_status(GroveBeadStatus::Running),
+                    encode_grove_bead_status(GroveBeadStatus::Checkpointed),
                 ],
             )
             .with_context(|| format!("set grove status for {}", bead_id.as_str()))?;
