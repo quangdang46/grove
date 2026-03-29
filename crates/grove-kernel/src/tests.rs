@@ -146,6 +146,26 @@ fn succeeded_and_failed_beads_are_not_dispatchable() -> TestResult {
 }
 
 #[test]
+fn blocked_failure_beads_report_blocked_suppression() -> TestResult {
+    let mut blocked = sample_bead(GroveBeadStatus::Failed, "task", &[], None, None)?;
+    blocked.last_failure_class = Some(FailureClass::Blocked);
+    blocked.last_failure_detail = Some(
+        serde_json::json!({
+            "reason": "waiting for upstream bead",
+            "blocked_by": ["identify-2id"],
+            "next_action": "retry after identify-2id succeeds"
+        })
+        .to_string(),
+    );
+    let context = sample_context(true, CircuitState::Closed, Vec::new())?;
+
+    let eligibility = evaluate_dispatch_eligibility(&blocked, &context);
+
+    assert!(suppression_codes(&eligibility).contains(&"blocked_awaiting_unblock"));
+    Ok(())
+}
+
+#[test]
 fn dependency_snapshot_sanity_detects_self_edges_and_duplicates() {
     let snapshot = BrDependencySnapshot {
         bead_id: BeadId::new("grove-1"),
@@ -1038,7 +1058,7 @@ fn persisted_runner_records_unknown_failure_with_progress_as_waiting_to_retry() 
 
 #[cfg(unix)]
 #[test]
-fn persisted_runner_records_explicit_exit_false_without_checkpoint_as_failed() -> TestResult {
+fn persisted_runner_records_blocked_exit_false_as_blocked_failure() -> TestResult {
     use std::{fs, io};
     use tempfile::tempdir;
 
@@ -1064,6 +1084,7 @@ fn persisted_runner_records_explicit_exit_false_without_checkpoint_as_failed() -
             "STDOUT_SCRIPT".to_owned(),
             concat!(
                 "blocked by upstream dependency\n",
+                "GROVE_BLOCKED: {\"reason\":\"waiting for upstream dependency\",\"blocked_by\":[\"grove-parent\"],\"next_action\":\"retry after grove-parent succeeds\"}\n",
                 "GROVE_WARNINGS: upstream dependency still active\n",
                 "GROVE_RESULT: no safe unblocked implementation slice remains\n",
                 "GROVE_EXIT: false\n"
@@ -1083,7 +1104,7 @@ fn persisted_runner_records_explicit_exit_false_without_checkpoint_as_failed() -
     )?;
 
     assert_eq!(persisted.run.status, RunStatus::Failed);
-    assert_eq!(persisted.run.failure_class, Some(FailureClass::Unknown));
+    assert_eq!(persisted.run.failure_class, Some(FailureClass::Blocked));
     assert_eq!(
         persisted.session.session.status,
         SessionStatus::UnknownFailure
@@ -1093,7 +1114,12 @@ fn persisted_runner_records_explicit_exit_false_without_checkpoint_as_failed() -
         "bead runtime should persist",
     )?;
     assert_eq!(bead.grove_status, GroveBeadStatus::Failed);
-    assert_eq!(bead.last_failure_class, Some(FailureClass::Unknown));
+    assert_eq!(bead.last_failure_class, Some(FailureClass::Blocked));
+    assert!(
+        bead.last_failure_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("waiting for upstream dependency"))
+    );
     assert!(persisted.checkpoint.is_none());
     Ok(())
 }

@@ -69,6 +69,9 @@ pub fn ingest_transcript_to_archive(
                         format!("GROVE_WARNINGS: {}", items.join(" | "))
                     }
                     grove_types::ProtocolEvent::Exit { value } => format!("GROVE_EXIT: {value}"),
+                    grove_types::ProtocolEvent::Blocked { payload } => {
+                        format!("GROVE_BLOCKED: {}", payload.summary())
+                    }
                     grove_types::ProtocolEvent::Checkpoint { payload } => format!(
                         "GROVE_CHECKPOINT: progress={} next_step={}",
                         payload.progress, payload.next_step

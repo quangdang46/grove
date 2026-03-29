@@ -343,6 +343,7 @@ pub fn execute_single_task_session_with_hooks<B: ClaudeBackend, H: SessionLifecy
                             transcript.append_protocol_event(event.clone(), ts)?;
                             let next_activity = match event {
                                 ProtocolEvent::Checkpoint { .. } => AgentActivity::Ready,
+                                ProtocolEvent::Blocked { .. } => AgentActivity::Blocked,
                                 ProtocolEvent::Exit { value: true } => AgentActivity::Ready,
                                 _ => AgentActivity::Active,
                             };

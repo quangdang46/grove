@@ -21,7 +21,8 @@ pub use archive::{
     SnippetRecord, SourceRecord,
 };
 pub use checkpoint::{
-    CheckpointPayload, CheckpointRecord, ProtocolEvent, ProtocolState, ResumeGeneration,
+    BlockedPayload, CheckpointPayload, CheckpointRecord, ProtocolEvent, ProtocolState,
+    ResumeGeneration,
 };
 pub use errors::{GroveTypesError, InvalidTransition};
 pub use event::{

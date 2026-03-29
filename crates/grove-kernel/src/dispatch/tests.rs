@@ -8,7 +8,7 @@ use grove_br::{
 use grove_session::CliClaudeBackend;
 use grove_types::{
     BeadId, BeadPriority, BeadRef, CircuitBreakerState, CircuitState, GroveBeadRecord,
-    GroveBeadStatus, Timestamp,
+    GroveBeadStatus, RunStatus, Timestamp,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
@@ -726,7 +726,7 @@ fn dispatch_loop_exits_queue_empty_when_ready_beads_are_all_locally_suppressed()
 
 #[cfg(unix)]
 #[test]
-fn dispatch_loop_stops_after_explicit_exit_false_without_checkpoint() -> TestResult {
+fn dispatch_loop_skips_blocked_bead_and_runs_next_ready_bead() -> TestResult {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -751,7 +751,7 @@ fn dispatch_loop_stops_after_explicit_exit_false_without_checkpoint() -> TestRes
     let script_path = dir.path().join("blocked-claude");
     fs::write(
         &script_path,
-        "#!/bin/sh\nprintf 'GROVE_RESULT: blocked on upstream coordination\\nGROVE_WARNINGS: waiting for unblock\\nGROVE_EXIT: false\\n'\n",
+        "#!/bin/sh\nstate=\"$PWD/.grove/dispatch-state\"\nif [ ! -f \"$state\" ]; then\n  printf 'GROVE_BLOCKED: {\"reason\":\"waiting for upstream coordination\",\"blocked_by\":[\"grove-parent\"],\"next_action\":\"retry after grove-parent succeeds\"}\\nGROVE_RESULT: blocked on upstream coordination\\nGROVE_WARNINGS: waiting for unblock\\nGROVE_EXIT: false\\n'\n  : > \"$state\"\nelse\n  printf 'GROVE_RESULT: implemented next bead\\nGROVE_ARTIFACTS: crates/grove-kernel/src/dispatch.rs\\nGROVE_EXIT: true\\n'\nfi\n",
     )?;
     let mut permissions = fs::metadata(&script_path)?.permissions();
     permissions.set_mode(0o755);
@@ -780,24 +780,24 @@ fn dispatch_loop_stops_after_explicit_exit_false_without_checkpoint() -> TestRes
 
     assert_eq!(outcome.exit_reason, DispatchExitReason::DispatchBlocked);
     assert_eq!(outcome.stop_reason, CoordinatorStopReason::DispatchBlocked);
-    assert_eq!(outcome.dispatched_count, 1);
+    assert_eq!(outcome.dispatched_count, 2);
     let blocked_summary = outcome
         .blocked_summary
-        .expect("blocked summary should explain manual stop");
-    assert_eq!(blocked_summary.blocked_ready_count, 1);
-    assert_eq!(
-        blocked_summary.reason_counts[0].code,
-        "explicit_exit_false_without_checkpoint"
+        .expect("blocked summary should explain remaining blocked bead");
+    assert_eq!(blocked_summary.blocked_ready_count, 2);
+    assert!(
+        blocked_summary
+            .reason_counts
+            .iter()
+            .any(|reason| reason.code == "blocked_awaiting_unblock")
     );
     assert_eq!(
         blocked_summary.sample_beads[0].bead_id,
         BeadId::new("grove-blocked")
     );
     let runs = db.list_task_runs_for_bead(&BeadId::new("grove-next"))?;
-    assert!(
-        runs.is_empty(),
-        "expected second bead to remain undispatched"
-    );
+    assert_eq!(runs.len(), 1, "expected second bead to be dispatched once");
+    assert_eq!(runs[0].status, RunStatus::Succeeded);
     Ok(())
 }
 

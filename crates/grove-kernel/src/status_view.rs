@@ -304,6 +304,17 @@ impl SuppressionReasonView {
                 issue_type: None,
                 conflict: None,
             },
+            LocalSuppressionReason::BlockedAwaitingUnblock { detail } => Self {
+                code: reason.code(),
+                summary: detail
+                    .clone()
+                    .unwrap_or_else(|| "blocked and waiting for an external unblock".to_owned()),
+                run_id: None,
+                retry_after: None,
+                label: None,
+                issue_type: None,
+                conflict: None,
+            },
             LocalSuppressionReason::FailedAwaitingManualRetry => Self {
                 code: reason.code(),
                 summary: "failed and awaiting manual retry".to_owned(),
@@ -1005,7 +1016,13 @@ fn recovery_hint(bead: &GroveBeadRecord, config: &GroveConfig) -> Option<String>
             )
         }),
         GroveBeadStatus::Failed => {
-            Some("run `grove retry <bead-id>` after reviewing the recovery capsule".to_owned())
+            if bead.last_failure_class == Some(grove_types::FailureClass::Blocked) {
+                Some(
+                    "wait for the declared blocker to resolve or update the bead scope, then rerun `grove run`".to_owned(),
+                )
+            } else {
+                Some("run `grove retry <bead-id>` after reviewing the recovery capsule".to_owned())
+            }
         }
         _ => None,
     }

@@ -290,10 +290,10 @@ fn build_contract_section(contract: ExecutionContract) -> PromptSegment {
             "[EXECUTION CONTRACT]\nResume from the latest checkpoint and continue the in-progress task without redoing completed work."
         }
         ExecutionContract::RetryRescue => {
-            "[EXECUTION CONTRACT]\nRetry the task with a changed approach that avoids repeating the previous failure mode. Stay fully autonomous: do not enter plan mode, do not ask for approval, and do not stop at a proposed plan. If the work cannot be finished in this attempt, emit GROVE_CHECKPOINT plus GROVE_EXIT: false instead."
+            "[EXECUTION CONTRACT]\nRetry the task with a changed approach that avoids repeating the previous failure mode. Stay fully autonomous: do not enter plan mode, do not ask for approval, and do not stop at a proposed plan. If the work cannot be finished but remains resumable, emit GROVE_CHECKPOINT plus GROVE_EXIT: false. If the work is blocked by an external dependency or another bead and no safe unblocked slice remains, emit GROVE_BLOCKED JSON plus GROVE_EXIT: false."
         }
         ExecutionContract::SingleTask => {
-            "[EXECUTION CONTRACT]\nComplete this single Grove task end-to-end without entering plan mode or asking for approval. If the work cannot be finished in this attempt, emit GROVE_CHECKPOINT plus GROVE_EXIT: false instead of stopping after a plan."
+            "[EXECUTION CONTRACT]\nComplete this single Grove task end-to-end without entering plan mode or asking for approval. If the work cannot be finished but remains resumable, emit GROVE_CHECKPOINT plus GROVE_EXIT: false instead of stopping after a plan. If the work is blocked by an external dependency or another bead and no safe unblocked slice remains, emit GROVE_BLOCKED JSON plus GROVE_EXIT: false. When possible, include `blocked_by` bead ids and a concrete `next_action`."
         }
     };
 

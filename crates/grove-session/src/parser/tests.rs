@@ -92,6 +92,24 @@ fn parse_checkpoint_updates_latest_checkpoint() {
 }
 
 #[test]
+fn parse_blocked_updates_latest_blocked() {
+    let mut parser = ProtocolParser::default();
+
+    parser.parse_stdout_line(
+        "GROVE_BLOCKED: {\"reason\":\"waiting for upstream bead\",\"blocked_by\":[\"identify-2id\"],\"next_action\":\"retry after identify-2id succeeds\"}",
+    );
+
+    assert_eq!(
+        parser
+            .state()
+            .latest_blocked
+            .as_ref()
+            .map(|payload| payload.reason.as_str()),
+        Some("waiting for upstream bead")
+    );
+}
+
+#[test]
 fn multiline_decisions_are_captured_after_empty_header() {
     let mut parser = ProtocolParser::default();
 

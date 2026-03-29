@@ -216,10 +216,10 @@ fn print_dispatch_blocked_summary(
         } else if sample
             .reasons
             .iter()
-            .any(|reason| reason.code == "explicit_exit_false_without_checkpoint")
+            .any(|reason| reason.code == "blocked_awaiting_unblock")
         {
             println!(
-                "Next action: update the task output to emit `GROVE_CHECKPOINT` together with `GROVE_EXIT: false`, or mark the bead blocked in `br` before rerunning."
+                "Next action: resolve the declared blocker or narrow the bead scope, then rerun `grove run`."
             );
         } else {
             println!(
@@ -1651,6 +1651,9 @@ fn read_live_transcript_lines(path: &str) -> Result<Vec<String>> {
                         format!("decisions: {}", items.join(", ")),
                     ProtocolEvent::Warnings { items } => format!("warnings: {}", items.join(", ")),
                     ProtocolEvent::Exit { value } => format!("exit: {value}"),
+                    ProtocolEvent::Blocked { payload } => {
+                        format!("blocked: {}", payload.summary())
+                    }
                     ProtocolEvent::Checkpoint { payload } =>
                         format!("checkpoint: {} -> {}", payload.progress, payload.next_step),
                 }

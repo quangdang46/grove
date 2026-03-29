@@ -12,6 +12,34 @@ pub struct CheckpointPayload {
     pub confidence: Option<f32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlockedPayload {
+    pub reason: String,
+    #[serde(default)]
+    pub blocked_by: Vec<String>,
+    #[serde(default)]
+    pub next_action: Option<String>,
+}
+
+impl BlockedPayload {
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut parts = vec![self.reason.clone()];
+        if !self.blocked_by.is_empty() {
+            parts.push(format!("blocked by {}", self.blocked_by.join(", ")));
+        }
+        if let Some(next_action) = self
+            .next_action
+            .as_deref()
+            .map(str::trim)
+            .filter(|next_action| !next_action.is_empty())
+        {
+            parts.push(format!("next action: {next_action}"));
+        }
+        parts.join(" | ")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointRecord {
     pub id: CheckpointId,
@@ -35,6 +63,7 @@ pub enum ProtocolEvent {
     Decisions { items: Vec<String> },
     Warnings { items: Vec<String> },
     Exit { value: bool },
+    Blocked { payload: BlockedPayload },
     Checkpoint { payload: CheckpointPayload },
 }
 
@@ -46,6 +75,7 @@ pub struct ProtocolState {
     pub decisions: Vec<String>,
     pub warnings: Vec<String>,
     pub explicit_exit: Option<bool>,
+    pub latest_blocked: Option<BlockedPayload>,
     pub latest_checkpoint: Option<CheckpointPayload>,
     pub events: Vec<ProtocolEvent>,
 }

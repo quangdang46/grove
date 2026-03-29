@@ -45,6 +45,7 @@ pub fn infer_agent_activity(outcome: &SessionOutcome, run_status: RunStatus) -> 
                 AgentActivity::Exited
             }
             Some(grove_types::StopReason::PermissionDenied) => AgentActivity::Blocked,
+            _ if outcome.analysis.blocked_emitted => AgentActivity::Blocked,
             _ if outcome.analysis.permission_denials > 0 => AgentActivity::Blocked,
             _ if outcome.analysis.repeated_error_fingerprint.is_some() => AgentActivity::Idle,
             _ => AgentActivity::Exited,

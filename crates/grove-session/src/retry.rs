@@ -57,6 +57,9 @@ fn retry_delta_summary_for_failure(
         FailureClass::PermissionDenied => format!(
             "Changed retry framing: avoids the blocked operation first, prefers an already-allowed path, and only asks for the minimum approval if it is still required{progress_clause}."
         ),
+        FailureClass::Blocked => format!(
+            "Changed retry framing: only retries after the declared blocker is cleared or the scope changes, and forces the next attempt to verify that unblock condition first{progress_clause}."
+        ),
         FailureClass::CircuitOpen | FailureClass::NoProgress => format!(
             "Changed retry framing: breaks the previous stuck loop, requires a different verification path, and forbids repeating the same debugging sequence verbatim{progress_clause}."
         ),
@@ -102,6 +105,10 @@ fn rescue_card_for_failure(
         FailureClass::PermissionDenied => vec![
             "- Do not repeat the blocked operation unchanged.".to_owned(),
             "- Choose an allowed path first and ask for the minimum approval only if there is no safe alternative.".to_owned(),
+        ],
+        FailureClass::Blocked => vec![
+            "- Verify the declared blocker is actually resolved before retrying.".to_owned(),
+            "- If the blocker is still active, keep the scope tight and emit GROVE_BLOCKED again instead of pretending the bead can finish.".to_owned(),
         ],
         FailureClass::CircuitOpen | FailureClass::NoProgress => vec![
             "- Break the prior loop immediately; choose a different inspection or verification path.".to_owned(),

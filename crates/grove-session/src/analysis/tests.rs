@@ -1,5 +1,5 @@
 use super::*;
-use grove_types::{CheckpointPayload, ProtocolEvent};
+use grove_types::{BlockedPayload, CheckpointPayload, ProtocolEvent};
 use serde_json::json;
 
 fn checkpoint_payload() -> CheckpointPayload {
@@ -21,6 +21,7 @@ fn protocol_state_with_events(events: Vec<ProtocolEvent>) -> ProtocolState {
         decisions: vec!["reuse parser state".to_owned()],
         warnings: vec!["mirror still pending".to_owned()],
         explicit_exit: Some(true),
+        latest_blocked: None,
         latest_checkpoint: Some(checkpoint_payload()),
         events,
     }
@@ -61,6 +62,7 @@ fn analysis_populates_protocol_derived_fields() {
     assert_eq!(analysis.completion_indicators, 2);
     assert!(analysis.has_explicit_exit_true);
     assert!(!analysis.has_explicit_exit_false);
+    assert!(!analysis.blocked_emitted);
     assert!(analysis.checkpoint_emitted);
     assert_eq!(analysis.artifacts_mentioned, protocol_state.artifacts);
     assert_eq!(analysis.lessons, protocol_state.lessons);
@@ -185,6 +187,29 @@ fn checkpoint_presence_sets_checkpoint_emitted() {
     });
 
     assert!(analysis.checkpoint_emitted);
+}
+
+#[test]
+fn blocked_presence_sets_blocked_emitted() {
+    let protocol_state = ProtocolState {
+        latest_blocked: Some(BlockedPayload {
+            reason: "waiting for upstream bead".to_owned(),
+            blocked_by: vec!["identify-2id".to_owned()],
+            next_action: Some("retry after identify-2id succeeds".to_owned()),
+        }),
+        ..ProtocolState::default()
+    };
+
+    let analysis = analyze_iteration(AnalysisInput {
+        protocol_state: &protocol_state,
+        protocol_warnings: &[],
+        stdout_lines: &[],
+        stderr_lines: &[],
+        estimated_prompt_tokens: 0,
+        estimated_output_tokens: 0,
+    });
+
+    assert!(analysis.blocked_emitted);
 }
 
 #[test]

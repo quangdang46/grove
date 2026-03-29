@@ -227,6 +227,7 @@ pub enum FailureClass {
     Timeout,
     RateLimit,
     PermissionDenied,
+    Blocked,
     CircuitOpen,
     NoProgress,
     RepeatedError,
@@ -467,6 +468,10 @@ fn likely_root_causes_for_failure(
             "The previous attempt depended on an operation that was not allowed in the current session."
                 .to_owned(),
         ],
+        FailureClass::Blocked => vec![
+            "The attempt explicitly reported an external blocker and stopped without a resumable checkpoint."
+                .to_owned(),
+        ],
         FailureClass::CircuitOpen | FailureClass::NoProgress => vec![
             "The session loop stopped producing new evidence and Grove opened recovery mode."
                 .to_owned(),
@@ -519,6 +524,12 @@ fn risky_paths_for_failure(failure_class: FailureClass) -> Vec<String> {
         FailureClass::PermissionDenied => {
             vec!["Retrying the blocked operation unchanged before exploring an already-allowed path.".to_owned()]
         }
+        FailureClass::Blocked => {
+            vec![
+                "Retrying before the declared blocker resolves or the task scope changes."
+                    .to_owned(),
+            ]
+        }
         FailureClass::CircuitOpen | FailureClass::NoProgress => {
             vec![
                 "Following the same debugging sequence that already failed to create progress."
@@ -568,6 +579,9 @@ fn do_not_repeat_for_failure(failure_class: FailureClass) -> Vec<String> {
         }
         FailureClass::PermissionDenied => {
             vec!["Do not repeat the blocked operation unchanged.".to_owned()]
+        }
+        FailureClass::Blocked => {
+            vec!["Do not re-dispatch the bead until the declared blocker is resolved or the plan changes.".to_owned()]
         }
         FailureClass::CircuitOpen | FailureClass::NoProgress => {
             vec!["Do not repeat the same stalled inspection path verbatim.".to_owned()]

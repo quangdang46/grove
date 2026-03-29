@@ -67,6 +67,7 @@ pub fn analyze_iteration(input: AnalysisInput<'_>) -> IterationAnalysis {
         completion_indicators: count_completion_indicators(input.stdout_lines),
         has_explicit_exit_true: has_explicit_exit(input.protocol_state, true),
         has_explicit_exit_false: has_explicit_exit(input.protocol_state, false),
+        blocked_emitted: blocked_emitted(input.protocol_state),
         checkpoint_emitted: checkpoint_emitted(input.protocol_state),
         probable_progress: infer_progress_signal(
             input.protocol_state,
@@ -123,6 +124,14 @@ fn checkpoint_emitted(protocol_state: &ProtocolState) -> bool {
             .events
             .iter()
             .any(|event| matches!(event, ProtocolEvent::Checkpoint { .. }))
+}
+
+fn blocked_emitted(protocol_state: &ProtocolState) -> bool {
+    protocol_state.latest_blocked.is_some()
+        || protocol_state
+            .events
+            .iter()
+            .any(|event| matches!(event, ProtocolEvent::Blocked { .. }))
 }
 
 fn count_permission_denials(stdout_lines: &[String], stderr_lines: &[String]) -> u32 {

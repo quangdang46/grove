@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use grove_types::{CheckpointPayload, ProtocolEvent};
+use grove_types::{BlockedPayload, CheckpointPayload, ProtocolEvent};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -9,6 +9,7 @@ pub const GROVE_LESSONS_PREFIX: &str = "GROVE_LESSONS:";
 pub const GROVE_DECISIONS_PREFIX: &str = "GROVE_DECISIONS:";
 pub const GROVE_WARNINGS_PREFIX: &str = "GROVE_WARNINGS:";
 pub const GROVE_EXIT_PREFIX: &str = "GROVE_EXIT:";
+pub const GROVE_BLOCKED_PREFIX: &str = "GROVE_BLOCKED:";
 pub const GROVE_CHECKPOINT_PREFIX: &str = "GROVE_CHECKPOINT:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +20,7 @@ pub enum ProtocolMarker {
     Decisions,
     Warnings,
     Exit,
+    Blocked,
     Checkpoint,
 }
 
@@ -32,6 +34,7 @@ impl ProtocolMarker {
             Self::Decisions => GROVE_DECISIONS_PREFIX,
             Self::Warnings => GROVE_WARNINGS_PREFIX,
             Self::Exit => GROVE_EXIT_PREFIX,
+            Self::Blocked => GROVE_BLOCKED_PREFIX,
             Self::Checkpoint => GROVE_CHECKPOINT_PREFIX,
         }
     }
@@ -44,7 +47,7 @@ impl ProtocolMarker {
     }
 
     #[must_use]
-    pub fn all() -> [Self; 7] {
+    pub fn all() -> [Self; 8] {
         [
             Self::Result,
             Self::Artifacts,
@@ -52,6 +55,7 @@ impl ProtocolMarker {
             Self::Decisions,
             Self::Warnings,
             Self::Exit,
+            Self::Blocked,
             Self::Checkpoint,
         ]
     }
@@ -76,6 +80,10 @@ pub enum ProtocolParseError {
     InvalidCheckpointJson { source: serde_json::Error },
     #[error("checkpoint payload must be a JSON object")]
     CheckpointNotObject,
+    #[error("invalid blocked JSON: {source}")]
+    InvalidBlockedJson { source: serde_json::Error },
+    #[error("blocked payload must be a JSON object")]
+    BlockedNotObject,
 }
 
 pub fn parse_protocol_event(line: &str) -> Result<Option<ProtocolEvent>, ProtocolParseError> {
@@ -109,6 +117,9 @@ pub fn parse_protocol_event(line: &str) -> Result<Option<ProtocolEvent>, Protoco
         },
         ProtocolMarker::Exit => ProtocolEvent::Exit {
             value: parse_exit_payload(payload)?,
+        },
+        ProtocolMarker::Blocked => ProtocolEvent::Blocked {
+            payload: parse_blocked_payload(payload)?,
         },
         ProtocolMarker::Checkpoint => ProtocolEvent::Checkpoint {
             payload: parse_checkpoint_payload(payload)?,
@@ -186,6 +197,16 @@ fn parse_checkpoint_payload(payload: &str) -> Result<CheckpointPayload, Protocol
     }
     serde_json::from_value(value)
         .map_err(|source| ProtocolParseError::InvalidCheckpointJson { source })
+}
+
+fn parse_blocked_payload(payload: &str) -> Result<BlockedPayload, ProtocolParseError> {
+    let value: Value = serde_json::from_str(payload)
+        .map_err(|source| ProtocolParseError::InvalidBlockedJson { source })?;
+    if !value.is_object() {
+        return Err(ProtocolParseError::BlockedNotObject);
+    }
+    serde_json::from_value(value)
+        .map_err(|source| ProtocolParseError::InvalidBlockedJson { source })
 }
 
 fn push_unique(items: &mut Vec<String>, candidate: &str) {

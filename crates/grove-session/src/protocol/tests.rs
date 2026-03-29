@@ -170,6 +170,36 @@ fn parse_grove_checkpoint_valid_json() -> TestResult {
 }
 
 #[test]
+fn parse_grove_blocked_payload() -> TestResult {
+    let event = parse_protocol_event(
+        "GROVE_BLOCKED: {\"reason\":\"waiting for upstream bead\",\"blocked_by\":[\"identify-2id\"],\"next_action\":\"retry after identify-2id succeeds\"}",
+    )?
+    .ok_or("missing event")?;
+    let ProtocolEvent::Blocked { payload } = event else {
+        panic!("expected blocked event");
+    };
+    assert_eq!(payload.reason, "waiting for upstream bead");
+    assert_eq!(payload.blocked_by, vec!["identify-2id".to_owned()]);
+    assert_eq!(
+        payload.next_action.as_deref(),
+        Some("retry after identify-2id succeeds")
+    );
+    Ok(())
+}
+
+#[test]
+fn parse_grove_blocked_invalid_json() {
+    let error = match parse_protocol_event("GROVE_BLOCKED: nope") {
+        Ok(value) => panic!("expected parse error, got {value:?}"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        ProtocolParseError::InvalidBlockedJson { .. }
+    ));
+}
+
+#[test]
 fn parse_grove_checkpoint_minimal_json() -> TestResult {
     let event = parse_protocol_event(
         "GROVE_CHECKPOINT: {\"progress\":\"halfway\",\"next_step\":\"finish\",\"context\":{},\"open_questions\":[],\"claimed_paths\":[]}",

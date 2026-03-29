@@ -24,9 +24,9 @@ use grove_session::{
     execute_single_task_session_with_hooks, update_circuit_breaker,
 };
 use grove_types::{
-    AgentActivity, BeadId, CheckpointId, CircuitState, FailureClass, GroveBeadRecord,
-    GroveBeadStatus, ProgressSignal, ReservationConflict, ReservationMode, ReservationRecord,
-    RunId, RunStatus, SessionStatus, Timestamp, WorkflowPhase, WorkflowState,
+    AgentActivity, BeadId, BlockedPayload, CheckpointId, CircuitState, FailureClass,
+    GroveBeadRecord, GroveBeadStatus, ProgressSignal, ReservationConflict, ReservationMode,
+    ReservationRecord, RunId, RunStatus, SessionStatus, Timestamp, WorkflowPhase, WorkflowState,
 };
 use std::{
     collections::BTreeMap,
@@ -646,6 +646,9 @@ fn finalize_persisted_run(
             Some(FailureClass::Interrupted),
             Some(ended_at),
         ),
+        SessionStatus::UnknownFailure if outcome.analysis.blocked_emitted => {
+            (RunStatus::Failed, Some(FailureClass::Blocked), None)
+        }
         SessionStatus::UnknownFailure if unknown_failure_should_retry(outcome) => (
             RunStatus::WaitingToRetry,
             Some(FailureClass::NoProgress),
@@ -656,12 +659,14 @@ fn finalize_persisted_run(
             (RunStatus::Failed, Some(FailureClass::Unknown), None)
         }
     };
-    let failure_detail = failure_detail_override.or_else(|| {
-        outcome
-            .session
-            .stop_reason
-            .map(|reason| format!("session ended with {:?}", reason))
-    });
+    let failure_detail = failure_detail_override
+        .or_else(|| blocked_failure_detail(outcome))
+        .or_else(|| {
+            outcome
+                .session
+                .stop_reason
+                .map(|reason| format!("session ended with {:?}", reason))
+        });
     let prior_breaker = db
         .get_bead_record(bead_id)?
         .and_then(|record| record.circuit_breaker_state)
@@ -746,6 +751,29 @@ fn synthetic_checkpoint_payload_from_outcome(
         claimed_paths: Vec::new(),
         confidence: Some(0.25),
     })
+}
+
+fn blocked_payload_from_outcome(outcome: &grove_types::SessionOutcome) -> Option<BlockedPayload> {
+    outcome
+        .protocol_events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            grove_types::ProtocolEvent::Blocked { payload } => Some(payload.clone()),
+            _ => None,
+        })
+}
+
+fn blocked_failure_detail(outcome: &grove_types::SessionOutcome) -> Option<String> {
+    blocked_payload_from_outcome(outcome).and_then(|payload| serde_json::to_string(&payload).ok())
+}
+
+pub(crate) fn parse_blocked_failure_detail(detail: Option<&str>) -> Option<BlockedPayload> {
+    detail.and_then(|detail| serde_json::from_str(detail).ok())
+}
+
+pub(crate) fn blocked_summary_from_detail(detail: Option<&str>) -> Option<String> {
+    parse_blocked_failure_detail(detail).map(|payload| payload.summary())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1471,6 +1499,7 @@ pub enum LocalSuppressionReason {
     CircuitOpen,
     ReservationConflict { conflict: ReservationConflict },
     AlreadySucceeded,
+    BlockedAwaitingUnblock { detail: Option<String> },
     FailedAwaitingManualRetry,
 }
 
@@ -1485,6 +1514,7 @@ impl LocalSuppressionReason {
             Self::CircuitOpen => "circuit_open",
             Self::ReservationConflict { .. } => "reservation_conflict",
             Self::AlreadySucceeded => "already_succeeded",
+            Self::BlockedAwaitingUnblock { .. } => "blocked_awaiting_unblock",
             Self::FailedAwaitingManualRetry => "failed_awaiting_manual_retry",
         }
     }
@@ -1550,7 +1580,15 @@ fn collect_local_suppressions(
             }
         }
         GroveBeadStatus::Succeeded => reasons.push(LocalSuppressionReason::AlreadySucceeded),
-        GroveBeadStatus::Failed => reasons.push(LocalSuppressionReason::FailedAwaitingManualRetry),
+        GroveBeadStatus::Failed => {
+            if bead.last_failure_class == Some(FailureClass::Blocked) {
+                reasons.push(LocalSuppressionReason::BlockedAwaitingUnblock {
+                    detail: blocked_summary_from_detail(bead.last_failure_detail.as_deref()),
+                });
+            } else {
+                reasons.push(LocalSuppressionReason::FailedAwaitingManualRetry);
+            }
+        }
     }
 
     if matches!(context.circuit_state, CircuitState::Open) {

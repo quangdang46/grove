@@ -104,6 +104,7 @@ pub struct IterationAnalysis {
     pub completion_indicators: u32,
     pub has_explicit_exit_true: bool,
     pub has_explicit_exit_false: bool,
+    pub blocked_emitted: bool,
     pub checkpoint_emitted: bool,
     pub probable_progress: ProgressSignal,
     pub permission_denials: u32,

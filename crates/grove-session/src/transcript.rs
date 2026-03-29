@@ -233,6 +233,10 @@ enum SerializableProtocolEvent {
     Warnings { items: Vec<String> },
     #[serde(rename = "exit")]
     Exit { value: bool },
+    #[serde(rename = "blocked")]
+    Blocked {
+        payload: grove_types::BlockedPayload,
+    },
     #[serde(rename = "checkpoint")]
     Checkpoint {
         payload: grove_types::CheckpointPayload,
@@ -248,6 +252,7 @@ impl From<ProtocolEvent> for SerializableProtocolEvent {
             ProtocolEvent::Decisions { items } => Self::Decisions { items },
             ProtocolEvent::Warnings { items } => Self::Warnings { items },
             ProtocolEvent::Exit { value } => Self::Exit { value },
+            ProtocolEvent::Blocked { payload } => Self::Blocked { payload },
             ProtocolEvent::Checkpoint { payload } => Self::Checkpoint { payload },
         }
     }
@@ -320,6 +325,10 @@ enum DeserializableProtocolEvent {
     Warnings { items: Vec<String> },
     #[serde(rename = "exit")]
     Exit { value: bool },
+    #[serde(rename = "blocked")]
+    Blocked {
+        payload: grove_types::BlockedPayload,
+    },
     #[serde(rename = "checkpoint")]
     Checkpoint {
         payload: grove_types::CheckpointPayload,
@@ -335,6 +344,7 @@ impl DeserializableProtocolEvent {
             Self::Decisions { items } => ProtocolEvent::Decisions { items },
             Self::Warnings { items } => ProtocolEvent::Warnings { items },
             Self::Exit { value } => ProtocolEvent::Exit { value },
+            Self::Blocked { payload } => ProtocolEvent::Blocked { payload },
             Self::Checkpoint { payload } => ProtocolEvent::Checkpoint { payload },
         })
     }

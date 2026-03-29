@@ -125,6 +125,9 @@ impl ProtocolParser {
             ProtocolEvent::Exit { value } => {
                 self.state.explicit_exit = Some(*value);
             }
+            ProtocolEvent::Blocked { payload } => {
+                self.state.latest_blocked = Some(payload.clone());
+            }
             ProtocolEvent::Checkpoint { payload } => {
                 self.state.latest_checkpoint = Some(payload.clone());
             }

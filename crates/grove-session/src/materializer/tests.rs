@@ -111,6 +111,7 @@ fn materializer_changes_contract_framing() {
             .rendered_prompt
             .contains("emit GROVE_CHECKPOINT plus GROVE_EXIT: false")
     );
+    assert!(single.rendered_prompt.contains("emit GROVE_BLOCKED JSON"));
     assert!(
         retry
             .rendered_prompt
@@ -126,6 +127,7 @@ fn materializer_changes_contract_framing() {
             .rendered_prompt
             .contains("emit GROVE_CHECKPOINT plus GROVE_EXIT: false")
     );
+    assert!(retry.rendered_prompt.contains("emit GROVE_BLOCKED JSON"));
 }
 
 #[test]
