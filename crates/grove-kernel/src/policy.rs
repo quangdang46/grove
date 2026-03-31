@@ -262,9 +262,7 @@ fn risky_provider_flags(init_args: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ExecutionPolicyAction, PolicyVerdict, ProviderAction, evaluate_execution_policy,
-    };
+    use super::{ExecutionPolicyAction, PolicyVerdict, ProviderAction, evaluate_execution_policy};
     use grove_types::{BeadId, GroveBeadStatus, RuntimeProvider};
 
     #[test]

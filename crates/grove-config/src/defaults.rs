@@ -7,3 +7,5 @@ pub const DEFAULT_CHECKPOINTS_DIR_NAME: &str = "checkpoints";
 pub const DEFAULT_ARTIFACTS_DIR_NAME: &str = "artifacts";
 pub const DEFAULT_LOGS_DIR_NAME: &str = "logs";
 pub const DEFAULT_TMP_DIR_NAME: &str = "tmp";
+pub const DEFAULT_WORKFLOW_DOCS_DIR_NAME: &str = "workflows";
+pub const DEFAULT_PLAYBOOK_DOCS_DIR_NAME: &str = "playbooks";

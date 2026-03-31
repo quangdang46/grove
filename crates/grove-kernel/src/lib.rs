@@ -3,6 +3,7 @@ pub mod diary;
 pub mod dispatch;
 pub mod inspect_view;
 pub mod lesson_ingest;
+mod operator_docs;
 pub mod policy;
 pub mod reactions;
 pub mod scoring;

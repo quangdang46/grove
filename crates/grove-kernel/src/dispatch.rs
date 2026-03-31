@@ -1040,6 +1040,27 @@ fn load_startup_prompt(config: &GroveConfig, working_dir: &Utf8Path) -> Option<S
     }
 }
 
+fn merge_playbook_rules(
+    mut inline_rules: Vec<grove_types::playbook::PlaybookBulletRecord>,
+    mut active_rules: Vec<grove_types::playbook::PlaybookBulletRecord>,
+) -> Vec<grove_types::playbook::PlaybookBulletRecord> {
+    inline_rules.append(&mut active_rules);
+    inline_rules.sort_by(|left, right| {
+        right
+            .pinned
+            .cmp(&left.pinned)
+            .then_with(|| {
+                right
+                    .effective_score
+                    .unwrap_or(0.0)
+                    .partial_cmp(&left.effective_score.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    inline_rules
+}
+
 fn workflow_phase_handoff_summary(db: &Database, bead: &GroveBeadRecord) -> Option<String> {
     bead.workflow_state().and_then(|workflow_state| {
         db.handoff_for_bead(&bead.bead.id)
@@ -1107,7 +1128,11 @@ fn build_session_request(
     parent_handoffs: Vec<String>,
     escalation_tier: EscalationTier,
 ) -> SingleTaskSessionRequest {
-    let startup_prompt = load_startup_prompt(config, working_dir);
+    let operator_documents =
+        crate::operator_docs::load_operator_documents(config, working_dir, bead)
+            .unwrap_or_default();
+    let startup_prompt =
+        operator_documents.merge_startup_prompt(load_startup_prompt(config, working_dir));
     let prompt_id = PromptId::new(format!("prompt-{}", run_id.as_str()));
     let transcript_path = Utf8PathBuf::from(format!(
         ".grove/transcripts/{}/{}.jsonl",
@@ -1157,7 +1182,7 @@ fn build_session_request(
         token_budget: None,
         ordinal_in_run: 1,
         archive_bundle: None,
-        playbook_rules: Vec::new(),
+        playbook_rules: operator_documents.playbook_rules,
         env: build_provider_environment(config.runtime.provider, &config.runtime, &current_env),
         shutdown: SessionShutdownConfig::default(),
         escalation_tier,
@@ -1530,7 +1555,8 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 active_rules.truncate(5);
-                request.playbook_rules = active_rules;
+                request.playbook_rules =
+                    merge_playbook_rules(request.playbook_rules.clone(), active_rules);
             }
 
             if bead.grove_status == GroveBeadStatus::Checkpointed

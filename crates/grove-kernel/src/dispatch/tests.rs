@@ -671,6 +671,63 @@ fn workflow_labeled_bead_advances_across_multiple_internal_phases() -> TestResul
 }
 
 #[test]
+fn build_session_request_loads_markdown_workflow_and_playbook_docs() -> TestResult {
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    std::fs::create_dir_all(workspace_dir.join(".grove/workflows"))?;
+    std::fs::create_dir_all(workspace_dir.join(".grove/playbooks"))?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| std::io::Error::other("workspace dir must be valid UTF-8"))?;
+    std::fs::write(
+        workspace_dir
+            .join(".grove/workflows/review.md")
+            .as_std_path(),
+        concat!(
+            "---\n",
+            "title = \"Review workflow\"\n",
+            "phases = [\"review\"]\n",
+            "issue_types = [\"feature\"]\n",
+            "---\n",
+            "Review the generated changes before final close.\n",
+        ),
+    )?;
+    std::fs::write(
+        workspace_dir.join(".grove/playbooks/rust.md").as_std_path(),
+        concat!(
+            "---\n",
+            "category = \"workflow\"\n",
+            "---\n",
+            "- Keep markdown-defined instructions concise.\n",
+        ),
+    )?;
+
+    let mut bead = sample_bead("grove-feature", BeadPriority::P0, GroveBeadStatus::Ready)?;
+    bead.bead.issue_type = "feature".to_owned();
+    bead.bead.labels.push("grove:workflow:review".to_owned());
+    let run_id = RunId::new("run-grove-feature");
+    let session_id = SessionId::new("ses-grove-feature");
+    let request = build_session_request(
+        &bead,
+        &GroveConfig::default(),
+        &workspace_dir,
+        &run_id,
+        &session_id,
+        Vec::new(),
+        EscalationTier::FirstAttempt,
+    );
+
+    let startup_prompt = request.startup_prompt.expect("workflow docs should load");
+    assert!(startup_prompt.contains("Review workflow"));
+    assert!(startup_prompt.contains("Review the generated changes"));
+    assert_eq!(request.playbook_rules.len(), 1);
+    assert_eq!(
+        request.playbook_rules[0].text,
+        "Keep markdown-defined instructions concise."
+    );
+    Ok(())
+}
+
+#[test]
 fn lease_renew_interval_uses_one_third_of_ttl() {
     assert_eq!(
         lease_renew_interval(chrono::Duration::milliseconds(90)),

@@ -4,7 +4,8 @@ use crate::{
     ConfigError, GroveConfig,
     defaults::{
         DEFAULT_ARTIFACTS_DIR_NAME, DEFAULT_CHECKPOINTS_DIR_NAME, DEFAULT_GROVE_DIR_NAME,
-        DEFAULT_LOGS_DIR_NAME, DEFAULT_PROMPTS_DIR_NAME, DEFAULT_TMP_DIR_NAME,
+        DEFAULT_LOGS_DIR_NAME, DEFAULT_PLAYBOOK_DOCS_DIR_NAME, DEFAULT_PROMPTS_DIR_NAME,
+        DEFAULT_TMP_DIR_NAME, DEFAULT_WORKFLOW_DOCS_DIR_NAME,
     },
 };
 
@@ -75,6 +76,16 @@ impl GrovePaths {
     }
 
     #[must_use]
+    pub fn workflow_docs_dir(&self) -> Utf8PathBuf {
+        self.grove_dir.join(DEFAULT_WORKFLOW_DOCS_DIR_NAME)
+    }
+
+    #[must_use]
+    pub fn playbook_docs_dir(&self) -> Utf8PathBuf {
+        self.grove_dir.join(DEFAULT_PLAYBOOK_DOCS_DIR_NAME)
+    }
+
+    #[must_use]
     pub fn startup_prompt_path(&self) -> &Utf8Path {
         &self.startup_prompt_path
     }
@@ -109,6 +120,8 @@ impl GrovePaths {
                 self.startup_prompt_path.clone(),
             ),
             ("prompts_dir", self.prompts_dir()),
+            ("workflow_docs_dir", self.workflow_docs_dir()),
+            ("playbook_docs_dir", self.playbook_docs_dir()),
             ("checkpoints_dir", self.checkpoints_dir()),
             ("artifacts_dir", self.artifacts_dir()),
             ("logs_dir", self.logs_dir()),
@@ -134,6 +147,8 @@ impl GrovePaths {
             ),
             ("memory.transcript_dir", self.transcript_dir.clone()),
             ("prompts_dir", self.prompts_dir()),
+            ("workflow_docs_dir", self.workflow_docs_dir()),
+            ("playbook_docs_dir", self.playbook_docs_dir()),
             ("checkpoints_dir", self.checkpoints_dir()),
             ("artifacts_dir", self.artifacts_dir()),
             ("logs_dir", self.logs_dir()),

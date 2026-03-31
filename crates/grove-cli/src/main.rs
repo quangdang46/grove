@@ -2239,6 +2239,8 @@ fn ensure_workspace_layout(paths: &GrovePaths) -> Result<()> {
         paths.grove_dir().to_owned(),
         paths.transcript_dir().to_owned(),
         paths.prompts_dir(),
+        paths.workflow_docs_dir(),
+        paths.playbook_docs_dir(),
         paths.checkpoints_dir(),
         paths.artifacts_dir(),
         paths.logs_dir(),
