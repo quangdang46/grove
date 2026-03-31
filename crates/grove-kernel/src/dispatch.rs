@@ -7,11 +7,11 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
-use grove_br::{BeadCacheStore, BrClient};
+use grove_br::{BeadCacheStore, BrClient, BrError};
 use grove_config::{
     DEFAULT_CHECKPOINTS_DIR_NAME, DEFAULT_GROVE_DIR_NAME, GroveConfig, build_provider_environment,
 };
-use grove_db::Database;
+use grove_db::{Database, RunFinishInput};
 use grove_session::{
     CheckpointPromptInput, ClaudeBackend, ContextMonitor, ExitPolicy, SessionShutdownConfig,
     SingleTaskSessionRequest,
@@ -19,7 +19,7 @@ use grove_session::{
 use grove_types::{
     BeadId, CoordinatorStopReason, EscalationTier, ExecutionContract, FailureClass,
     GroveBeadRecord, GroveBeadStatus, PromptId, ReservationConflict, ReservationMode, RunId,
-    SessionId, Timestamp,
+    RunStatus, SessionId, Timestamp,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1061,6 +1061,85 @@ fn merge_playbook_rules(
     inline_rules
 }
 
+fn is_generated_child_bead(bead: &GroveBeadRecord) -> bool {
+    bead.bead
+        .labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case("grove:generated"))
+}
+
+fn reconcile_missing_generated_candidate<C: BrClient>(
+    db: &mut Database,
+    br: &C,
+    bead: &GroveBeadRecord,
+) -> Result<bool> {
+    if !is_generated_child_bead(bead) {
+        return Ok(false);
+    }
+
+    match br.show(&bead.bead.id) {
+        Ok(_) => Ok(false),
+        Err(BrError::BeadNotFound { .. }) => {
+            let now = chrono::Utc::now();
+            let detail = format!(
+                "generated child bead {} no longer exists in br authoritative state; skipping local dispatch and reconciling cache",
+                bead.bead.id.as_str()
+            );
+            if bead.grove_status == GroveBeadStatus::Checkpointed
+                && let Some(run_id) = bead.last_run_id.as_ref()
+            {
+                let runs = db
+                    .list_task_runs_for_bead(&bead.bead.id)
+                    .unwrap_or_default();
+                if runs
+                    .iter()
+                    .any(|run| run.id == *run_id && run.status == RunStatus::Checkpointed)
+                {
+                    let _ = db.record_run_finished(
+                        &bead.bead.id,
+                        RunFinishInput {
+                            run_id: run_id.clone(),
+                            status: RunStatus::Failed,
+                            failure_class: Some(FailureClass::Blocked),
+                            failure_detail: Some(detail.clone()),
+                            ended_at: now,
+                            retry_after: None,
+                            circuit_breaker_state: bead.circuit_breaker_state.clone(),
+                        },
+                    );
+                }
+            }
+
+            let _ = db.write_event_log(
+                grove_types::EventKind::RecoveryActionTaken,
+                Some(&bead.bead.id),
+                bead.last_run_id.as_ref(),
+                None,
+                &serde_json::json!({
+                    "action": "stale_generated_child_reconciled",
+                    "detail": detail,
+                }),
+                &now,
+            );
+
+            if let Err(error) = grove_br::sync_bead_cache(br, db) {
+                eprintln!(
+                    "grove dispatch: stale generated child sync failed for {}: {error}",
+                    bead.bead.id.as_str()
+                );
+            }
+            Ok(true)
+        }
+        Err(error) => {
+            eprintln!(
+                "grove dispatch: authority preflight failed for {}: {error}",
+                bead.bead.id.as_str()
+            );
+            Ok(false)
+        }
+    }
+}
+
 fn workflow_phase_handoff_summary(db: &Database, bead: &GroveBeadRecord) -> Option<String> {
     bead.workflow_state().and_then(|workflow_state| {
         db.handoff_for_bead(&bead.bead.id)
@@ -1449,6 +1528,15 @@ pub fn run_dispatch_loop<B: ClaudeBackend + Clone + 'static, C: BrClient>(
             else {
                 break;
             };
+
+            if reconcile_missing_generated_candidate(db, br, bead)? {
+                eprintln!(
+                    "grove dispatch: skipping stale generated child {} because br no longer recognizes it",
+                    bead.bead.id.as_str()
+                );
+                excluded_ids.insert(bead.bead.id.clone());
+                continue;
+            }
 
             let bead_id = bead.bead.id.clone();
             let run_id = RunId::new(format!(

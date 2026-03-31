@@ -79,6 +79,11 @@ struct TestBrClient {
     mirror_delay: Duration,
 }
 
+#[derive(Clone)]
+struct StaleReadyBrClient {
+    ready: Vec<BrIssueSummary>,
+}
+
 #[derive(Debug, Default)]
 struct TestBrState {
     issues: BTreeMap<String, BrIssueSummary>,
@@ -290,6 +295,82 @@ impl BrClient for TestBrClient {
             }
             Ok(())
         }
+    }
+}
+
+impl BrClient for StaleReadyBrClient {
+    fn ready(&self) -> Result<Vec<BrIssueSummary>, BrError> {
+        Ok(self.ready.clone())
+    }
+
+    fn list_open(&self) -> Result<Vec<BrIssueSummary>, BrError> {
+        Ok(Vec::new())
+    }
+
+    fn show(&self, id: &BeadId) -> Result<BrIssueDetail, BrError> {
+        Err(BrError::BeadNotFound { id: id.clone() })
+    }
+
+    fn dep_list(&self, id: &BeadId) -> Result<BrDependencySnapshot, BrError> {
+        Ok(BrDependencySnapshot {
+            bead_id: id.clone(),
+            blocked_by: Vec::new(),
+            blocks: Vec::new(),
+            rows: Vec::new(),
+        })
+    }
+
+    fn capability(&self) -> Result<BrCapability, BrError> {
+        Ok(BrCapability {
+            available: true,
+            version_line: Some("br stale".to_owned()),
+            version: Some(BrVersion {
+                raw: "br stale".to_owned(),
+                major: Some(0),
+                minor: Some(1),
+                patch: Some(0),
+            }),
+            beads_dir_exists: true,
+        })
+    }
+
+    fn create_issue(&self, input: &BrCreateIssueInput) -> Result<BrIssueDetail, BrError> {
+        Err(BrError::ProtocolViolation {
+            command: "create_issue".to_owned(),
+            message: format!("unexpected create for {}", input.title),
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+
+    fn add_dependency(&self, issue: &BeadId, depends_on: &BeadId) -> Result<(), BrError> {
+        Err(BrError::ProtocolViolation {
+            command: "add_dependency".to_owned(),
+            message: format!(
+                "unexpected dependency add {} -> {}",
+                issue.as_str(),
+                depends_on.as_str()
+            ),
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+
+    fn close_bead(&self, _id: &BeadId, _reason: Option<&str>) -> Result<(), BrError> {
+        Ok(())
+    }
+
+    fn add_comment(&self, _id: &BeadId, _text: &str) -> Result<(), BrError> {
+        Ok(())
+    }
+
+    fn mirror_handoff(
+        &self,
+        _id: &BeadId,
+        _handoff: &grove_types::HandoffRecord,
+        _close_bead: bool,
+    ) -> Result<(), BrError> {
+        Ok(())
     }
 }
 
@@ -667,6 +748,72 @@ fn workflow_labeled_bead_advances_across_multiple_internal_phases() -> TestResul
         "workflow plan phase should create at least one generated child bead"
     );
 
+    Ok(())
+}
+
+#[test]
+fn stale_generated_child_ready_in_br_is_reconciled_before_dispatch() -> TestResult {
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    std::fs::create_dir_all(workspace_dir.join(".grove"))?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| std::io::Error::other("workspace dir must be valid UTF-8"))?;
+    let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+        .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+
+    let mut db = Database::open(&db_path)?;
+    db.migrate()?;
+
+    let mut bead_summary = bead_summary("grove-generated", BeadPriority::P0)?;
+    bead_summary.labels.push("grove:generated".to_owned());
+    db.upsert_bead_cache(&bead_summary)?;
+    db.set_grove_status(&bead_summary.id, GroveBeadStatus::Ready)?;
+
+    let backend = CliClaudeBackend::new("/definitely/missing/grove-provider".to_owned());
+    let br = StaleReadyBrClient {
+        ready: vec![bead_summary],
+    };
+    let mut config = GroveConfig::default();
+    config.scheduler.max_parallel = 1;
+    config.scheduler.poll_interval_ms = 1;
+    let lease_config = LeaderLeaseConfig {
+        owner_label: "stale-ready-owner".to_owned(),
+        lease_ttl: chrono::Duration::seconds(30),
+    };
+    let loop_config = DispatchLoopConfig {
+        max_total_runs: Some(1),
+        max_poll_cycles: Some(10),
+        working_dir: workspace_dir,
+        shutdown_signal: ShutdownSignal::new(),
+        db_path,
+    };
+
+    let outcome = crate::run_headless_coordinator(
+        &mut db,
+        &backend,
+        &br,
+        &config,
+        &lease_config,
+        &loop_config,
+    )?;
+
+    match outcome {
+        crate::HeadlessCoordinatorRunOutcome::Completed(report) => {
+            assert_eq!(report.outcome.exit_reason, DispatchExitReason::QueueEmpty);
+        }
+        crate::HeadlessCoordinatorRunOutcome::Failed(failure) => {
+            panic!("expected stale generated child to be skipped, got {failure:?}");
+        }
+    }
+
+    assert!(
+        db.get_bead_record(&BeadId::new("grove-generated"))?
+            .is_none()
+    );
+    assert!(
+        db.list_task_runs_for_bead(&BeadId::new("grove-generated"))?
+            .is_empty()
+    );
     Ok(())
 }
 
