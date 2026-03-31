@@ -1240,6 +1240,28 @@ pub struct StartupCoordinatorState {
     pub recovery: StartupRecoveryReport,
 }
 
+#[derive(Debug)]
+pub struct HeadlessCoordinatorRunReport {
+    pub startup: StartupCoordinatorState,
+    pub outcome: DispatchLoopOutcome,
+    pub leader_release: Option<grove_types::LeaderLeaseRecord>,
+    pub autonomous_recovery_attempted: bool,
+}
+
+#[derive(Debug)]
+pub struct HeadlessCoordinatorRunFailure {
+    pub startup: StartupCoordinatorState,
+    pub leader_release: Option<grove_types::LeaderLeaseRecord>,
+    pub autonomous_recovery_attempted: bool,
+    pub error: anyhow::Error,
+}
+
+#[derive(Debug)]
+pub enum HeadlessCoordinatorRunOutcome {
+    Completed(HeadlessCoordinatorRunReport),
+    Failed(HeadlessCoordinatorRunFailure),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaderLeaseAcquireError {
     Contested { owner_label: String },
@@ -1356,6 +1378,219 @@ pub fn acquire_startup_coordinator(
         }
     };
     Ok(StartupCoordinatorState { leader, recovery })
+}
+
+fn write_coordinator_stop_event(
+    db: &mut Database,
+    stop_reason: grove_types::CoordinatorStopReason,
+    exit_reason: &str,
+    leader_released: bool,
+    error: Option<&str>,
+) {
+    let mut payload = serde_json::json!({
+        "exit_reason": exit_reason,
+        "stop_reason": stop_reason.as_str(),
+        "forced_termination": stop_reason == grove_types::CoordinatorStopReason::Interrupted,
+        "running_session_count": 0,
+        "leader_released": leader_released,
+    });
+
+    if let Some(error) = error
+        && let serde_json::Value::Object(ref mut object) = payload
+    {
+        object.insert("error".to_owned(), serde_json::json!(error));
+    }
+
+    let _ = db.write_event_log(
+        grove_types::EventKind::CoordinatorStopped,
+        None,
+        None,
+        None,
+        &payload,
+        &chrono::Utc::now(),
+    );
+}
+
+fn should_autonomously_reset_blocked_bead(
+    bead: &GroveBeadRecord,
+    blocked_reason_codes: &[&str],
+) -> bool {
+    blocked_reason_codes == ["failed_awaiting_manual_retry"]
+        && bead.grove_status == GroveBeadStatus::Failed
+        && bead.last_failure_class == Some(grove_types::FailureClass::ClaudeCrashed)
+}
+
+fn try_autonomous_dispatch_blocked_recovery<C: BrClient>(
+    db: &mut Database,
+    br: &C,
+    blocked_summary: Option<&DispatchBlockedSummary>,
+) -> Result<Vec<BeadId>> {
+    let Some(summary) = blocked_summary else {
+        return Ok(Vec::new());
+    };
+
+    let ready_ids = br
+        .ready()
+        .context("load br ready set for autonomous blocked recovery")?
+        .into_iter()
+        .map(|bead| bead.id)
+        .collect::<std::collections::HashSet<_>>();
+    let mut recovered = Vec::new();
+
+    for sample in &summary.sample_beads {
+        if !ready_ids.contains(&sample.bead_id) {
+            continue;
+        }
+
+        let bead = db.get_bead_record(&sample.bead_id)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "blocked bead {} missing from local cache",
+                sample.bead_id.as_str()
+            )
+        })?;
+        let blocked_reason_codes = sample
+            .reasons
+            .iter()
+            .map(|reason| reason.code)
+            .collect::<Vec<_>>();
+        if !should_autonomously_reset_blocked_bead(&bead, &blocked_reason_codes) {
+            continue;
+        }
+
+        let has_active_run = db
+            .list_task_runs_for_bead(&sample.bead_id)?
+            .into_iter()
+            .any(|run| run.status == RunStatus::Active);
+        if has_active_run {
+            continue;
+        }
+
+        let now = chrono::Utc::now();
+        db.reset_bead_for_retry_with_action(
+            &sample.bead_id,
+            &now,
+            serde_json::json!({
+                "action": "autonomous_retry_reset",
+                "trigger": "dispatch_blocked",
+                "previous_failure_class": "claude_crashed"
+            }),
+        )?;
+        recovered.push(sample.bead_id.clone());
+    }
+
+    Ok(recovered)
+}
+
+pub fn run_headless_coordinator<B: ClaudeBackend + Clone + 'static, C: BrClient>(
+    db: &mut Database,
+    backend: &B,
+    br: &C,
+    config: &GroveConfig,
+    lease_config: &LeaderLeaseConfig,
+    loop_config: &DispatchLoopConfig,
+) -> Result<HeadlessCoordinatorRunOutcome> {
+    trace_runtime_event(
+        "coordinator.run_started",
+        serde_json::json!({
+            "workspace_root": loop_config.working_dir.as_str(),
+            "configured_max_parallel": config.scheduler.max_parallel,
+        }),
+    );
+
+    let startup = acquire_startup_coordinator(db, lease_config, None, chrono::Utc::now())
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    trace_runtime_event(
+        "coordinator.lease_acquired",
+        serde_json::json!({
+            "owner_label": lease_config.owner_label.clone(),
+            "lease_ttl_ms": lease_config.lease_ttl.num_milliseconds(),
+        }),
+    );
+
+    LeaderLeaseManager::heartbeat(db, lease_config, chrono::Utc::now())?
+        .ok_or_else(|| anyhow::anyhow!("leader lease heartbeat failed after acquisition"))?;
+
+    let mut autonomous_recovery_attempted = false;
+    let mut dispatch_result = run_dispatch_loop(db, backend, br, config, lease_config, loop_config);
+
+    if let Ok(outcome) = &dispatch_result
+        && outcome.exit_reason == DispatchExitReason::DispatchBlocked
+        && !autonomous_recovery_attempted
+    {
+        let recovered_bead_ids =
+            try_autonomous_dispatch_blocked_recovery(db, br, outcome.blocked_summary.as_ref())?;
+        if !recovered_bead_ids.is_empty() {
+            autonomous_recovery_attempted = true;
+            dispatch_result = run_dispatch_loop(db, backend, br, config, lease_config, loop_config);
+        }
+    }
+
+    let leader_release =
+        LeaderLeaseManager::release(db, &lease_config.owner_label, chrono::Utc::now())
+            .context("release leader lease after dispatch loop")?;
+
+    trace_runtime_event(
+        "coordinator.lease_released",
+        serde_json::json!({
+            "owner_label": lease_config.owner_label.clone(),
+            "released": leader_release.is_some(),
+        }),
+    );
+
+    match dispatch_result {
+        Ok(outcome) => {
+            trace_runtime_event(
+                "coordinator.run_stopped",
+                serde_json::json!({
+                    "exit_reason": outcome.exit_reason.to_string(),
+                    "stop_reason": outcome.stop_reason.as_str(),
+                    "dispatched_count": outcome.dispatched_count,
+                    "poll_cycles": outcome.poll_cycles,
+                }),
+            );
+            write_coordinator_stop_event(
+                db,
+                outcome.stop_reason,
+                &outcome.exit_reason.to_string(),
+                leader_release.is_some(),
+                None,
+            );
+            Ok(HeadlessCoordinatorRunOutcome::Completed(
+                HeadlessCoordinatorRunReport {
+                    startup,
+                    outcome,
+                    leader_release,
+                    autonomous_recovery_attempted,
+                },
+            ))
+        }
+        Err(error) => {
+            let error_message = error.to_string();
+            trace_runtime_event(
+                "coordinator.run_error",
+                serde_json::json!({
+                    "error": error_message,
+                    "leader_lease_released": leader_release.is_some(),
+                }),
+            );
+            write_coordinator_stop_event(
+                db,
+                grove_types::CoordinatorStopReason::InternalError,
+                "error",
+                leader_release.is_some(),
+                Some(&error_message),
+            );
+            Ok(HeadlessCoordinatorRunOutcome::Failed(
+                HeadlessCoordinatorRunFailure {
+                    startup,
+                    leader_release,
+                    autonomous_recovery_attempted,
+                    error,
+                },
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

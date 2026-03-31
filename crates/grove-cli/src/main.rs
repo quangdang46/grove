@@ -15,9 +15,9 @@ use grove_config::{
 use grove_db::Database;
 use grove_kernel::{
     BeadInspectView, DispatchBlockedSummary, DispatchExitReason, DispatchLoopConfig,
-    DispatchLoopOutcome, LeaderLeaseConfig, LeaderLeaseManager, ShutdownSignal,
-    StartupRecoveryReport, WorkspaceStatusView, acquire_startup_coordinator, init_trace_logging,
-    load_bead_inspect_view, load_workspace_status_view, run_dispatch_loop, trace_runtime_event,
+    HeadlessCoordinatorRunOutcome, LeaderLeaseConfig, ShutdownSignal, StartupRecoveryReport,
+    WorkspaceStatusView, init_trace_logging, load_bead_inspect_view, load_workspace_status_view,
+    run_headless_coordinator, trace_runtime_event,
 };
 use grove_session::replay_transcript;
 use grove_types::{
@@ -232,6 +232,7 @@ fn print_dispatch_blocked_summary(
     }
 }
 
+#[cfg(test)]
 fn should_autonomously_reset_blocked_bead(
     bead: &GroveBeadRecord,
     blocked_reason_codes: &[&str],
@@ -239,67 +240,6 @@ fn should_autonomously_reset_blocked_bead(
     blocked_reason_codes == ["failed_awaiting_manual_retry"]
         && bead.grove_status == GroveBeadStatus::Failed
         && bead.last_failure_class == Some(grove_types::FailureClass::ClaudeCrashed)
-}
-
-fn try_autonomous_dispatch_blocked_recovery(
-    db: &mut Database,
-    br: &CliBrClient,
-    blocked_summary: Option<&DispatchBlockedSummary>,
-) -> Result<Vec<BeadId>> {
-    let Some(summary) = blocked_summary else {
-        return Ok(Vec::new());
-    };
-
-    let ready_ids = br
-        .ready()
-        .context("load br ready set for autonomous blocked recovery")?
-        .into_iter()
-        .map(|bead| bead.id)
-        .collect::<std::collections::HashSet<_>>();
-    let mut recovered = Vec::new();
-
-    for sample in &summary.sample_beads {
-        if !ready_ids.contains(&sample.bead_id) {
-            continue;
-        }
-
-        let bead = db.get_bead_record(&sample.bead_id)?.ok_or_else(|| {
-            anyhow!(
-                "blocked bead {} missing from local cache",
-                sample.bead_id.as_str()
-            )
-        })?;
-        let blocked_reason_codes = sample
-            .reasons
-            .iter()
-            .map(|reason| reason.code)
-            .collect::<Vec<_>>();
-        if !should_autonomously_reset_blocked_bead(&bead, &blocked_reason_codes) {
-            continue;
-        }
-
-        let has_active_run = db
-            .list_task_runs_for_bead(&sample.bead_id)?
-            .into_iter()
-            .any(|run| run.status == RunStatus::Active);
-        if has_active_run {
-            continue;
-        }
-
-        let now = chrono::Utc::now();
-        db.reset_bead_for_retry_with_action(
-            &sample.bead_id,
-            &now,
-            serde_json::json!({
-                "action": "autonomous_retry_reset",
-                "trigger": "dispatch_blocked",
-                "previous_failure_class": "claude_crashed"
-            }),
-        )?;
-        recovered.push(sample.bead_id.clone());
-    }
-
-    Ok(recovered)
 }
 
 const BUNDLED_SKILLS: &[(&str, &str)] = &[
@@ -719,21 +659,10 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
     }
 
     let (loaded, mut db, br) = open_runtime()?;
-    let mut autonomous_recovery_attempted = false;
     init_trace_logging(
         loaded.paths.workspace_root(),
         loaded.config.logging.persist_jsonl,
     )?;
-    trace_runtime_event(
-        "coordinator.run_started",
-        serde_json::json!({
-            "workspace_root": loaded.paths.workspace_root().as_str(),
-            "live": live,
-            "json_mode": json_mode,
-            "configured_max_parallel": loaded.config.scheduler.max_parallel,
-            "persist_jsonl": loaded.config.logging.persist_jsonl,
-        }),
-    );
     let owner_label = format!("{}:{}", loaded.paths.workspace_root(), std::process::id());
     // Keep the leader lease comfortably above a scheduler cycle as safety
     // headroom; the dispatch loop now renews during long synchronous work.
@@ -744,22 +673,6 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
         owner_label,
         lease_ttl,
     };
-    let now = chrono::Utc::now();
-    let startup = acquire_startup_coordinator(&mut db, &lease_config, None, now)
-        .map_err(|error| anyhow!(error.to_string()))?;
-
-    trace_runtime_event(
-        "coordinator.lease_acquired",
-        serde_json::json!({
-            "owner_label": lease_config.owner_label.clone(),
-            "lease_ttl_ms": lease_config.lease_ttl.num_milliseconds(),
-        }),
-    );
-
-    run_startup_checks(&mut db, &lease_config, startup)?;
-    if !json_mode && !live {
-        println!("Startup recovery checks complete. Beginning dispatch loop.");
-    }
 
     // Create and register shutdown signal for graceful Ctrl-C handling.
     let shutdown_signal = ShutdownSignal::new();
@@ -780,89 +693,21 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
         db_path: loaded.paths.db_path().to_owned(),
     };
 
-    let mut dispatch_result = if live {
+    let runtime_outcome = if live {
         run_dispatch_loop_with_live_ui(&loaded, &br, &lease_config, &loop_config)?
     } else {
-        run_dispatch_loop(
+        run_headless_coordinator(
             &mut db,
             &backend,
             &br,
             &loaded.config,
             &lease_config,
             &loop_config,
-        )
+        )?
     };
 
-    if !live
-        && let Ok(outcome) = &dispatch_result
-        && outcome.exit_reason == DispatchExitReason::DispatchBlocked
-        && !autonomous_recovery_attempted
-    {
-        let recovered_bead_ids = try_autonomous_dispatch_blocked_recovery(
-            &mut db,
-            &br,
-            outcome.blocked_summary.as_ref(),
-        )?;
-        if !recovered_bead_ids.is_empty() {
-            autonomous_recovery_attempted = true;
-            if !json_mode {
-                println!(
-                    "Autonomously recovered blocked bead(s) {} and retrying dispatch once.",
-                    recovered_bead_ids
-                        .iter()
-                        .map(|bead_id| bead_id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            dispatch_result = run_dispatch_loop(
-                &mut db,
-                &backend,
-                &br,
-                &loaded.config,
-                &lease_config,
-                &loop_config,
-            );
-        }
-    }
-
-    let release_at = chrono::Utc::now();
-    let release_result =
-        LeaderLeaseManager::release(&mut db, &lease_config.owner_label, release_at)
-            .context("release leader lease after dispatch loop")?;
-    trace_runtime_event(
-        "coordinator.lease_released",
-        serde_json::json!({
-            "owner_label": lease_config.owner_label.clone(),
-            "released": release_result.is_some(),
-        }),
-    );
-
-    match dispatch_result {
-        Ok(outcome) => {
-            trace_runtime_event(
-                "coordinator.run_stopped",
-                serde_json::json!({
-                    "exit_reason": outcome.exit_reason.to_string(),
-                    "stop_reason": outcome.stop_reason.as_str(),
-                    "dispatched_count": outcome.dispatched_count,
-                    "poll_cycles": outcome.poll_cycles,
-                }),
-            );
-            let _ = db.write_event_log(
-                grove_types::EventKind::CoordinatorStopped,
-                None,
-                None,
-                None,
-                &serde_json::json!({
-                    "exit_reason": outcome.exit_reason.to_string(),
-                    "stop_reason": outcome.stop_reason.as_str(),
-                    "forced_termination": outcome.stop_reason == grove_types::CoordinatorStopReason::Interrupted,
-                    "running_session_count": 0,
-                    "leader_released": release_result.is_some(),
-                }),
-                &chrono::Utc::now(),
-            );
+    match runtime_outcome {
+        HeadlessCoordinatorRunOutcome::Completed(report) => {
             if json_mode {
                 println!(
                     "{}",
@@ -871,62 +716,42 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
                         "command": "run",
                         "workspace_root": loaded.paths.workspace_root().as_str(),
                         "db_path": loaded.paths.db_path().as_str(),
-                        "exit_reason": outcome.exit_reason.to_string(),
-                        "stop_reason": outcome.stop_reason.as_str(),
-                        "dispatched_count": outcome.dispatched_count,
-                        "poll_cycles": outcome.poll_cycles,
-                        "leader_lease_released": release_result.is_some(),
+                        "exit_reason": report.outcome.exit_reason.to_string(),
+                        "stop_reason": report.outcome.stop_reason.as_str(),
+                        "dispatched_count": report.outcome.dispatched_count,
+                        "poll_cycles": report.outcome.poll_cycles,
+                        "leader_lease_released": report.leader_release.is_some(),
                         "configured_max_parallel": loaded.config.scheduler.max_parallel,
-                        "blocked_summary": outcome.blocked_summary,
+                        "blocked_summary": report.outcome.blocked_summary,
+                        "autonomous_recovery_attempted": report.autonomous_recovery_attempted,
                     }))?
                 );
-            } else {
-                println!("Dispatch loop exited: {}", outcome.exit_reason);
-                println!("Stop reason: {}", outcome.stop_reason);
-                println!("Total runs dispatched: {}", outcome.dispatched_count);
-                println!("Total poll cycles: {}", outcome.poll_cycles);
-                match outcome.exit_reason {
-                    DispatchExitReason::QueueEmpty => {
-                        println!(
-                            "No runnable beads remain right now. The project may still have unfinished work that is blocked locally; check `grove status` for active runs, checkpoints, retry backoff, failed-awaiting-manual-retry, reservation conflicts, or `dispatch:no` suppressions."
-                        );
-                    }
-                    DispatchExitReason::DispatchBlocked => {
-                        print_dispatch_blocked_summary(
-                            outcome.blocked_summary.as_ref(),
-                            autonomous_recovery_attempted,
-                        );
-                    }
-                    _ => {}
-                }
-                print_run_startup_report(&loaded, &release_result);
+                return Ok(());
             }
+
+            print_startup_recovery_report(&report.startup.leader, &report.startup.recovery);
+            println!("Dispatch loop exited: {}", report.outcome.exit_reason);
+            println!("Stop reason: {}", report.outcome.stop_reason);
+            println!("Total runs dispatched: {}", report.outcome.dispatched_count);
+            println!("Total poll cycles: {}", report.outcome.poll_cycles);
+            match report.outcome.exit_reason {
+                DispatchExitReason::QueueEmpty => {
+                    println!(
+                        "No runnable beads remain right now. The project may still have unfinished work that is blocked locally; check `grove status` for active runs, checkpoints, retry backoff, failed-awaiting-manual-retry, reservation conflicts, or `dispatch:no` suppressions."
+                    );
+                }
+                DispatchExitReason::DispatchBlocked => {
+                    print_dispatch_blocked_summary(
+                        report.outcome.blocked_summary.as_ref(),
+                        report.autonomous_recovery_attempted,
+                    );
+                }
+                _ => {}
+            }
+            print_run_startup_report(&loaded, &report.leader_release);
             Ok(())
         }
-        Err(error) => {
-            let error_message = error.to_string();
-            trace_runtime_event(
-                "coordinator.run_error",
-                serde_json::json!({
-                    "error": error_message,
-                    "leader_lease_released": release_result.is_some(),
-                }),
-            );
-            let _ = db.write_event_log(
-                grove_types::EventKind::CoordinatorStopped,
-                None,
-                None,
-                None,
-                &serde_json::json!({
-                    "exit_reason": "error",
-                    "stop_reason": grove_types::CoordinatorStopReason::InternalError.as_str(),
-                    "forced_termination": false,
-                    "running_session_count": 0,
-                    "leader_released": release_result.is_some(),
-                    "error": error_message,
-                }),
-                &chrono::Utc::now(),
-            );
+        HeadlessCoordinatorRunOutcome::Failed(failure) => {
             if json_mode {
                 println!(
                     "{}",
@@ -937,16 +762,18 @@ fn handle_run(json_mode: bool, live: bool) -> Result<()> {
                         "db_path": loaded.paths.db_path().as_str(),
                         "exit_reason": "error",
                         "stop_reason": grove_types::CoordinatorStopReason::InternalError.as_str(),
-                        "leader_lease_released": release_result.is_some(),
+                        "leader_lease_released": failure.leader_release.is_some(),
                         "configured_max_parallel": loaded.config.scheduler.max_parallel,
-                        "error": error_message,
+                        "autonomous_recovery_attempted": failure.autonomous_recovery_attempted,
+                        "error": failure.error.to_string(),
                     }))?
                 );
-                Ok(())
-            } else {
-                print_run_startup_report(&loaded, &release_result);
-                Err(error)
+                return Ok(());
             }
+
+            print_startup_recovery_report(&failure.startup.leader, &failure.startup.recovery);
+            print_run_startup_report(&loaded, &failure.leader_release);
+            Err(failure.error)
         }
     }
 }
@@ -1217,17 +1044,6 @@ fn handle_clean(
             yes,
         },
     )
-}
-
-fn run_startup_checks(
-    db: &mut Database,
-    lease_config: &LeaderLeaseConfig,
-    startup: grove_kernel::StartupCoordinatorState,
-) -> Result<()> {
-    LeaderLeaseManager::heartbeat(db, lease_config, chrono::Utc::now())?
-        .ok_or_else(|| anyhow!("leader lease heartbeat failed after acquisition"))?;
-    print_startup_recovery_report(&startup.leader, &startup.recovery);
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1683,7 +1499,7 @@ fn run_dispatch_loop_with_live_ui(
     br: &CliBrClient,
     lease_config: &LeaderLeaseConfig,
     loop_config: &DispatchLoopConfig,
-) -> Result<Result<DispatchLoopOutcome>> {
+) -> Result<HeadlessCoordinatorRunOutcome> {
     let backend = grove_session::CliClaudeBackend::new_for_provider_with_init_args(
         loaded.config.runtime.provider,
         loaded.config.runtime.provider_bin.clone(),
@@ -1698,7 +1514,7 @@ fn run_dispatch_loop_with_live_ui(
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        let result = run_dispatch_loop(
+        let result = run_headless_coordinator(
             &mut worker_db,
             &backend,
             &br_for_thread,
@@ -1712,13 +1528,13 @@ fn run_dispatch_loop_with_live_ui(
     if !io::stdout().is_terminal() {
         return rx
             .recv()
-            .context("receive dispatch result from worker thread");
+            .context("receive dispatch result from worker thread")?;
     }
 
     let mut live_hidden = false;
     let mut terminal = Some(enter_live_terminal()?);
     let mut state = LiveAuditState::new(loaded.paths.workspace_root().to_string());
-    let mut completed: Option<Result<DispatchLoopOutcome>> = None;
+    let mut completed: Option<Result<HeadlessCoordinatorRunOutcome>> = None;
 
     loop {
         if completed.is_none()
@@ -1727,7 +1543,7 @@ fn run_dispatch_loop_with_live_ui(
             completed = Some(result);
             if live_hidden {
                 if let Some(completed) = completed {
-                    return Ok(completed);
+                    return completed;
                 }
                 unreachable!("completed result must exist");
             }
@@ -1759,7 +1575,7 @@ fn run_dispatch_loop_with_live_ui(
                                 "grove: live UI hidden; dispatch is still running in the background"
                             );
                             if let Some(result) = completed.take() {
-                                return Ok(result);
+                                return result;
                             }
                             live_hidden = true;
                         }
@@ -1838,7 +1654,7 @@ fn run_dispatch_loop_with_live_ui(
             }
         } else {
             if let Some(result) = completed.take() {
-                return Ok(result);
+                return result;
             }
             thread::sleep(Duration::from_millis(150));
         }

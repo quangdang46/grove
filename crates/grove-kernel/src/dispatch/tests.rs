@@ -466,6 +466,125 @@ fn dispatch_loop_drains_inflight_workers_when_leader_lease_is_lost() -> TestResu
     Ok(())
 }
 
+#[test]
+fn headless_coordinator_releases_lease_when_queue_is_empty() -> TestResult {
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    std::fs::create_dir_all(workspace_dir.join(".grove"))?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| std::io::Error::other("workspace dir must be valid UTF-8"))?;
+    let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+        .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+
+    let mut db = Database::open(&db_path)?;
+    db.migrate()?;
+
+    let backend = CliClaudeBackend::new("/bin/true".to_owned());
+    let br = TestBrClient::new(Vec::new(), false, Duration::ZERO);
+    let mut config = GroveConfig::default();
+    config.scheduler.poll_interval_ms = 1;
+    let lease_config = LeaderLeaseConfig {
+        owner_label: "headless-owner".to_owned(),
+        lease_ttl: chrono::Duration::seconds(30),
+    };
+    let loop_config = DispatchLoopConfig {
+        max_total_runs: None,
+        max_poll_cycles: Some(5),
+        working_dir: workspace_dir,
+        shutdown_signal: ShutdownSignal::new(),
+        db_path,
+    };
+
+    let outcome = crate::run_headless_coordinator(
+        &mut db,
+        &backend,
+        &br,
+        &config,
+        &lease_config,
+        &loop_config,
+    )?;
+    match outcome {
+        crate::HeadlessCoordinatorRunOutcome::Completed(report) => {
+            assert!(matches!(
+                report.outcome.exit_reason,
+                DispatchExitReason::QueueEmpty
+            ));
+            assert!(report.leader_release.is_some());
+            assert!(!report.autonomous_recovery_attempted);
+        }
+        crate::HeadlessCoordinatorRunOutcome::Failed(failure) => {
+            panic!(
+                "expected successful headless completion, got error: {}",
+                failure.error
+            );
+        }
+    }
+
+    assert!(db.active_leader_lease(&chrono::Utc::now())?.is_none());
+    Ok(())
+}
+
+#[test]
+fn headless_coordinator_releases_lease_when_dispatch_fails() -> TestResult {
+    let dir = tempdir()?;
+    let workspace_dir = dir.path().join("workspace");
+    std::fs::create_dir_all(workspace_dir.join(".grove"))?;
+    let workspace_dir = Utf8PathBuf::from_path_buf(workspace_dir)
+        .map_err(|_| std::io::Error::other("workspace dir must be valid UTF-8"))?;
+    let db_path = Utf8PathBuf::from_path_buf(dir.path().join("grove.db"))
+        .map_err(|_| std::io::Error::other("db path must be valid UTF-8"))?;
+
+    let mut db = Database::open(&db_path)?;
+    db.migrate()?;
+    db.upsert_bead_cache(&bead_summary("grove-a", BeadPriority::P0)?)?;
+    db.set_grove_status(&BeadId::new("grove-a"), GroveBeadStatus::Ready)?;
+
+    let backend = CliClaudeBackend::new("/definitely/missing/grove-provider".to_owned());
+    let br = TestBrClient::new(
+        vec![bead_summary("grove-a", BeadPriority::P0)?],
+        false,
+        Duration::ZERO,
+    );
+    let mut config = GroveConfig::default();
+    config.scheduler.max_parallel = 1;
+    config.scheduler.poll_interval_ms = 1;
+    let lease_config = LeaderLeaseConfig {
+        owner_label: "headless-owner".to_owned(),
+        lease_ttl: chrono::Duration::seconds(30),
+    };
+    let loop_config = DispatchLoopConfig {
+        max_total_runs: Some(1),
+        max_poll_cycles: Some(10),
+        working_dir: workspace_dir,
+        shutdown_signal: ShutdownSignal::new(),
+        db_path,
+    };
+
+    let outcome = crate::run_headless_coordinator(
+        &mut db,
+        &backend,
+        &br,
+        &config,
+        &lease_config,
+        &loop_config,
+    )?;
+    match outcome {
+        crate::HeadlessCoordinatorRunOutcome::Completed(report) => {
+            panic!(
+                "expected dispatch failure, got successful outcome {:?}",
+                report.outcome.exit_reason
+            );
+        }
+        crate::HeadlessCoordinatorRunOutcome::Failed(failure) => {
+            assert!(failure.leader_release.is_some());
+            assert!(!failure.error.to_string().is_empty());
+        }
+    }
+
+    assert!(db.active_leader_lease(&chrono::Utc::now())?.is_none());
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn workflow_labeled_bead_advances_across_multiple_internal_phases() -> TestResult {
